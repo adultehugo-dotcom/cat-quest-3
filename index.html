@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Les Chroniques de Félingard</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%232b1e16' stroke='%23f4c553' stroke-width='4'/%3E%3Cpath d='M16 26 L20 12 L30 20 L34 20 L44 12 L48 26 C50 38 43 49 32 49 C21 49 14 38 16 26 Z' fill='%23e88c38' stroke='%232b1e16' stroke-width='2.5'/%3E%3Ccircle cx='25' cy='33' r='3' fill='%232b1e16'/%3E%3Ccircle cx='39' cy='33' r='3' fill='%232b1e16'/%3E%3Cpolygon points='32,37 29,40 35,40' fill='%23d45555'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div id="app">
+      <div id="game-canvas-container"></div>
+      <div id="floating-text-layer"></div>
+      <div id="hud-layer"></div>
+      <div id="modal-layer"></div>
+      <div id="screen-layer"></div>
+    </div>
+    <main
+      id="file-protocol-help"
+      style="display:none;position:fixed;inset:0;z-index:9999;place-items:center;padding:24px;background:#1b120d;color:#fff1cf;font:16px/1.6 system-ui,sans-serif;text-align:center"
+    >
+      <section style="max-width:600px;padding:32px;border:2px solid #d6a53c;border-radius:16px;background:#382317">
+        <h1 style="margin-top:0">Le jeu ne peut pas démarrer depuis index.html</h1>
+        <p>Ce prototype utilise Vite et TypeScript. Fermez cet onglet, puis double-cliquez sur <strong>start-game.bat</strong> dans le dossier du projet.</p>
+        <p>Vous pouvez aussi ouvrir un terminal dans ce dossier et lancer <code>npm run start</code>.</p>
+      </section>
+    </main>
+    <script type="module">
+      if (window.location.protocol === 'file:') {
+        document.getElementById('app').hidden = true;
+        document.getElementById('file-protocol-help').style.display = 'grid';
+      } else {
+        await import('./src/main.ts');
+      }
+    </script>
+  </body>
+</html>

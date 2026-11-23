@@ -1,0 +1,23 @@
+{
+  "name": "les-chroniques-de-felingard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Prototype Action-RPG 2.5D inspiré de Cat Quest — Les Chroniques de Félingard",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "start": "vite --host 127.0.0.1 --open",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "three": "^0.174.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.174.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0",
+    "vitest": "^3.0.8"
+  }
+}
