@@ -21,6 +21,8 @@ const LOOK_OFFSET_Z = -0.8;
 const BASE_CAMERA_FOV = 38;
 const FOV_COMPENSATION_ASPECT = 1.2;
 const MAX_CAMERA_FOV = 62;
+const SOFTWARE_RENDERER_PIXEL_RATIO = 0.5;
+const MAX_HARDWARE_PIXEL_RATIO = 2;
 
 export function computeResponsiveFov(aspect: number): number {
   if (!Number.isFinite(aspect) || aspect <= 0 || aspect >= FOV_COMPENSATION_ASPECT) {
@@ -30,6 +32,12 @@ export function computeResponsiveFov(aspect: number): number {
   const compensatedRad =
     2 * Math.atan((Math.tan(halfBaseRad) * FOV_COMPENSATION_ASPECT) / aspect);
   return Math.min(MAX_CAMERA_FOV, THREE.MathUtils.radToDeg(compensatedRad));
+}
+
+export function isSoftwareRendererName(rendererName: string): boolean {
+  return /swiftshader|llvmpipe|software rasterizer|basic render driver|\bwarp\b/i.test(
+    rendererName,
+  );
 }
 
 const SHADOW_MAP_SIZE = 2048;
@@ -216,6 +224,7 @@ export class SceneManager {
   private lastCameraDt = 0.016;
   private updatedSinceLastRender = false;
   private activeLightingZone: ZoneId | null = null;
+  private readonly isSoftwareRenderer: boolean;
   private cameraInitialized = false;
   private lastScreen: GameState['screen'] | null = null;
 
@@ -243,13 +252,22 @@ export class SceneManager {
       antialias: true,
       powerPreference: 'high-performance',
     });
+    const gl = this.renderer.getContext();
+    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info') as
+      | { UNMASKED_RENDERER_WEBGL: number }
+      | null;
+    const rendererName = debugInfo
+      ? String(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL))
+      : '';
+    this.isSoftwareRenderer = isSoftwareRendererName(rendererName);
+
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
-    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.enabled = !this.isSoftwareRenderer;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelRatio = this.getPixelRatio();
     this.renderer.setPixelRatio(pixelRatio);
     this.renderer.setSize(width, height);
 
@@ -288,7 +306,9 @@ export class SceneManager {
     this.scene.add(this.torchGroup);
 
     this.setZoneLighting('overworld');
-    this.initPostProcessing(width, height, pixelRatio);
+    if (!this.isSoftwareRenderer) {
+      this.initPostProcessing(width, height, pixelRatio);
+    }
 
     this.boundResize = () => this.resize();
     window.addEventListener('resize', this.boundResize);
@@ -415,6 +435,13 @@ export class SceneManager {
 
   public isSsaoEnabled(): boolean {
     return Boolean(this.ssaoPass && this.ssaoPass.enabled);
+  }
+
+  private getPixelRatio(): number {
+    return Math.min(
+      window.devicePixelRatio || 1,
+      this.isSoftwareRenderer ? SOFTWARE_RENDERER_PIXEL_RATIO : MAX_HARDWARE_PIXEL_RATIO,
+    );
   }
 
   /**
@@ -872,7 +899,7 @@ export class SceneManager {
   public resize(): void {
     const width = Math.max(1, this.container.clientWidth || window.innerWidth);
     const height = Math.max(1, this.container.clientHeight || window.innerHeight);
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelRatio = this.getPixelRatio();
 
     const aspect = width / height;
     this.camera.aspect = aspect;
