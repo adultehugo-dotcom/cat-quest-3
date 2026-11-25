@@ -11,12 +11,33 @@ export const MYSTERY_CHEST_COST = 120;
 export const MAX_PLAYER_LEVEL = 10;
 export const MAX_SPELL_LEVEL = 5;
 
+export const ALL_EQUIP_SLOTS: readonly EquipSlot[] = [
+  'weapon',
+  'shield',
+  'helmet',
+  'armor',
+  'boots',
+  'gloves',
+  'cape',
+  'trinket',
+];
+
+export const OPTIONAL_EQUIP_SLOTS: readonly EquipSlot[] = [
+  'shield',
+  'boots',
+  'gloves',
+  'cape',
+  'trinket',
+];
+
 export const STARTING_EQUIPMENT: Record<EquipSlot, string> = {
   weapon: 'sword_wood',
-  secondary_weapon: '',
   shield: '',
   helmet: 'helm_bandana',
   armor: 'armor_tunic',
+  boots: '',
+  gloves: '',
+  cape: '',
   trinket: '',
 };
 
@@ -38,13 +59,22 @@ export type BiomeId =
   | 'mystic'
   | 'wild';
 
-export type SpellId = 'flamepurr' | 'lightnyan' | 'freezepaw' | 'healing_paw';
+export type SpellId =
+  | 'flamepurr'
+  | 'lightnyan'
+  | 'freezepaw'
+  | 'healing_paw'
+  | 'aegis_purr'
+  | 'pounce_dash'
+  | 'meteor_paw';
 export type EquipSlot =
   | 'weapon'
-  | 'secondary_weapon'
   | 'shield'
   | 'helmet'
   | 'armor'
+  | 'boots'
+  | 'gloves'
+  | 'cape'
   | 'trinket';
 export type Rarity = 'common' | 'rare' | 'epic';
 
@@ -76,17 +106,108 @@ export type MaritimeEnemyType =
   | 'oiseau_tempete'
   | 'kraken_de_chambre';
 
+export type ShipMode =
+  | 'parked'
+  | 'boarding'
+  | 'sailing'
+  | 'docking'
+  | 'disembarking';
+
+export type SavedShipMode = 'parked' | 'sailing';
+
+export type CoastKind = 'beach' | 'cliff' | 'rocks';
+
+export type DisembarkRefusalReason =
+  | 'too_far_from_shore'
+  | 'inaccessible_cliff'
+  | 'no_safe_spot'
+  | 'not_in_overworld';
+
+export interface ShipTransitionState {
+  kind: 'boarding' | 'docking' | 'disembarking';
+  elapsed: number;
+  duration: number;
+  targetIslandId: IslandId;
+  shipStartPos: Vec2;
+  shipTargetPos: Vec2;
+  shipStartAngle: number;
+  shipTargetAngle: number;
+  heroStartPos: Vec2;
+  heroStartY: number;
+  heroTargetPos: Vec2;
+  heroTargetY: number;
+  companionStartPos: Vec2;
+  companionStartY: number;
+  companionTargetPos: Vec2;
+  companionTargetY: number;
+  arcHeight: number;
+  landingPos?: Vec2;
+}
+
+export interface ShipDisembarkStatus {
+  canDisembark: boolean;
+  nearestIslandId: IslandId | null;
+  coastDistance: number;
+  coastKind: CoastKind;
+  reason?: DisembarkRefusalReason;
+  landingPos?: Vec2;
+  shorePoint?: Vec2;
+}
+
 export interface ShipState {
+  mode: ShipMode;
+  /** Synchronisé avec mode === 'sailing' || mode === 'docking' */
   isSailing: boolean;
   position: Vec2;
+  /**
+   * Cap canonique Three.js en radians autour de +Y (proue locale = -Z).
+   * forward(angle) = (-sin(angle), -cos(angle)) ; right(angle) = (cos(angle), -sin(angle)).
+   * Augmenter angle tourne à gauche (bâbord / CCW vu du dessus).
+   */
   angle: number;
-  departureIslandId: IslandId | null;
-  hasLeftDock: boolean;
+  vx: number;
+  vz: number;
+  /** Vitesse longitudinale signée (> 0 avant, < 0 marche arrière) */
+  speed: number;
+  /** Vitesse angulaire (rad/s : > 0 bâbord/gauche, < 0 tribord/droite) */
+  angularVelocity: number;
+  /** Angle normalisé du gouvernail [-1 (gauche) .. +1 (droite)] */
+  rudder: number;
+  /** Inclinaison latérale visuelle (rad) */
+  roll: number;
+  /** Tangage longitudinal visuel (rad) */
+  pitch: number;
+  /** Phase d'oscillation verticale sur l'eau */
+  bobPhase: number;
+  /** Décalage vertical de houle purement visuel */
+  bobY: number;
+  /** Intensité normalisée du sillage [0..1] */
+  wakeIntensity: number;
+  /** Temporisation obligatoire à v = 0 avant d'enclencher la marche arrière */
+  reverseEngageTimer: number;
+  isCollidingShore: boolean;
+  nearestCoastIslandId: IslandId | null;
+  dockedIslandId: IslandId | null;
+  transition: ShipTransitionState | null;
+  disembarkStatus: ShipDisembarkStatus;
   hullHp: number;
   maxHullHp: number;
   ammo: number;
   maxAmmo: number;
   reloadTimer: number;
+  equippedBlueprints: Partial<Record<ShipSlot, ShipBlueprint>>;
+  unlockedSlots: Record<ShipSlot, boolean>;
+}
+
+export interface SavedShipData {
+  mode: SavedShipMode;
+  position: Vec2;
+  angle: number;
+  dockedIslandId: IslandId | null;
+  hullHp: number;
+  maxHullHp: number;
+  ammo: number;
+  maxAmmo: number;
   equippedBlueprints: Partial<Record<ShipSlot, ShipBlueprint>>;
   unlockedSlots: Record<ShipSlot, boolean>;
 }
@@ -150,6 +271,9 @@ export interface PlayerState {
   hitFlashTimer: number;
   regenTimer: number;       // pour Soin-velours
   regenTickAccum: number;
+  shieldHp?: number;        // bouclier temporaire (Égide de Ronron)
+  shieldMaxHp?: number;
+  shieldTimer?: number;
   hasRunicKey: boolean;
   stats: PlayerStats;
   // Champs auxiliaires optionnels pour la simulation/juice
@@ -158,6 +282,10 @@ export interface PlayerState {
   knockbackVx?: number;
   knockbackVz?: number;
   lastMeleeAngle?: number;
+  /** Élévation monde Y (pont du bateau ou saut parabolique embarquement/débarquement) */
+  elevationY?: number;
+  /** Vrai lorsque le personnage se tient sur le pont du voilier */
+  onShipDeck?: boolean;
 }
 
 export type EnemyTypeId =
@@ -235,7 +363,12 @@ export type GameEventType =
   | 'mp_gain'
   | 'telegraph_impact'
   | 'dialogue_started'
-  | 'toast';
+  | 'toast'
+  | 'ship_boarding'
+  | 'ship_boarded'
+  | 'ship_docking'
+  | 'ship_disembarked'
+  | 'ship_refused';
 
 export interface GameEvent {
   type: GameEventType;
@@ -248,6 +381,7 @@ export interface GameEvent {
   isCrit?: boolean;
   spellId?: SpellId;
   zoneId?: ZoneId;
+  islandId?: IslandId;
   enemyId?: string;
   enemyTypeId?: EnemyTypeId;
   itemId?: string;
@@ -256,6 +390,7 @@ export interface GameEvent {
   comboStep?: 0 | 1 | 2;
   shape?: TelegraphShape;
   color?: string;
+  toastVariant?: 'info' | 'warning';
 }
 
 // --- Équipement & Styles Visuels ---
@@ -266,18 +401,40 @@ export type WeaponShape =
   | 'arcane_staff'
   | 'dragon_blade'
   | 'wood_shield'
+  | 'knight_shield'
   | 'yarn_trinket';
 export type HelmetShape = 'bandana' | 'knight_helm' | 'mage_hat' | 'dragon_crown';
 export type ArmorShape = 'tunic' | 'mail' | 'star_robe' | 'dragon_plate';
+export type BootsShape =
+  | 'leather_boots'
+  | 'iron_greaves'
+  | 'arcane_slippers'
+  | 'dragon_boots';
+export type GlovesShape =
+  | 'leather_gloves'
+  | 'steel_gauntlets'
+  | 'arcane_gloves'
+  | 'dragon_gauntlets';
+export type CapeShape =
+  | 'traveler_cloak'
+  | 'knight_mantle'
+  | 'starlight_cape'
+  | 'dragon_cape';
 
 export interface EquipmentVisualStyle {
-  shape: WeaponShape | HelmetShape | ArmorShape;
+  shape:
+    | WeaponShape
+    | HelmetShape
+    | ArmorShape
+    | BootsShape
+    | GlovesShape
+    | CapeShape;
   primaryColor: string;
   secondaryColor: string;
   accentColor: string;
+  /** Effet lumineux explicitement localisé à cette pièce uniquement (jamais global) */
+  luminous?: boolean;
   glowColor?: string;
-  hasCape?: boolean;
-  capeColor?: string;
 }
 
 export interface EquipmentStatBonuses {
@@ -309,7 +466,14 @@ export interface MysteryChestResult {
 
 // --- Sorts ---
 
-export type SpellGeometry = 'circle_aoe' | 'line_pierce' | 'frost_nova' | 'self_heal';
+export type SpellGeometry =
+  | 'circle_aoe'
+  | 'line_pierce'
+  | 'frost_nova'
+  | 'self_heal'
+  | 'self_shield'
+  | 'mobility_dash'
+  | 'target_meteor_aoe';
 
 export interface SpellDefinition {
   id: SpellId;
@@ -321,8 +485,9 @@ export interface SpellDefinition {
   mpCost: number;
   cooldown: number;        // secondes
   maxLevel: number;        // 5
-  radius: number;          // rayon AoE ou longueur de ligne
-  width?: number;          // largeur pour 'line_pierce'
+  radius: number;          // rayon AoE ou longueur de ligne / portée de bond
+  width?: number;          // largeur pour 'line_pierce' / 'mobility_dash'
+  castRange?: number;      // portée de projection pour AoE ciblée
   baseMagMult: number;     // multiplicateur MAG au niveau 1
   magMultPerLevel: number; // incrément de multiplicateur par niveau au-delà du Niv. 1
   upgradeBaseCost: number; // coût upgrade = upgradeBaseCost * currentLevel
@@ -332,6 +497,9 @@ export interface SpellDefinition {
   regenTicks?: number;     // nombre de ticks de régénération (ex: 3)
   regenTickPct?: number;   // fraction de maxHp par tick (ex: 0.08)
   regenDuration?: number;  // durée totale de la régénération (ex: 3.0 s)
+  shieldHpPct?: number;    // fraction de maxHp convertie en barrière (Égide)
+  shieldDuration?: number; // durée de la barrière (secondes)
+  dashIframes?: number;    // durée d'invulnérabilité pendant le bond
   color: string;
   secondaryColor: string;
 }
@@ -439,7 +607,8 @@ export type InteractableType =
   | 'dungeon_entrance'
   | 'dungeon_exit'
   | 'healing_crystal'
-  | 'dock';
+  | 'ship_board'
+  | 'ship_disembark';
 
 export interface Interactable {
   id: string;
@@ -763,10 +932,11 @@ export interface SavedPlayerData {
 }
 
 export interface SaveData {
-  version: 1;
+  version: 1 | 2;
   timestamp: number;
   islandId?: IslandId;
   player: SavedPlayerData;
+  ship?: SavedShipData;
   quests: Record<QuestId, QuestProgress>;
   trackedQuestId: QuestId | null;
   openedChestIds: string[];
@@ -839,6 +1009,10 @@ export interface CompanionState {
   x: number;
   z: number;
   bobPhase: number;
+  /** Élévation monde Y (pont du bateau ou saut parabolique) */
+  y?: number;
+  /** Vrai lorsque le compagnon est embarqué sur le pont */
+  onShipDeck?: boolean;
 }
 
 export interface GameState {

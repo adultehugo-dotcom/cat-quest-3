@@ -5,8 +5,27 @@ export {
   updateWaterMaterial,
   createWaterGeometry,
   createWaterMesh,
+  sampleOceanWaveHeight,
+  type OceanCoastIsland,
   type WaterMaterialOptions,
 } from './waterShader';
+
+export {
+  SHIP_WAKE_VERTEX_SHADER,
+  SHIP_WAKE_FRAGMENT_SHADER,
+  BOW_FOAM_VERTEX_SHADER,
+  BOW_FOAM_FRAGMENT_SHADER,
+  HULL_RIPPLE_VERTEX_SHADER,
+  HULL_RIPPLE_FRAGMENT_SHADER,
+  WIND_STREAK_VERTEX_SHADER,
+  WIND_STREAK_FRAGMENT_SHADER,
+  applySailWindShader,
+  createShipWakeMaterial,
+  createBowFoamMaterial,
+  createHullRippleMaterial,
+  createWindStreakMaterial,
+  type SailWindUniforms,
+} from './shipShaders';
 
 export {
   TiltShiftVignetteShader,

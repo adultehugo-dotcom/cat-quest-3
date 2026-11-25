@@ -1,21 +1,41 @@
 import './style.css';
+import * as THREE from 'three';
 import { TextureRegistry } from './art/textureRegistry';
-import { AudioEngine } from './audio/audioEngine';
+import {
+  AudioEngine,
+  type WeatherAudioState,
+  type WeatherAudioStatus,
+} from './audio/audioEngine';
+import { ALL_NEW_ISLANDS, NEW_ISLANDS } from './data/worldIslands';
 import { GameEngine } from './game/gameEngine';
 import { InputManager } from './game/input';
 import type {
   EquipSlot,
   GameEvent,
+  IslandId,
   MusicTrackId,
   OwnedEquipment,
   QuestId,
   QuestProgress,
+  ShipMode,
   SpeakerPortraitId,
 } from './game/types';
 import { EffectsRenderer } from './render/effectsRenderer';
 import { EntityRenderer } from './render/entityRenderer';
 import { FloatingTextManager } from './render/floatingText';
 import { SceneManager } from './render/sceneManager';
+import {
+  type OceanCoastIsland,
+  sampleOceanCoastDistance,
+} from './render/shaders/waterShader';
+import { ShipRenderer } from './render/shipRenderer';
+import {
+  type DayPhase,
+  type WeatherCondition,
+  WeatherCycleController,
+  type WeatherQaOverride,
+  WeatherVfxRenderer,
+} from './render/weatherSystem';
 import {
   type TorchLightPosition,
   WorldRenderer,
@@ -46,13 +66,17 @@ export interface CatQuestQaHook {
     screen: string;
     activeModal: string;
     zoneId: string;
+    islandId: IslandId;
     inVillage: boolean;
     time: number;
     player: {
       x: number;
       z: number;
+      elevationY: number;
+      onShipDeck: boolean;
       hp: number;
       maxHp: number;
+      shieldHp: number;
       mp: number;
       maxMp: number;
       level: number;
@@ -63,6 +87,27 @@ export interface CatQuestQaHook {
       equipped: Record<EquipSlot, string>;
       stats: { atk: number; mag: number; def: number; critChance: number };
       spellLevels: Record<string, number>;
+    };
+    companion: {
+      x: number;
+      z: number;
+      y: number;
+      onShipDeck: boolean;
+    };
+    ship: {
+      mode: ShipMode;
+      isSailing: boolean;
+      x: number;
+      z: number;
+      angle: number;
+      speed: number;
+      angularVelocity: number;
+      rudder: number;
+      dockedIslandId: IslandId | null;
+      isCollidingShore: boolean;
+      nearestCoastIslandId: IslandId | null;
+      canDisembark: boolean;
+      disembarkReason: string | null;
     };
     activeBoss: {
       id: string;
@@ -96,6 +141,19 @@ export interface CatQuestQaHook {
       currentIndex: number;
       lineCount: number;
     };
+    weather: {
+      condition: WeatherCondition;
+      targetCondition: WeatherCondition;
+      transitionProgress: number;
+      dayPhase: DayPhase;
+      timeOfDay: number;
+      fogIntensity: number;
+      stormIntensity: number;
+      rainIntensity: number;
+      windIntensity: number;
+      waveAmplitude: number;
+      lightningFlash: number;
+    };
     runStats: {
       playTimeSec: number;
       enemiesDefeated: number;
@@ -112,9 +170,19 @@ export interface CatQuestQaHook {
     zoneId: string;
     musicTrack: MusicTrackId | null;
     audioMuted: boolean;
+    audioVolume: number;
     audioUnlocked: boolean;
+    weatherAudio: WeatherAudioStatus;
     hasSave: boolean;
+    geometries: number;
+    gpuTextures: number;
+    drawCalls: number;
+    triangles: number;
+    cape: Readonly<ReturnType<EntityRenderer['getCapeDiagnostics']>>;
   }>;
+  readonly setWeatherForTest?: (override: WeatherQaOverride) => void;
+  readonly advanceWeatherForTest?: (seconds: number) => void;
+  readonly setAudioVolumeForTest?: (volume: number) => void;
 }
 
 declare global {
@@ -142,7 +210,7 @@ function getEquippedSignature(
   equipped: Record<EquipSlot, string>,
   hdLoaded: boolean,
 ): string {
-  return `${hdLoaded ? 'hd' : 'proc'}|${equipped.weapon}|${equipped.secondary_weapon}|${equipped.shield}|${equipped.helmet}|${equipped.armor}|${equipped.trinket}`;
+  return `${hdLoaded ? 'hd' : 'proc'}|${equipped.weapon}|${equipped.shield}|${equipped.helmet}|${equipped.armor}|${equipped.boots}|${equipped.gloves}|${equipped.cape}|${equipped.trinket}`;
 }
 
 function bootstrap(): void {
@@ -160,17 +228,84 @@ function bootstrap(): void {
   const worldRenderer = new WorldRenderer(
     sceneManager.scene,
     textures,
-    (positions: TorchLightPosition[]) => {
+    (positions: readonly TorchLightPosition[]) => {
       sceneManager.setDynamicTorchLights(positions);
     },
   );
+  const shipRenderer = new ShipRenderer(sceneManager.scene);
   const entityRenderer = new EntityRenderer(sceneManager.scene, textures);
   const effectsRenderer = new EffectsRenderer(sceneManager.scene, textures);
+  const weatherController = new WeatherCycleController();
+  const weatherVfx = new WeatherVfxRenderer(sceneManager.scene);
   const floatingTextManager = new FloatingTextManager(floatingTextLayer);
 
   const audioEngine = new AudioEngine();
   const inputManager = new InputManager();
   const engine = new GameEngine();
+
+  const archipelagoCoasts: readonly OceanCoastIsland[] = [
+    { x: 0, z: 0, radius: 52.5, isMain: true },
+    ...ALL_NEW_ISLANDS.map((id) => ({
+      x: NEW_ISLANDS[id].centerX,
+      z: NEW_ISLANDS[id].centerZ,
+      radius: NEW_ISLANDS[id].radius,
+      isMain: false,
+    })),
+  ];
+  const cameraFocusScratch = new THREE.Vector3();
+  const weatherAudioState: WeatherAudioState = {
+    inOverworld: true,
+    stormIntensity: 0,
+    fogIntensity: 0,
+    rainIntensity: 0,
+    windIntensity: 0.2,
+    seaAgitation: 0.3,
+    seaProximity: 0.7,
+    shipSpeedRatio: 0,
+  };
+
+  const syncAtmosphereAndAudio = (dtForAudio: number): void => {
+    const isOverworld = engine.state.zoneId === 'overworld';
+    const w = weatherController.getSnapshot();
+    sceneManager.applyOverworldAtmosphere(w, isOverworld);
+
+    let seaProximity = 0;
+    if (isOverworld) {
+      const mode = engine.state.ship.mode;
+      if (mode !== 'parked') {
+        seaProximity = 1.0;
+      } else {
+        const dCoast = sampleOceanCoastDistance(
+          engine.state.player.x,
+          engine.state.player.z,
+          archipelagoCoasts,
+          0.6,
+        );
+        const inlandDepth = Math.max(0, -dCoast);
+        const t = Math.min(1, inlandDepth / 40);
+        seaProximity = 1.0 - t * 0.66;
+      }
+    }
+
+    weatherAudioState.inOverworld = isOverworld;
+    weatherAudioState.stormIntensity = w.stormIntensity;
+    weatherAudioState.fogIntensity = w.fogIntensity;
+    weatherAudioState.rainIntensity = w.rainIntensity;
+    weatherAudioState.windIntensity = w.windIntensity;
+    weatherAudioState.seaAgitation = Math.min(1, Math.max(0.22, (w.waveAmplitude - 0.7) / 1.45));
+    weatherAudioState.seaProximity = seaProximity;
+    weatherAudioState.shipSpeedRatio =
+      isOverworld && engine.state.ship.isSailing
+        ? Math.min(1, Math.abs(engine.state.ship.speed) / 13.5)
+        : 0;
+
+    audioEngine.updateWeatherAmbience(weatherAudioState, dtForAudio);
+
+    const pendingThunder = weatherController.consumePendingThunder();
+    if (pendingThunder > 0 && isOverworld) {
+      audioEngine.triggerThunder(pendingThunder);
+    }
+  };
 
   // Cache local des aperçus corps entier du héros pour l'Inventaire
   const heroFullPreviewCache = new Map<string, string>();
@@ -370,12 +505,19 @@ function bootstrap(): void {
       inputManager.reset();
       blurFocusedButton();
     },
+    onSetWeather: (condition) => {
+      audioEngine.unlock();
+      weatherController.setManualWeather(condition === 'auto' ? null : condition);
+      syncAtmosphereAndAudio(0.016);
+      audioEngine.playSfx('meow_ui');
+    },
   });
 
   function clearTransientRenderers(): void {
     effectsRenderer.clear();
     floatingTextManager.clear();
     entityRenderer.clear();
+    shipRenderer.resetWake();
   }
 
   function syncStaticSpeakerPortraits(): void {
@@ -451,9 +593,15 @@ function bootstrap(): void {
         ev.type === 'quest_completed' ||
         ev.type === 'quest_updated' ||
         ev.type === 'player_rested' ||
+        ev.type === 'ship_disembarked' ||
         ev.type === 'victory'
       ) {
         saveMayHaveChanged = true;
+      }
+      if (ev.type === 'ship_boarding' || ev.type === 'ship_disembarked') {
+        audioEngine.playSfx('dodge_whoosh');
+      } else if (ev.type === 'ship_boarded' || ev.type === 'ship_refused') {
+        audioEngine.playSfx('meow_ui');
       }
     }
 
@@ -502,8 +650,31 @@ function bootstrap(): void {
 
   // --- 5. Premier rendu immédiat (scène 2.5D en orbite douce derrière l'Écran Titre) ---
   sceneManager.updateCamera(engine.state, 0.016);
-  worldRenderer.update(engine.state, 0);
-  entityRenderer.update(engine.state, 0);
+  syncAtmosphereAndAudio(0.016);
+  {
+    const w = weatherController.getSnapshot();
+    const isOverworld = engine.state.zoneId === 'overworld';
+    const fogNear = sceneManager.getFogNear();
+    const fogFar = sceneManager.getFogFar();
+    worldRenderer.update(engine.state, 0, w, fogNear, fogFar);
+    shipRenderer.update(engine.state, 0, w, fogNear, fogFar);
+    sceneManager.getCameraFocusPosition(cameraFocusScratch);
+    weatherVfx.update(
+      0,
+      w,
+      cameraFocusScratch.x,
+      cameraFocusScratch.z,
+      engine.state.ship.position.x,
+      engine.state.ship.position.z,
+      isOverworld,
+    );
+  }
+  entityRenderer.update(
+    engine.state,
+    0,
+    engine.state.zoneId === 'overworld' ? shipRenderer.getDeckAnchors() : null,
+    weatherController.getSnapshot(),
+  );
   effectsRenderer.update(engine.state, 0);
   sceneManager.render(0.016);
   hudController.update(engine.state);
@@ -564,9 +735,32 @@ function bootstrap(): void {
     const animDt = isSimFrozen ? 0 : dt;
 
     // Caméra & screen shake toujours fluides (y compris hitstop et orbite Écran Titre)
+    // La météo est visuelle et sonore: elle continue ses transitions même si le
+    // gameplay est en pause, notamment pour que le sélecteur pause soit réactif.
+    const weatherSnap = weatherController.update(dt);
+    const isOverworld = engine.state.zoneId === 'overworld';
     sceneManager.updateCamera(engine.state, dt);
-    worldRenderer.update(engine.state, animDt);
-    entityRenderer.update(engine.state, animDt);
+    syncAtmosphereAndAudio(dt);
+    const fogNear = sceneManager.getFogNear();
+    const fogFar = sceneManager.getFogFar();
+    worldRenderer.update(engine.state, animDt, weatherSnap, fogNear, fogFar);
+    shipRenderer.update(engine.state, animDt, weatherSnap, fogNear, fogFar);
+    sceneManager.getCameraFocusPosition(cameraFocusScratch);
+    weatherVfx.update(
+      animDt,
+      weatherSnap,
+      cameraFocusScratch.x,
+      cameraFocusScratch.z,
+      engine.state.ship.position.x,
+      engine.state.ship.position.z,
+      isOverworld,
+    );
+    entityRenderer.update(
+      engine.state,
+      animDt,
+      isOverworld ? shipRenderer.getDeckAnchors() : null,
+      weatherSnap,
+    );
     effectsRenderer.update(engine.state, animDt);
     floatingTextManager.update(animDt, projectWorldToScreen);
     sceneManager.render(dt);
@@ -595,13 +789,17 @@ function bootstrap(): void {
         screen: s.screen,
         activeModal: s.activeModal,
         zoneId: s.zoneId,
+        islandId: s.islandId,
         inVillage: s.inVillage,
         time: Math.round(s.time * 100) / 100,
         player: Object.freeze({
           x: Math.round(p.x * 100) / 100,
           z: Math.round(p.z * 100) / 100,
+          elevationY: Math.round((p.elevationY ?? 0) * 100) / 100,
+          onShipDeck: Boolean(p.onShipDeck),
           hp: Math.round(p.hp),
           maxHp: Math.round(p.maxHp),
+          shieldHp: (p.shieldTimer ?? 0) > 0 ? Math.round(p.shieldHp ?? 0) : 0,
           mp: Math.round(p.mp),
           maxMp: Math.round(p.maxMp),
           level: p.level,
@@ -612,6 +810,27 @@ function bootstrap(): void {
           equipped: Object.freeze({ ...p.equipped }),
           stats: Object.freeze({ ...p.stats }),
           spellLevels: Object.freeze({ ...p.spellLevels }),
+        }),
+        companion: Object.freeze({
+          x: Math.round(s.companion.x * 100) / 100,
+          z: Math.round(s.companion.z * 100) / 100,
+          y: Math.round((s.companion.y ?? 0) * 100) / 100,
+          onShipDeck: Boolean(s.companion.onShipDeck),
+        }),
+        ship: Object.freeze({
+          mode: s.ship.mode,
+          isSailing: s.ship.isSailing,
+          x: Math.round(s.ship.position.x * 100) / 100,
+          z: Math.round(s.ship.position.z * 100) / 100,
+          angle: Math.round(s.ship.angle * 1000) / 1000,
+          speed: Math.round(s.ship.speed * 100) / 100,
+          angularVelocity: Math.round(s.ship.angularVelocity * 100) / 100,
+          rudder: Math.round(s.ship.rudder * 100) / 100,
+          dockedIslandId: s.ship.dockedIslandId,
+          isCollidingShore: s.ship.isCollidingShore,
+          nearestCoastIslandId: s.ship.nearestCoastIslandId,
+          canDisembark: s.ship.disembarkStatus.canDisembark,
+          disembarkReason: s.ship.disembarkStatus.reason ?? null,
         }),
         activeBoss: boss
           ? Object.freeze({
@@ -642,6 +861,22 @@ function bootstrap(): void {
           currentIndex: s.dialogue.currentIndex,
           lineCount: s.dialogue.lines.length,
         }),
+        weather: (() => {
+          const w = weatherController.getSnapshot();
+          return Object.freeze({
+            condition: w.currentCondition,
+            targetCondition: w.targetCondition,
+            transitionProgress: Math.round(w.transitionProgress * 1000) / 1000,
+            dayPhase: w.dayPhase,
+            timeOfDay: Math.round(w.timeOfDay * 10000) / 10000,
+            fogIntensity: Math.round(w.fogIntensity * 1000) / 1000,
+            stormIntensity: Math.round(w.stormIntensity * 1000) / 1000,
+            rainIntensity: Math.round(w.rainIntensity * 1000) / 1000,
+            windIntensity: Math.round(w.windIntensity * 1000) / 1000,
+            waveAmplitude: Math.round(w.waveAmplitude * 1000) / 1000,
+            lightningFlash: Math.round(w.lightningFlash * 1000) / 1000,
+          });
+        })(),
         runStats: Object.freeze({ ...s.runStats }),
       });
     },
@@ -667,9 +902,34 @@ function bootstrap(): void {
         zoneId: engine.state.zoneId,
         musicTrack: audioEngine.getMusicTheme(),
         audioMuted: audioEngine.isMuted(),
+        audioVolume: audioEngine.getVolume(),
         audioUnlocked: audioEngine.isUnlocked(),
+        weatherAudio: audioEngine.getWeatherAudioStatus(),
         hasSave: engine.hasSavedGame(),
+        geometries: sceneManager.renderer.info.memory.geometries,
+        gpuTextures: sceneManager.renderer.info.memory.textures,
+        drawCalls: sceneManager.renderer.info.render.calls,
+        triangles: sceneManager.renderer.info.render.triangles,
+        cape: Object.freeze(entityRenderer.getCapeDiagnostics()),
       }),
+    setWeatherForTest: (override: WeatherQaOverride) => {
+      weatherController.applyQaOverride(override);
+      syncAtmosphereAndAudio(0.016);
+    },
+    advanceWeatherForTest: (seconds: number) => {
+      const total = Math.max(0, Math.min(seconds, 7200));
+      let remaining = total;
+      while (remaining > 0.0001) {
+        const step = Math.min(0.2, remaining);
+        weatherController.update(step);
+        remaining -= step;
+      }
+      syncAtmosphereAndAudio(0.016);
+    },
+    setAudioVolumeForTest: (volume: number) => {
+      audioEngine.setVolume(volume);
+      hudController.setMuted(audioEngine.isMuted());
+    },
   });
 
   window.__CAT_QUEST__ = qaHook;
@@ -687,8 +947,10 @@ function bootstrap(): void {
     modalsController.dispose();
     screensController.dispose();
     floatingTextManager.dispose();
+    weatherVfx.dispose();
     effectsRenderer.dispose();
     entityRenderer.dispose();
+    shipRenderer.dispose();
     worldRenderer.dispose();
     textures.dispose();
     sceneManager.dispose();

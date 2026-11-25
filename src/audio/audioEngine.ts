@@ -7,12 +7,20 @@ import {
   type SpellId,
   type StorageAdapter,
 } from '../game/types';
-import { MusicSynth } from './musicSynth';
+import { LocalMusicPlayer } from './localMusic';
 import { playProceduralSfx } from './sfxSynth';
+import {
+  WeatherAudioController,
+  type WeatherAudioState,
+  type WeatherAudioStatus,
+} from './weatherAudio';
+
+export type { WeatherAudioState, WeatherAudioStatus } from './weatherAudio';
 
 const DEFAULT_VOLUME = 0.85;
 const DEFAULT_SFX_BUS_GAIN = 0.78;
 const DEFAULT_BGM_BUS_GAIN = 0.18;
+const DEFAULT_WEATHER_BUS_GAIN = 0.42;
 
 // Délai minimal (ms) par SFX pour éviter le stacking agressif sur coups multiples simultanés
 const SFX_MIN_INTERVAL_MS: Partial<Record<SfxId, number>> = {
@@ -56,17 +64,24 @@ function mapSpellToSfx(spellId: SpellId | undefined): SfxId | null {
       return 'spell_ice';
     case 'healing_paw':
       return 'spell_heal';
+    case 'aegis_purr':
+      return 'spell_heal';
+    case 'pounce_dash':
+      return 'dodge_whoosh';
+    case 'meteor_paw':
+      return 'spell_fire';
     default:
       return null;
   }
 }
 
 /**
- * Moteur audio 100 % procédural (Web Audio API) :
+ * Moteur audio (Web Audio API) :
  * - Création / reprise automatique de l'AudioContext sur 1re interaction utilisateur
- * - Hiérarchie masterGain / sfxGain / bgmGain + compresseur anti-saturation
+ * - Hiérarchie masterGain / sfxGain / bgmGain / weatherGain + compresseur anti-saturation
  * - Persistance des préférences dans localStorage (felingard_audio_prefs_v1)
- * - 14 SFX procéduraux + 3 boucles musicales à crossfade doux (0.6 s)
+ * - 14 SFX procéduraux + 3 pistes locales avec crossfade doux
+ * - Ambiances météo & maritimes locales (mer, vent, pluie, tonnerre) avec repli procédural
  */
 export class AudioEngine {
   private readonly storage: StorageAdapter | null;
@@ -74,11 +89,14 @@ export class AudioEngine {
   private masterGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
   private bgmGain: GainNode | null = null;
+  private weatherGain: GainNode | null = null;
   private compressor: DynamicsCompressorNode | null = null;
-  private musicSynth: MusicSynth | null = null;
+  private musicPlayer: LocalMusicPlayer | null = null;
+  private weatherAudio: WeatherAudioController | null = null;
 
   private prefs: AudioPrefs;
   private desiredTheme: MusicTrackId | null = null;
+  private lastWeatherState: WeatherAudioState | null = null;
   private lastSfxTimestamp: Partial<Record<SfxId, number>> = {};
   private unlockListenersBound = false;
   private disposed = false;
@@ -128,6 +146,7 @@ export class AudioEngine {
         const masterGain = ctx.createGain();
         const sfxGain = ctx.createGain();
         const bgmGain = ctx.createGain();
+        const weatherGain = ctx.createGain();
         const compressor = ctx.createDynamicsCompressor();
 
         compressor.threshold.setValueAtTime(-12, ctx.currentTime);
@@ -138,9 +157,11 @@ export class AudioEngine {
 
         sfxGain.gain.setValueAtTime(DEFAULT_SFX_BUS_GAIN, ctx.currentTime);
         bgmGain.gain.setValueAtTime(DEFAULT_BGM_BUS_GAIN, ctx.currentTime);
+        weatherGain.gain.setValueAtTime(DEFAULT_WEATHER_BUS_GAIN, ctx.currentTime);
 
         sfxGain.connect(masterGain);
         bgmGain.connect(masterGain);
+        weatherGain.connect(masterGain);
         masterGain.connect(compressor);
         compressor.connect(ctx.destination);
 
@@ -148,8 +169,11 @@ export class AudioEngine {
         this.masterGain = masterGain;
         this.sfxGain = sfxGain;
         this.bgmGain = bgmGain;
+        this.weatherGain = weatherGain;
         this.compressor = compressor;
-        this.musicSynth = new MusicSynth(ctx, bgmGain);
+        this.musicPlayer = new LocalMusicPlayer(ctx, bgmGain);
+        this.weatherAudio = new WeatherAudioController(ctx, weatherGain);
+        this.weatherAudio.startLoading();
 
         this.applyMasterGain(true);
       } catch {
@@ -231,9 +255,52 @@ export class AudioEngine {
   public setMusicTheme(theme: MusicTrackId | null): void {
     if (this.disposed) return;
     this.desiredTheme = theme;
-    if (this.musicSynth && this.ctx && this.ctx.state === 'running') {
-      this.musicSynth.setTheme(theme, 0.6);
+    if (this.musicPlayer && this.ctx && this.ctx.state === 'running') {
+      this.musicPlayer.setTheme(theme, 0.8);
     }
+  }
+
+  /**
+   * Met à jour les ambiances météo & maritimes (mer, vent, pluie) avec transitions lissées.
+   * Sans effet réseau ou WebAudio avant `unlock()` ou en environnement Node/Vitest.
+   */
+  public updateWeatherAmbience(state: WeatherAudioState, dt: number): void {
+    if (this.disposed) return;
+    this.lastWeatherState = { ...state };
+    if (this.weatherAudio && this.ctx && this.ctx.state === 'running') {
+      this.weatherAudio.update(state, dt);
+    }
+  }
+
+  /**
+   * Déclenche un coup de tonnerre one-shot (respecte muted, volume, inOverworld et ctx running).
+   */
+  public triggerThunder(intensity = 1.0): void {
+    if (this.disposed || this.prefs.muted || this.prefs.volume <= 0.001) {
+      return;
+    }
+    if (!this.ctx || !this.weatherAudio || this.ctx.state !== 'running') {
+      return;
+    }
+    if (this.lastWeatherState && !this.lastWeatherState.inOverworld) {
+      return;
+    }
+    this.weatherAudio.triggerThunder(intensity);
+  }
+
+  /**
+   * Retourne l'état courant des pistes météo chargées, en repli, gains actifs et compteur tonnerre.
+   */
+  public getWeatherAudioStatus(): WeatherAudioStatus {
+    if (!this.weatherAudio) {
+      return {
+        loadedTracks: [],
+        fallbackTracks: [],
+        activeGains: { ocean: 0, wind: 0, rain: 0 },
+        thunderCount: 0,
+      };
+    }
+    return this.weatherAudio.getStatus();
   }
 
   /**
@@ -330,11 +397,22 @@ export class AudioEngine {
   public dispose(): void {
     this.disposed = true;
     this.unbindUnlockListeners();
-    if (this.musicSynth) {
-      this.musicSynth.dispose();
-      this.musicSynth = null;
+    if (this.musicPlayer) {
+      this.musicPlayer.dispose();
+      this.musicPlayer = null;
     }
-    for (const node of [this.sfxGain, this.bgmGain, this.masterGain, this.compressor]) {
+    if (this.weatherAudio) {
+      this.weatherAudio.dispose();
+      this.weatherAudio = null;
+    }
+    this.lastWeatherState = null;
+    for (const node of [
+      this.sfxGain,
+      this.bgmGain,
+      this.weatherGain,
+      this.masterGain,
+      this.compressor,
+    ]) {
       if (node) {
         try {
           node.disconnect();
@@ -346,6 +424,7 @@ export class AudioEngine {
     this.masterGain = null;
     this.sfxGain = null;
     this.bgmGain = null;
+    this.weatherGain = null;
     this.compressor = null;
     if (this.ctx) {
       void this.ctx.close().catch(() => {
@@ -358,8 +437,15 @@ export class AudioEngine {
   private onContextRunning(): void {
     this.unbindUnlockListeners();
     this.applyMasterGain(false);
-    if (this.musicSynth && this.desiredTheme !== null) {
-      this.musicSynth.setTheme(this.desiredTheme, 0.6);
+    if (this.musicPlayer && this.desiredTheme !== null) {
+      this.musicPlayer.setTheme(this.desiredTheme, 0.8);
+    }
+    if (this.weatherAudio) {
+      if (this.lastWeatherState) {
+        this.weatherAudio.update(this.lastWeatherState, 0.016);
+      } else {
+        this.weatherAudio.syncCurrentState();
+      }
     }
   }
 

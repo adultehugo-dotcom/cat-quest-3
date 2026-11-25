@@ -12,6 +12,8 @@ import {
   createTiltShiftVignettePass,
   updateTiltShiftResolution,
 } from './shaders/tiltShiftShader';
+import type { WeatherSnapshot } from './weatherSystem';
+import { clearSpriteLight, setSpriteLight } from './spriteLighting';
 
 const BASE_CAM_OFFSET_Y = 19;
 const BASE_CAM_OFFSET_Z = 17.5;
@@ -47,6 +49,9 @@ export interface TorchLightPosition {
   x: number;
   y: number;
   z: number;
+  intensity?: number;
+  distance?: number;
+  outdoor?: boolean;
 }
 
 export interface PostProcessingConfig {
@@ -70,6 +75,9 @@ interface TorchSpec {
   y: number;
   z: number;
   seed: number;
+  intensity: number;
+  distance: number;
+  outdoor: boolean;
 }
 
 /**
@@ -177,6 +185,8 @@ export class SceneManager {
   private readonly hemiLight: THREE.HemisphereLight;
   private readonly dirLightOffset = new THREE.Vector3(26, 42, 22);
   private readonly sunDirection = new THREE.Vector3(26, 42, 22).normalize();
+  private readonly overworldBgColor = new THREE.Color(0x1b5e85);
+  private readonly overworldFog = new THREE.Fog(0x216b94, 115, 265);
   private currentShadowExtent = SHADOW_EXTENT_GAMEPLAY;
 
   // Pipeline Post-Processing (EffectComposer)
@@ -193,11 +203,14 @@ export class SceneManager {
   private readonly torchGroup = new THREE.Group();
   private readonly torchPool: DynamicTorchSlot[] = [];
   private torchSpecs: TorchSpec[] = [];
+  private readonly nearestTorchIndices = new Int32Array(MAX_ACTIVE_TORCH_LIGHTS);
+  private readonly nearestTorchDistanceSq = new Float32Array(MAX_ACTIVE_TORCH_LIGHTS);
   private torchWarmColor = new THREE.Color(0xff9f40);
   private torchHotColor = new THREE.Color(0xffc96b);
   private torchEmberColor = new THREE.Color(0xff6b24);
   private readonly torchColorScratch = new THREE.Color();
   private torchBaseIntensity = 8.5;
+  private outdoorLampBrightness = 0;
 
   private readonly raycaster = new THREE.Raycaster();
   private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -209,6 +222,8 @@ export class SceneManager {
   private readonly camPos = new THREE.Vector3(0, BASE_CAM_OFFSET_Y, 24 + BASE_CAM_OFFSET_Z);
   private readonly camLookAt = new THREE.Vector3(0, LOOK_OFFSET_Y, 24 + LOOK_OFFSET_Z);
   private currentZoom = 1.0;
+  private maritimeLeadX = 0;
+  private maritimeLeadZ = 0;
   private titleOrbitAngle = 0.35;
   private internalShake = 0;
   private shakeClock = 0;
@@ -234,7 +249,7 @@ export class SceneManager {
       computeResponsiveFov(aspect),
       aspect,
       0.5,
-      220,
+      300,
     );
     this.camera.position.copy(this.camPos);
     this.camera.lookAt(this.camLookAt);
@@ -409,6 +424,73 @@ export class SceneManager {
     return this.sunDirection.clone();
   }
 
+  public getCameraFocusPosition(out: THREE.Vector3): THREE.Vector3 {
+    return out.copy(this.camLookAt);
+  }
+
+  public getCameraFocusDistance(): number {
+    return Math.max(18, this.camPos.distanceTo(this.camLookAt));
+  }
+
+  public getFogNear(): number {
+    return this.scene.fog instanceof THREE.Fog ? this.scene.fog.near : 115;
+  }
+
+  public getFogFar(): number {
+    return this.scene.fog instanceof THREE.Fog ? this.scene.fog.far : 265;
+  }
+
+  /**
+   * Applique en temps réel l'éclairage, la couleur de ciel, la direction solaire/lunaire
+   * et le brouillard du système météo / cycle jour-nuit sur tout l'overworld (0 allocation/frame).
+   * Ne modifie jamais les donjons souterrains.
+   */
+  public applyOverworldAtmosphere(weather: WeatherSnapshot, isOverworld: boolean): void {
+    if (!isOverworld) return;
+
+    if (this.scene.background !== this.overworldBgColor) {
+      this.scene.background = this.overworldBgColor;
+    }
+    if (this.scene.fog !== this.overworldFog) {
+      this.scene.fog = this.overworldFog;
+    }
+
+    const focusDist = this.getCameraFocusDistance();
+    this.overworldBgColor.copy(weather.fogColor);
+    this.overworldFog.color.copy(weather.fogColor);
+    this.overworldFog.near = focusDist + weather.fogNearOffset;
+    this.overworldFog.far = Math.max(
+      this.overworldFog.near + 20,
+      focusDist + weather.fogFarOffset,
+    );
+
+    this.ambientLight.color.copy(weather.ambientColor);
+    this.ambientLight.intensity = weather.ambientIntensity;
+
+    this.hemiLight.color.copy(weather.hemiSkyColor);
+    this.hemiLight.groundColor.copy(weather.hemiGroundColor);
+    this.hemiLight.intensity = weather.hemiIntensity;
+
+    this.dirLight.color.copy(weather.dirLightColor);
+    this.dirLight.intensity = weather.dirLightIntensity;
+    this.dirLightOffset.copy(weather.dirLightOffset);
+    this.sunDirection.copy(weather.sunDirection);
+    this.outdoorLampBrightness = THREE.MathUtils.clamp(
+      Math.max(
+        weather.nightFactor * 0.96,
+        weather.sunsetFactor * 0.52,
+        weather.dawnFactor * 0.36,
+        weather.fogIntensity * 0.52,
+        weather.stormIntensity * 0.65,
+      ),
+      0,
+      1,
+    );
+
+    // Maintient les ombres alignées sur la nouvelle position solaire/lunaire
+    this.updateShadowFollow(this.camLookAt.x, this.camLookAt.z, this.currentShadowExtent);
+  }
+
   public isPostProcessingEnabled(): boolean {
     return this.postProcessingActive && this.composer !== null;
   }
@@ -462,15 +544,21 @@ export class SceneManager {
    * Les torches les plus proches de la caméra sont éclairées en temps réel par des
    * PointLights ambrées scintillantes (flicker organique) avec atténuation réaliste.
    */
-  public setDynamicTorchLights(positions: TorchLightPosition[]): void {
+  public setDynamicTorchLights(positions: readonly TorchLightPosition[]): void {
     this.torchSpecs = positions.map((pos, idx) => ({
       x: pos.x,
       y: pos.y,
       z: pos.z,
       seed: idx * 2.17 + pos.x * 0.31 + pos.z * 0.19,
+      intensity: pos.intensity ?? this.torchBaseIntensity,
+      distance: pos.distance ?? 17,
+      outdoor: pos.outdoor ?? false,
     }));
 
     if (this.torchSpecs.length === 0) {
+      for (let index = 0; index < MAX_ACTIVE_TORCH_LIGHTS; index++) {
+        clearSpriteLight(index);
+      }
       for (const slot of this.torchPool) {
         slot.light.intensity = 0;
         slot.light.visible = false;
@@ -488,35 +576,56 @@ export class SceneManager {
 
     const focusX = this.camLookAt.x;
     const focusZ = this.camLookAt.z;
+    const slotsToRank = Math.min(this.torchPool.length, this.nearestTorchIndices.length);
+    this.nearestTorchIndices.fill(-1);
+    this.nearestTorchDistanceSq.fill(Number.POSITIVE_INFINITY);
 
-    // Trie les indices des torches par distance à la caméra pour couvrir 100 % du donjon avec 8 lumières GPU
-    const ranked = this.torchSpecs.map((spec, index) => {
-      const dx = spec.x - focusX;
-      const dz = spec.z - focusZ;
-      return { index, distSq: dx * dx + dz * dz };
-    });
-    ranked.sort((a, b) => a.distSq - b.distSq);
+    // Sélectionne les sources les plus proches dans des buffers réutilisés (aucune
+    // allocation map/sort/objet par frame, même dans les grands donjons).
+    for (let sourceIndex = 0; sourceIndex < this.torchSpecs.length; sourceIndex++) {
+      const source = this.torchSpecs[sourceIndex];
+      const dx = source.x - focusX;
+      const dz = source.z - focusZ;
+      const distSq = dx * dx + dz * dz;
+      for (let rank = 0; rank < slotsToRank; rank++) {
+        if (distSq >= this.nearestTorchDistanceSq[rank]) continue;
+        for (let shift = slotsToRank - 1; shift > rank; shift--) {
+          this.nearestTorchDistanceSq[shift] = this.nearestTorchDistanceSq[shift - 1];
+          this.nearestTorchIndices[shift] = this.nearestTorchIndices[shift - 1];
+        }
+        this.nearestTorchDistanceSq[rank] = distSq;
+        this.nearestTorchIndices[rank] = sourceIndex;
+        break;
+      }
+    }
 
-    const activeCount = Math.min(this.torchPool.length, ranked.length);
+    let activeCount = 0;
+    while (activeCount < slotsToRank && this.nearestTorchIndices[activeCount] >= 0) {
+      activeCount++;
+    }
     for (let i = 0; i < this.torchPool.length; i++) {
       const slot = this.torchPool[i];
       if (i >= activeCount) {
         slot.light.visible = false;
         slot.light.intensity = 0;
         slot.assignedIndex = -1;
+        clearSpriteLight(i);
         continue;
       }
 
-      const { index, distSq } = ranked[i];
-      const spec = this.torchSpecs[index];
-      slot.assignedIndex = index;
+      const sourceIndex = this.nearestTorchIndices[i];
+      const distSq = this.nearestTorchDistanceSq[i];
+      const spec = this.torchSpecs[sourceIndex];
+      slot.assignedIndex = sourceIndex;
 
-      // Atténuation douce au-delà de 24 u pour éviter tout saut brutal lors des déplacements
+      // Atténuation douce autour du rayon de la source, sans couper brutalement
+      // les éclairages lorsque la caméra passe de l'un au suivant.
       const dist = Math.sqrt(distSq);
-      const rangeFade = 1 - THREE.MathUtils.smoothstep(dist, 22, 34);
+      const rangeFade = 1 - THREE.MathUtils.smoothstep(dist, spec.distance * 1.3, spec.distance * 2);
       if (rangeFade <= 0.01) {
         slot.light.visible = false;
         slot.light.intensity = 0;
+        clearSpriteLight(i);
         continue;
       }
 
@@ -529,7 +638,11 @@ export class SceneManager {
 
       const intensityFactor = 0.86 + flickerNorm * 0.22;
       slot.light.visible = true;
-      slot.light.intensity = this.torchBaseIntensity * intensityFactor * rangeFade;
+      slot.light.distance = spec.distance;
+      const sourceBrightness = spec.outdoor
+        ? this.outdoorLampBrightness * (0.98 + flickerNorm * 0.035)
+        : intensityFactor;
+      slot.light.intensity = spec.intensity * sourceBrightness * rangeFade;
 
       // Micro-danse de la flamme faisant vibrer les reflets sur les dalles PBR
       slot.light.position.set(
@@ -545,6 +658,7 @@ export class SceneManager {
         this.torchColorScratch.copy(this.torchWarmColor).lerp(this.torchEmberColor, -flickerNorm * 0.4);
       }
       slot.light.color.copy(this.torchColorScratch);
+      setSpriteLight(i, slot.light.position, slot.light.color, slot.light.intensity, slot.light.distance);
     }
   }
 
@@ -585,8 +699,12 @@ export class SceneManager {
     this.activeLightingZone = zoneId;
 
     if (zoneId === 'overworld') {
-      this.scene.background = new THREE.Color(0x1b5e85);
-      this.scene.fog = new THREE.Fog(0x216b94, 95, 210);
+      this.overworldBgColor.setHex(0x1b5e85);
+      this.overworldFog.color.setHex(0x216b94);
+      this.overworldFog.near = 115;
+      this.overworldFog.far = 265;
+      this.scene.background = this.overworldBgColor;
+      this.scene.fog = this.overworldFog;
 
       // Lumière dorée diorama calibrée : ombres nettes (~39% contraste) sans faire bloomer la neige
       this.ambientLight.color.setHex(0xfff4e0);
@@ -670,6 +788,8 @@ export class SceneManager {
    */
   public snapCameraTo(x: number, z: number, zoom = 1.0): void {
     this.currentZoom = zoom;
+    this.maritimeLeadX = 0;
+    this.maritimeLeadZ = 0;
     this.camPos.set(
       x,
       BASE_CAM_OFFSET_Y * zoom,
@@ -679,10 +799,23 @@ export class SceneManager {
     this.camera.position.copy(this.camPos);
     this.camera.lookAt(this.camLookAt);
     this.cameraInitialized = true;
-    this.updateShadowFollow(x, z, SHADOW_EXTENT_GAMEPLAY);
+    this.updateShadowFollow(x, z, SHADOW_EXTENT_GAMEPLAY * Math.max(1, zoom));
   }
 
   private getTargetZoom(state: GameState): number {
+    if (state.zoneId === 'overworld') {
+      const mode = state.ship.mode;
+      if (mode === 'sailing') {
+        const speedRatio = THREE.MathUtils.clamp(Math.abs(state.ship.speed) / 13.5, 0, 1);
+        return 1.22 + 0.14 * speedRatio;
+      }
+      if (mode === 'boarding' || mode === 'docking') {
+        return 1.14;
+      }
+      if (mode === 'disembarking') {
+        return 1.04;
+      }
+    }
     if (state.dialogue.active || state.inVillage) {
       return 0.85;
     }
@@ -749,16 +882,56 @@ export class SceneManager {
       return;
     }
 
+    const isMaritime =
+      state.zoneId === 'overworld' && state.ship.mode !== 'parked';
     const targetZoom = this.getTargetZoom(state);
-    const zoomAlpha = 1 - Math.exp(-5.0 * safeDt);
+    const zoomRate = isMaritime ? 3.2 : 5.0;
+    const zoomAlpha = 1 - Math.exp(-zoomRate * safeDt);
     this.currentZoom += (targetZoom - this.currentZoom) * zoomAlpha;
 
-    const desiredPosX = state.player.x;
+    // Cible horizontale lissée : anticipation douce de vitesse en navigation & cadrage rivage à l'accostage
+    let focusX = state.player.x;
+    let focusZ = state.player.z;
+    let desiredLeadX = 0;
+    let desiredLeadZ = 0;
+
+    if (state.zoneId === 'overworld') {
+      if (state.ship.mode === 'sailing') {
+        focusX = state.ship.position.x;
+        focusZ = state.ship.position.z;
+        desiredLeadX = THREE.MathUtils.clamp(state.ship.vx * 0.24, -3.6, 3.6);
+        desiredLeadZ = THREE.MathUtils.clamp(state.ship.vz * 0.2, -3.0, 3.0);
+      } else if (state.ship.mode === 'docking') {
+        const land = state.ship.transition?.landingPos;
+        if (land) {
+          focusX = state.ship.position.x * 0.72 + land.x * 0.28;
+          focusZ = state.ship.position.z * 0.72 + land.z * 0.28;
+        } else {
+          focusX = state.ship.position.x;
+          focusZ = state.ship.position.z;
+        }
+      } else if (
+        state.ship.mode === 'boarding' ||
+        state.ship.mode === 'disembarking'
+      ) {
+        focusX = state.player.x * 0.65 + state.ship.position.x * 0.35;
+        focusZ = state.player.z * 0.65 + state.ship.position.z * 0.35;
+      }
+    }
+
+    const leadAlpha = 1 - Math.exp(-3.0 * safeDt);
+    this.maritimeLeadX += (desiredLeadX - this.maritimeLeadX) * leadAlpha;
+    this.maritimeLeadZ += (desiredLeadZ - this.maritimeLeadZ) * leadAlpha;
+
+    const targetX = focusX + this.maritimeLeadX;
+    const targetZ = focusZ + this.maritimeLeadZ;
+
+    const desiredPosX = targetX;
     const desiredPosY = BASE_CAM_OFFSET_Y * this.currentZoom;
-    const desiredPosZ = state.player.z + BASE_CAM_OFFSET_Z * this.currentZoom;
-    const desiredLookX = state.player.x;
+    const desiredPosZ = targetZ + BASE_CAM_OFFSET_Z * this.currentZoom;
+    const desiredLookX = targetX;
     const desiredLookY = LOOK_OFFSET_Y;
-    const desiredLookZ = state.player.z + LOOK_OFFSET_Z;
+    const desiredLookZ = targetZ + LOOK_OFFSET_Z;
 
     const distSq =
       (desiredLookX - this.camLookAt.x) ** 2 +
@@ -766,9 +939,10 @@ export class SceneManager {
 
     // Snap si on sort de l'écran titre ou lors d'une téléportation / transition de zone
     if (!this.cameraInitialized || this.lastScreen === 'title' || distSq > 400) {
-      this.snapCameraTo(state.player.x, state.player.z, targetZoom);
+      this.snapCameraTo(targetX, targetZ, targetZoom);
     } else {
-      const followAlpha = 1 - Math.exp(-8.0 * safeDt);
+      const followRate = isMaritime ? 5.8 : 8.0;
+      const followAlpha = 1 - Math.exp(-followRate * safeDt);
       this.camPos.x += (desiredPosX - this.camPos.x) * followAlpha;
       this.camPos.y += (desiredPosY - this.camPos.y) * followAlpha;
       this.camPos.z += (desiredPosZ - this.camPos.z) * followAlpha;
@@ -804,9 +978,9 @@ export class SceneManager {
       this.camLookAt.z,
     );
 
-    // Suivi du soleil directionnel 2048×2048 autour du héros pour des ombres ultra-nettes
+    // Suivi du soleil directionnel 2048×2048 autour du focus pour des ombres ultra-nettes
     const shadowExtent = SHADOW_EXTENT_GAMEPLAY * Math.max(0.95, this.currentZoom);
-    this.updateShadowFollow(state.player.x, state.player.z, shadowExtent);
+    this.updateShadowFollow(this.camLookAt.x, this.camLookAt.z, shadowExtent);
   }
 
   /**

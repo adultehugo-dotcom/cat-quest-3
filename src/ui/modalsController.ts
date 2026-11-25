@@ -13,7 +13,6 @@ import {
 import { OVERWORLD_DATA } from '../data/worldData';
 import {
   ALL_NEW_ISLANDS,
-  FELINGARD_DOCK_POS,
   NEW_ISLANDS,
 } from '../data/worldIslands';
 import {
@@ -72,19 +71,23 @@ export interface ModalsCallbacks {
 
 const SLOT_ORDER: Record<EquipSlot, number> = {
   weapon: 0,
-  secondary_weapon: 1,
-  shield: 2,
-  helmet: 3,
-  armor: 4,
-  trinket: 5,
+  shield: 1,
+  helmet: 2,
+  armor: 3,
+  boots: 4,
+  gloves: 5,
+  cape: 6,
+  trinket: 7,
 };
 
 const SLOT_LABELS: Record<EquipSlot, string> = {
   weapon: 'Arme',
-  secondary_weapon: 'Arme secondaire',
   shield: 'Bouclier',
   helmet: 'Casque',
   armor: 'Armure',
+  boots: 'Bottes',
+  gloves: 'Gants',
+  cape: 'Cape',
   trinket: 'Babiole',
 };
 
@@ -155,11 +158,6 @@ function getEquipmentSvgMarkup(def: EquipmentDefinition): string {
         <line x1="10" y1="28" x2="20" y2="38" stroke="${secondaryColor}" stroke-width="4.5" stroke-linecap="round"/>
         <circle cx="11" cy="37" r="3.5" fill="${accentColor}" stroke="#2b1e16" stroke-width="2"/>
       </svg>`;
-    case 'secondary_weapon':
-      return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
-        <path d="M12 36 L35 9 L39 13 L16 40 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.4"/>
-        <circle cx="11" cy="37" r="3" fill="${accentColor}" stroke="#2b1e16" stroke-width="2"/>
-      </svg>`;
     case 'shield':
       return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
         <path d="M24 6 L38 12 L36 31 Q33 39 24 43 Q15 39 12 31 L10 12 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.6"/>
@@ -180,6 +178,21 @@ function getEquipmentSvgMarkup(def: EquipmentDefinition): string {
         <path d="M14 10 L20 14 L28 14 L34 10 L40 18 L35 24 L36 39 L12 39 L13 24 L8 18 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.6" stroke-linejoin="round"/>
         <rect x="14" y="26" width="20" height="4.5" rx="2" fill="${accentColor}" stroke="#2b1e16" stroke-width="1.6"/>
         <path d="M20 14 L24 21 L28 14" fill="${secondaryColor}" stroke="#2b1e16" stroke-width="1.8"/>
+      </svg>`;
+    case 'boots':
+      return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+        <path d="M12 8 H26 V26 L38 31 Q42 34 39 40 H9 Q6 38 9 33 L14 27 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.8" stroke-linejoin="round"/>
+        <path d="M12 33 H39" stroke="${accentColor}" stroke-width="3"/>
+      </svg>`;
+    case 'gloves':
+      return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+        <path d="M13 25 V13 Q13 9 17 9 Q20 9 20 13 V21 V10 Q20 6 24 6 Q28 6 28 10 V21 V12 Q28 8 32 8 Q36 8 36 12 V23 L39 20 Q43 18 44 22 L40 35 Q38 41 31 42 H21 Q14 41 12 35 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.6" stroke-linejoin="round"/>
+        <path d="M15 31 H39" stroke="${accentColor}" stroke-width="3"/>
+      </svg>`;
+    case 'cape':
+      return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+        <path d="M17 9 Q24 13 31 9 L38 17 L34 22 L37 40 Q24 36 11 40 L14 22 L10 17 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.6" stroke-linejoin="round"/>
+        <path d="M15 34 Q24 31 35 34" fill="none" stroke="${accentColor}" stroke-width="3"/>
       </svg>`;
   }
 }
@@ -211,6 +224,21 @@ function getSpellIconSvg(spellId: SpellId): string {
         <ellipse cx="44" cy="24" rx="6" ry="7.5" fill="#5ce67a" stroke="#2b1e16" stroke-width="2.6"/>
         <path d="M18 42 C18 33 25 29 32 29 C39 29 46 33 46 42 C46 50 40 54 32 54 C24 54 18 50 18 42 Z" fill="#5ce67a" stroke="#2b1e16" stroke-width="2.8"/>
         <path d="M32 36 V47 M26.5 41.5 H37.5" stroke="#ffffff" stroke-width="3.2" stroke-linecap="round"/>
+      </svg>`;
+    case 'aegis_purr':
+      return `<svg width="32" height="32" viewBox="0 0 64 64" aria-hidden="true">
+        <path d="M32 7 L51 15 L48 39 Q44 51 32 57 Q20 51 16 39 L13 15 Z" fill="#ffd166" stroke="#2b1e16" stroke-width="3"/>
+        <path d="M32 17 L41 22 L39 36 Q37 43 32 47 Q27 43 25 36 L23 22 Z" fill="#66f2ff" stroke="#2b1e16" stroke-width="2"/>
+      </svg>`;
+    case 'pounce_dash':
+      return `<svg width="32" height="32" viewBox="0 0 64 64" aria-hidden="true">
+        <path d="M10 42 Q26 24 54 18 Q40 31 35 46 Q29 37 10 42 Z" fill="#4de8d6" stroke="#2b1e16" stroke-width="3"/>
+        <path d="M12 24 L31 20 M16 50 L36 44" stroke="#fff3a8" stroke-width="3.2" stroke-linecap="round"/>
+      </svg>`;
+    case 'meteor_paw':
+      return `<svg width="32" height="32" viewBox="0 0 64 64" aria-hidden="true">
+        <circle cx="36" cy="36" r="15" fill="#c95bff" stroke="#2b1e16" stroke-width="3"/>
+        <polygon points="36,24 40,32 48,34 42,40 43,48 36,43 29,48 30,40 24,34 32,32" fill="#ffbe4d"/>
       </svg>`;
   }
 }
@@ -288,6 +316,7 @@ export class ModalsController {
   private mapQuestMarkerEl: HTMLDivElement | null = null;
   private mapQuestLabelEl: HTMLSpanElement | null = null;
   private mapQuestDotEl: HTMLDivElement | null = null;
+  private mapShipPinEl: HTMLDivElement | null = null;
   private mapStaticAnchors: MapStaticAnchor[] = [];
   private lastMapLayoutSig = '';
 
@@ -448,8 +477,13 @@ export class ModalsController {
           Math.round(p.stats.critChance * 100),
           p.hasRunicKey ? 1 : 0,
           p.equipped.weapon,
+          p.equipped.shield,
           p.equipped.helmet,
           p.equipped.armor,
+          p.equipped.boots,
+          p.equipped.gloves,
+          p.equipped.cape,
+          p.equipped.trinket,
           invKey,
         ].join('|');
       }
@@ -581,10 +615,12 @@ export class ModalsController {
 
     ([
       'weapon',
-      'secondary_weapon',
       'shield',
       'helmet',
       'armor',
+      'boots',
+      'gloves',
+      'cape',
       'trinket',
     ] as EquipSlot[]).forEach((slot) => {
       const itemId = p.equipped[slot];
@@ -614,8 +650,13 @@ export class ModalsController {
     const filters: Array<{ id: InventoryFilter; label: string }> = [
       { id: 'all', label: 'Tout' },
       { id: 'weapon', label: 'Armes' },
+      { id: 'shield', label: 'Boucliers' },
       { id: 'helmet', label: 'Casques' },
       { id: 'armor', label: 'Armures' },
+      { id: 'boots', label: 'Bottes' },
+      { id: 'gloves', label: 'Gants' },
+      { id: 'cape', label: 'Capes' },
+      { id: 'trinket', label: 'Babioles' },
     ];
     for (const f of filters) {
       const btn = document.createElement('button');
@@ -746,6 +787,7 @@ export class ModalsController {
     this.mapFrameEl = null;
     this.mapCompassEl = null;
     this.mapPlayerPinEl = null;
+    this.mapShipPinEl = null;
     this.mapQuestMarkerEl = null;
     this.mapQuestLabelEl = null;
     this.mapQuestDotEl = null;
@@ -783,6 +825,8 @@ export class ModalsController {
     villageMarker.style.top = `${villagePos.top}%`;
     const villageDot = document.createElement('div');
     villageDot.className = 'map-marker-dot';
+    villageDot.dataset.mapIndex = '1';
+    villageDot.title = '1 — Félingard, Miaou-bourg';
     villageDot.setAttribute('aria-hidden', 'true');
     villageDot.textContent = '🏠';
     const villageLabel = document.createElement('span');
@@ -798,45 +842,23 @@ export class ModalsController {
       dotEl: villageDot,
     });
 
-    const mainlandDockPos = worldToMapPercent(
-      FELINGARD_DOCK_POS.x,
-      FELINGARD_DOCK_POS.z,
-    );
-    const mainlandDock = document.createElement('div');
-    mainlandDock.className = 'map-marker map-marker--island';
-    mainlandDock.style.left = `${mainlandDockPos.left}%`;
-    mainlandDock.style.top = `${mainlandDockPos.top}%`;
-    const mainlandDockDot = document.createElement('div');
-    mainlandDockDot.className = 'map-marker-dot';
-    mainlandDockDot.setAttribute('aria-hidden', 'true');
-    mainlandDockDot.textContent = '⚓';
-    const mainlandDockLabel = document.createElement('span');
-    mainlandDockLabel.className = 'map-marker-label';
-    mainlandDockLabel.textContent = 'Quai de Félingard';
-    mainlandDock.append(mainlandDockDot, mainlandDockLabel);
-    frame.appendChild(mainlandDock);
-    this.mapStaticAnchors.push({
-      left: mainlandDockPos.left,
-      top: mainlandDockPos.top,
-      el: mainlandDock,
-      labelEl: mainlandDockLabel,
-      dotEl: mainlandDockDot,
-    });
-
+    let islandMapIndex = 2;
     for (const islandId of ALL_NEW_ISLANDS) {
       const island = NEW_ISLANDS[islandId];
-      const pos = worldToMapPercent(island.dockPos.x, island.dockPos.z);
+      const pos = worldToMapPercent(island.centerX, island.centerZ);
       const marker = document.createElement('div');
       marker.className = 'map-marker map-marker--island';
       marker.style.left = `${pos.left}%`;
       marker.style.top = `${pos.top}%`;
       const dot = document.createElement('div');
       dot.className = 'map-marker-dot';
+      dot.dataset.mapIndex = String(islandMapIndex++);
+      dot.title = `${dot.dataset.mapIndex} — ${island.name}`;
       dot.setAttribute('aria-hidden', 'true');
-      dot.textContent = '⚓';
+      dot.textContent = '🏝️';
       const label = document.createElement('span');
       label.className = 'map-marker-label';
-      label.textContent = `${island.name} — Quai`;
+      label.textContent = island.name;
       marker.append(dot, label);
       frame.appendChild(marker);
       this.mapStaticAnchors.push({
@@ -848,8 +870,9 @@ export class ModalsController {
       });
     }
 
-    // Marqueurs Donjons (+ niveaux recommandés & cadenas si Clé Runique manquante)
-    for (const portal of state.islandId === 'felingard' ? OVERWORLD_DATA.dungeonPortals : []) {
+    // Marqueurs Donjons de Félingard (+ niveaux recommandés & cadenas si Clé Runique manquante)
+    let dungeonMapIndex = 7;
+    for (const portal of OVERWORLD_DATA.dungeonPortals) {
       const pos = worldToMapPercent(portal.x, portal.z);
       const isDragon = portal.targetZoneId === 'dungeon_dragon_lair';
       const isLocked = Boolean(portal.requiresRunicKey && !state.player.hasRunicKey);
@@ -865,6 +888,8 @@ export class ModalsController {
 
       const dot = document.createElement('div');
       dot.className = 'map-marker-dot';
+      dot.dataset.mapIndex = String(dungeonMapIndex++);
+      dot.title = `${dot.dataset.mapIndex} — ${dungeonName} (${portal.shortLabel})`;
       dot.setAttribute('aria-hidden', 'true');
       dot.textContent = isLocked ? '🔒' : isDragon ? '🐉' : '⚔️';
 
@@ -899,6 +924,14 @@ export class ModalsController {
     this.mapQuestLabelEl = questLabel;
     frame.appendChild(questMarker);
 
+    // Position en direct du voilier
+    const shipPin = document.createElement('div');
+    shipPin.className = 'map-ship-pin';
+    shipPin.title = 'Votre voilier';
+    shipPin.textContent = '⛵';
+    this.mapShipPinEl = shipPin;
+    frame.appendChild(shipPin);
+
     // Point joueur en direct
     const playerPin = document.createElement('div');
     playerPin.className = 'map-player-pin';
@@ -911,14 +944,28 @@ export class ModalsController {
     legend.className = 'map-legend';
     legend.innerHTML = `
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#3be8ff;"></span>Vous</span>
+      <span class="map-legend-item"><span class="map-legend-swatch" style="background:#e5b75a;"></span>Votre voilier</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#f5c95d;"></span>Miaou-bourg</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#8a56d6;"></span>Grotte (Niv. 2)</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#c92a3e;"></span>Antre du Dragon (Niv. 5)</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#f5b316;"></span>Objectif de quête</span>
-      <span class="map-legend-item"><span class="map-legend-swatch" style="background:#70c8d8;"></span>Îles accessibles par bateau</span>
+      <span class="map-legend-item"><span class="map-legend-swatch" style="background:#70c8d8;"></span>Îles de l'archipel</span>
     `;
 
-    container.append(frame, legend);
+    const mobileKey = document.createElement('div');
+    mobileKey.className = 'map-mobile-key';
+    mobileKey.innerHTML = `
+      <span><b>1</b> Miaou-bourg</span>
+      <span><b>2</b> Plage des Ronrons Dorés</span>
+      <span><b>3</b> Griffe-de-Roc</span>
+      <span><b>4</b> Sanctuaire des Ronrons Oubliés</span>
+      <span><b>5</b> Terres des Griffes Sauvages</span>
+      <span><b>6</b> Archipel des Moustaches</span>
+      <span><b>7</b> Grotte des Souris-Fantômes</span>
+      <span><b>8</b> Antre du Dragon-Griffe</span>
+    `;
+
+    container.append(frame, legend, mobileKey);
     this.bodyEl.appendChild(container);
     this.lastMapLayoutSig = '';
     this.updateLiveMapPins(state);
@@ -967,6 +1014,12 @@ export class ModalsController {
       this.mapPlayerPinEl.style.top = `${pct.top.toFixed(2)}%`;
     }
 
+    if (this.mapShipPinEl) {
+      const sPct = worldToMapPercent(state.ship.position.x, state.ship.position.z);
+      this.mapShipPinEl.style.left = `${sPct.left.toFixed(2)}%`;
+      this.mapShipPinEl.style.top = `${sPct.top.toFixed(2)}%`;
+    }
+
     if (!this.mapQuestMarkerEl || !this.mapQuestLabelEl) return;
 
     const qPos = getOverworldQuestPos(state);
@@ -1001,14 +1054,85 @@ export class ModalsController {
       ? frameRect.width / Math.max(1, this.mapFrameEl.clientWidth)
       : 1;
 
-    // 1. Place les libellés statiques par défaut (en dessous) avec clamp minimal dans le cadre
+    // 1. Place les libellés statiques sans chevauchement entre pastilles/étiquettes statiques & boussole
+    const defaultStaticModes: MapLabelPlacement[] = [];
     const defaultStaticShifts: number[] = [];
-    for (const anchor of this.mapStaticAnchors) {
-      this.applyMarkerLabelStyle(anchor.el, anchor.labelEl, 'below', 0);
-      const shift = hasDomLayout
-        ? this.clampLabelShiftX(anchor.labelEl, frameRect, scaleX, 0)
-        : 0;
-      defaultStaticShifts.push(shift);
+    const compassRect = this.mapCompassEl?.getBoundingClientRect() ?? null;
+    const staticDotRects: SimpleRect[] = this.mapStaticAnchors.map((a) =>
+      a.dotEl.getBoundingClientRect(),
+    );
+
+    if (!hasDomLayout) {
+      for (const anchor of this.mapStaticAnchors) {
+        this.applyMarkerLabelStyle(anchor.el, anchor.labelEl, 'below', 0);
+        defaultStaticModes.push('below');
+        defaultStaticShifts.push(0);
+      }
+    } else {
+      const placedStaticLabelRects: SimpleRect[] = [];
+      const staticModes: MapLabelPlacement[] = [
+        'below',
+        'above',
+        'below-offset',
+        'above-offset',
+      ];
+      const staticNudges = [0, 26, -26, 48, -48];
+      const margin = 3 * scaleX;
+
+      for (let i = 0; i < this.mapStaticAnchors.length; i++) {
+        const anchor = this.mapStaticAnchors[i];
+        let bestStaticScore = Infinity;
+        let bestMode: MapLabelPlacement = 'below';
+        let bestShift = 0;
+
+        for (let mIdx = 0; mIdx < staticModes.length; mIdx++) {
+          const mode = staticModes[mIdx];
+          for (const nudge of staticNudges) {
+            this.applyMarkerLabelStyle(anchor.el, anchor.labelEl, mode, nudge);
+            const appliedShift = this.clampLabelShiftX(
+              anchor.labelEl,
+              frameRect,
+              scaleX,
+              nudge,
+            );
+            const lr = anchor.labelEl.getBoundingClientRect();
+
+            let score = mIdx * 10 + Math.abs(appliedShift) * 0.1;
+            const clip =
+              Math.max(0, frameRect.left + margin - lr.left) +
+              Math.max(0, lr.right - (frameRect.right - margin)) +
+              Math.max(0, frameRect.top + margin - lr.top) +
+              Math.max(0, lr.bottom - (frameRect.bottom - margin));
+            if (clip > 0) {
+              score += 100000 + clip * 5000;
+            }
+            if (compassRect) {
+              const ca = getRectOverlapArea(lr, compassRect, 2 * scaleX);
+              if (ca > 0) score += 20000 + ca * 50;
+            }
+            for (const prevRect of placedStaticLabelRects) {
+              const area = getRectOverlapArea(lr, prevRect, 2 * scaleX);
+              if (area > 0) score += 20000 + area * 80;
+            }
+            for (let dIdx = 0; dIdx < staticDotRects.length; dIdx++) {
+              if (dIdx === i) continue;
+              const area = getRectOverlapArea(lr, staticDotRects[dIdx], 2 * scaleX);
+              if (area > 0) score += 5000 + area * 35;
+            }
+
+            if (score < bestStaticScore) {
+              bestStaticScore = score;
+              bestMode = mode;
+              bestShift = appliedShift;
+            }
+          }
+        }
+
+        this.applyMarkerLabelStyle(anchor.el, anchor.labelEl, bestMode, bestShift);
+        defaultStaticModes.push(bestMode);
+        defaultStaticShifts.push(bestShift);
+        placedStaticLabelRects.push(anchor.labelEl.getBoundingClientRect());
+      }
     }
 
     if (!qPct || !this.mapQuestMarkerEl || !this.mapQuestLabelEl || !this.mapQuestDotEl) {
@@ -1060,18 +1184,19 @@ export class ModalsController {
     const candidates: CandidateSpec[] = [];
     if (nearestAnchor) {
       if (qPct.top <= nearestAnchor.top + 1.5) {
-        // Quête au même point ou au-dessus du marqueur (ex. Donjon) : étiquette de quête AU-DESSUS en priorité
+        // Quête au même point ou au-dessus du marqueur (ex. Donjon) : évite tout contact avec la pastille ★ empilée
         candidates.push(
           { questMode: 'above', flipIdx: -1, flipMode: 'below', flipNudges: [0], questNudges: [0, -24, 24, -44, 44] },
+          { questMode: 'above-offset', flipIdx: -1, flipMode: 'below', flipNudges: [0], questNudges: [0, -24, 24, -44, 44] },
           { questMode: 'below-offset', flipIdx: -1, flipMode: 'below', flipNudges: [0], questNudges: [0, -24, 24, -44, 44] },
-          { questMode: 'above-offset', flipIdx: -1, flipMode: 'below', flipNudges: [0], questNudges: [0, -24, 24] },
+          { questMode: 'below', flipIdx: nearestIdx, flipMode: 'above-offset', flipNudges: [0, -28, 28, -48, 48], questNudges: [0, -24, 24] },
           { questMode: 'below', flipIdx: nearestIdx, flipMode: 'above', flipNudges: [0, -28, 28, -48, 48], questNudges: [0, -24, 24] },
         );
       } else {
         // Quête juste sous le marqueur proche (ex. Maire Moustache sous Miaou-bourg) :
-        // bascule l'étiquette statique au-dessus (avec léger décalage si un donjon est proche) ou décale la quête
         candidates.push(
           { questMode: 'below', flipIdx: nearestIdx, flipMode: 'above', flipNudges: [0, -28, 28, -48, 48], questNudges: [0, -20, 20] },
+          { questMode: 'below', flipIdx: nearestIdx, flipMode: 'above-offset', flipNudges: [0, -28, 28, -48, 48], questNudges: [0, -20, 20] },
           { questMode: 'below-offset', flipIdx: -1, flipMode: 'below', flipNudges: [0], questNudges: [0, -24, 24, -44, 44] },
           { questMode: 'above-offset', flipIdx: -1, flipMode: 'below', flipNudges: [0], questNudges: [0, -24, 24] },
           { questMode: 'above', flipIdx: -1, flipMode: 'below', flipNudges: [0], questNudges: [0, -24, 24] },
@@ -1087,9 +1212,8 @@ export class ModalsController {
       );
     }
 
-    const compassRect = this.mapCompassEl?.getBoundingClientRect() ?? null;
     const dotRects: SimpleRect[] = [
-      ...this.mapStaticAnchors.map((a) => a.dotEl.getBoundingClientRect()),
+      ...staticDotRects,
       this.mapQuestDotEl.getBoundingClientRect(),
     ];
     const questDotIdx = this.mapStaticAnchors.length;
@@ -1123,7 +1247,7 @@ export class ModalsController {
             this.applyMarkerLabelStyle(
               anchor.el,
               anchor.labelEl,
-              'below',
+              defaultStaticModes[i],
               defaultStaticShifts[i],
             );
           }
@@ -1191,17 +1315,14 @@ export class ModalsController {
             }
           }
 
-          // Pénalité si une étiquette recouvre la pastille d'un autre marqueur
+          // Pénalité si une étiquette recouvre la pastille d'un autre marqueur (marge généreuse pour le pulse ★)
           for (let i = 0; i < labelRects.length; i++) {
             for (let j = 0; j < dotRects.length; j++) {
               if (i === j) continue;
-              // Si la quête est empilée exactement sur son ancre statique, les deux pastilles coïncident
-              if (isStacked && ((i === questDotIdx && j === nearestIdx) || (i === nearestIdx && j === questDotIdx))) {
-                continue;
-              }
-              const area = getRectOverlapArea(labelRects[i], dotRects[j], 1 * scaleX);
+              const pad = j === questDotIdx ? 5 * scaleX : 2 * scaleX;
+              const area = getRectOverlapArea(labelRects[i], dotRects[j], pad);
               if (area > 0) {
-                score += 3000 + area * 25;
+                score += 6000 + area * 40;
               }
             }
           }
@@ -1234,7 +1355,7 @@ export class ModalsController {
         this.applyMarkerLabelStyle(
           anchor.el,
           anchor.labelEl,
-          'below',
+          defaultStaticModes[i],
           defaultStaticShifts[i],
         );
       }
@@ -1518,7 +1639,13 @@ export class ModalsController {
                 ? ` → ${Math.round(p.maxHp * (def.instantHealPct ?? 0.25) + nextPower)} PV`
                 : ''
             }`
-          : `Puissance : ${curPower}${!isMax ? ` → ${nextPower}` : ''} dégâts`;
+          : def.id === 'aegis_purr'
+            ? `Bouclier : ${Math.round(p.maxHp * (def.shieldHpPct ?? 0.24) + curPower)} PV${
+                !isMax
+                  ? ` → ${Math.round(p.maxHp * (def.shieldHpPct ?? 0.24) + nextPower)} PV`
+                  : ''
+              }`
+            : `Puissance : ${curPower}${!isMax ? ` → ${nextPower}` : ''} dégâts`;
 
       const card = document.createElement('div');
       card.className = 'forge-spell-card';

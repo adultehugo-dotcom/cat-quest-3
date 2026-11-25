@@ -109,12 +109,45 @@ function getSpellSvgMarkup(spellId: SpellId): string {
         <path d="M18 42 C18 33 25 29 32 29 C39 29 46 33 46 42 C46 50 40 54 32 54 C24 54 18 50 18 42 Z" fill="url(#fg-heal)" stroke="#2b1e16" stroke-width="2.8"/>
         <path d="M32 36 V47 M26.5 41.5 H37.5" stroke="#ffffff" stroke-width="3.2" stroke-linecap="round"/>
       </svg>`;
+    case 'aegis_purr':
+      return `<svg class="spell-slot-icon" viewBox="0 0 64 64" aria-hidden="true">
+        <defs>
+          <linearGradient id="fg-aegis" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#fff4b8"/>
+            <stop offset="52%" stop-color="#ffd166"/>
+            <stop offset="100%" stop-color="#3cd8eb"/>
+          </linearGradient>
+        </defs>
+        <path d="M32 7 L51 15 L48 39 Q44 51 32 57 Q20 51 16 39 L13 15 Z" fill="url(#fg-aegis)" stroke="#2b1e16" stroke-width="3.2" stroke-linejoin="round"/>
+        <path d="M32 17 L41 22 L39 36 Q37 43 32 47 Q27 43 25 36 L23 22 Z" fill="rgba(255,255,255,0.42)" stroke="#2b1e16" stroke-width="2"/>
+      </svg>`;
+    case 'pounce_dash':
+      return `<svg class="spell-slot-icon" viewBox="0 0 64 64" aria-hidden="true">
+        <path d="M10 42 Q26 24 54 18 Q40 31 35 46 Q29 37 10 42 Z" fill="#4de8d6" stroke="#2b1e16" stroke-width="3" stroke-linejoin="round"/>
+        <path d="M12 24 L31 20 M8 32 L26 28 M16 50 L36 44" stroke="#fff3a8" stroke-width="3.4" stroke-linecap="round"/>
+      </svg>`;
+    case 'meteor_paw':
+      return `<svg class="spell-slot-icon" viewBox="0 0 64 64" aria-hidden="true">
+        <defs>
+          <radialGradient id="fg-meteor" cx="42%" cy="48%" r="54%">
+            <stop offset="0%" stop-color="#fff6c7"/>
+            <stop offset="48%" stop-color="#ffae42"/>
+            <stop offset="100%" stop-color="#9e38e8"/>
+          </radialGradient>
+        </defs>
+        <path d="M16 10 L40 24 L29 29 L52 40 L24 44 L30 33 L10 22 Z" fill="#c95bff" opacity="0.7"/>
+        <circle cx="38" cy="38" r="15" fill="url(#fg-meteor)" stroke="#2b1e16" stroke-width="3"/>
+        <polygon points="38,27 41,34 48,35 43,40 44,47 38,43 32,47 33,40 28,35 35,34" fill="#fff8d6"/>
+      </svg>`;
   }
 }
 
 function getZoneDisplayName(state: GameState): string {
   if (state.zoneId !== 'overworld') {
     return DUNGEONS[state.zoneId].name;
+  }
+  if (state.ship.mode === 'sailing' || state.ship.mode === 'docking') {
+    return 'Mer des Ronrons';
   }
   if (state.islandId !== 'felingard') {
     return NEW_ISLANDS[state.islandId].name;
@@ -207,6 +240,7 @@ export class HudController {
   private readonly questObj: HTMLDivElement;
 
   private readonly promptBtn: HTMLButtonElement;
+  private readonly promptKey: HTMLSpanElement;
   private readonly promptText: HTMLSpanElement;
   private readonly spellBar: HTMLDivElement;
 
@@ -227,6 +261,7 @@ export class HudController {
   private lastQuestSignature = '';
   private lastPromptText = '';
   private lastPromptVisible = false;
+  private lastPromptStatusOnly = false;
   private lastSpellBarVisible = true;
   private goldBumpTimer: number | null = null;
   private toastTimers: Set<number> = new Set();
@@ -413,14 +448,16 @@ export class HudController {
     this.promptBtn = document.createElement('button');
     this.promptBtn.type = 'button';
     this.promptBtn.className = 'interact-prompt is-hidden';
-    const promptKey = document.createElement('span');
-    promptKey.className = 'keycap';
-    promptKey.textContent = 'E';
+    this.promptKey = document.createElement('span');
+    this.promptKey.className = 'keycap';
+    this.promptKey.textContent = 'E';
     this.promptText = document.createElement('span');
-    this.promptBtn.append(promptKey, this.promptText);
+    this.promptBtn.append(this.promptKey, this.promptText);
     this.promptBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      this.callbacks.onInteract();
+      if (!this.promptBtn.disabled) {
+        this.callbacks.onInteract();
+      }
     });
 
     this.spellBar = document.createElement('div');
@@ -601,6 +638,19 @@ export class HudController {
         }
         case 'toast': {
           if (ev.text) {
+            emitUniqueToast(ev.text, ev.toastVariant ?? 'info', 3000);
+          }
+          break;
+        }
+        case 'ship_refused': {
+          if (ev.text) {
+            emitUniqueToast(ev.text, 'warning', 2800);
+          }
+          break;
+        }
+        case 'ship_boarded':
+        case 'ship_disembarked': {
+          if (ev.text) {
             emitUniqueToast(ev.text, 'info', 3000);
           }
           break;
@@ -622,7 +672,9 @@ export class HudController {
     // afin d'éviter tout flash fugace lors d'une Nouvelle Partie (dialogue d'intro immédiat)
     const isDialogueOpen =
       state.dialogue.active && state.dialogue.lines.length > 0;
-    const showSpellBar = !isDialogueOpen;
+    const isMaritimeLocked =
+      state.zoneId === 'overworld' && state.ship.mode !== 'parked';
+    const showSpellBar = !isDialogueOpen && !isMaritimeLocked;
     if (showSpellBar !== this.lastSpellBarVisible) {
       this.lastSpellBarVisible = showSpellBar;
       if (!wasVisible && shouldShow && !showSpellBar) {
@@ -676,16 +728,20 @@ export class HudController {
       this.keyBadge.classList.toggle('is-hidden', !p.hasRunicKey);
     }
 
-    // PV
+    // PV (+ bouclier Égide actif si présent)
     const hpCur = Math.max(0, Math.round(p.hp));
     const hpMax = Math.max(1, Math.round(p.maxHp));
+    const shieldCur =
+      (p.shieldTimer ?? 0) > 0 ? Math.max(0, Math.round(p.shieldHp ?? 0)) : 0;
     const hpRatio = Math.max(0, Math.min(1, p.hp / hpMax));
-    const hpStr = `${hpCur} / ${hpMax}`;
+    const hpStr =
+      shieldCur > 0 ? `${hpCur} / ${hpMax} (+${shieldCur})` : `${hpCur} / ${hpMax}`;
     if (hpStr !== this.lastHpStr) {
       this.lastHpStr = hpStr;
       this.hpText.textContent = hpStr;
       this.hpFill.style.width = `${(hpRatio * 100).toFixed(1)}%`;
     }
+    this.hpTrack.classList.toggle('has-shield', shieldCur > 0);
     const isLowHp = hpRatio > 0 && hpRatio < 0.28;
     if (isLowHp !== this.lastLowHp) {
       this.lastLowHp = isLowHp;
@@ -724,17 +780,37 @@ export class HudController {
     // Barre des 4 Sorts (visibilité déjà synchronisée avec l'état de dialogue en début d'update)
     this.updateSpellBar(state);
 
-    // Bulle d'interaction contextuelle [E]
-    const showPrompt =
+    // Bulle d'interaction contextuelle [E] (ou statut discret d'accostage)
+    const canShowPromptSurface =
       state.screen === 'playing' &&
       state.activeModal === 'none' &&
-      !state.dialogue.active &&
-      state.nearestInteractable !== null;
-    const promptLabel = state.nearestInteractable?.label ?? '';
+      !state.dialogue.active;
+    const isDockingStatus =
+      canShowPromptSurface &&
+      state.zoneId === 'overworld' &&
+      state.ship.mode === 'docking';
+    const isShipJumpTransition =
+      state.zoneId === 'overworld' &&
+      (state.ship.mode === 'boarding' || state.ship.mode === 'disembarking');
+
+    const showPrompt =
+      isDockingStatus ||
+      (canShowPromptSurface &&
+        !isShipJumpTransition &&
+        state.nearestInteractable !== null);
+    const promptLabel = isDockingStatus
+      ? 'Accostage en cours...'
+      : (state.nearestInteractable?.label ?? '');
 
     if (showPrompt !== this.lastPromptVisible) {
       this.lastPromptVisible = showPrompt;
       this.promptBtn.classList.toggle('is-hidden', !showPrompt);
+    }
+    if (isDockingStatus !== this.lastPromptStatusOnly) {
+      this.lastPromptStatusOnly = isDockingStatus;
+      this.promptBtn.classList.toggle('is-status', isDockingStatus);
+      this.promptBtn.disabled = isDockingStatus;
+      this.promptKey.classList.toggle('is-hidden', isDockingStatus);
     }
     if (showPrompt && promptLabel !== this.lastPromptText) {
       this.lastPromptText = promptLabel;

@@ -1,6 +1,13 @@
 import type { EnemyTypeId, EquipSlot, SpeakerPortraitId } from '../game/types';
 import { STARTING_EQUIPMENT } from '../game/types';
 import {
+  ENEMY_ANIM_CLIPS,
+  NPC_ANIM_CLIPS,
+  type NpcId,
+  type SpriteGridSpec,
+  resolveActiveSpriteGrid,
+} from './hdAssets';
+import {
   CREAM_HIGHLIGHT,
   GOLD_LIGHT,
   GOLD_MID,
@@ -10,7 +17,10 @@ import {
   drawRoundedRect,
   drawStar,
 } from './palette';
-import { drawHeroPortraitDataUrl } from './spriteHero';
+import {
+  type HeroModularImages,
+  drawHeroPortraitDataUrl,
+} from './spriteHero';
 
 const speakerPortraitCache = new Map<string, string>();
 
@@ -1213,14 +1223,16 @@ function drawInnkeeperPortrait(ctx: CanvasRenderingContext2D): void {
 export interface HdPortraitImages {
   miaou_sprit?: HTMLImageElement;
   mayor_moustache?: HTMLImageElement;
+  kit_chat?: HTMLImageElement;
+  innkeeper?: HTMLImageElement;
   boss_rat_king?: HTMLImageElement;
   boss_dragon_claw?: HTMLImageElement;
-  hero_armor?: HTMLImageElement;
-  hero_portrait?: HTMLImageElement;
+  heroModular?: HeroModularImages;
 }
 
 /**
- * Crée une variante HD Phase 2 enflammée de Drak-Miaou à partir du PNG HD 512×512.
+ * Crée une variante HD Phase 2 enflammée de Drak-Miaou à partir du PNG HD 512×512
+ * (extrait proprement la première cellule si l'image source est une planche multi-frames).
  */
 export function drawBossDragonPhase2HdCanvas(
   hdDragonImg: HTMLImageElement,
@@ -1230,8 +1242,14 @@ export function drawBossDragonPhase2HdCanvas(
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
-  // Sprite HD principal
-  ctx.drawImage(hdDragonImg, 0, 0, size, size);
+  const rawW = hdDragonImg.naturalWidth || hdDragonImg.width || size;
+  const rawH = hdDragonImg.naturalHeight || hdDragonImg.height || size;
+  const grid = resolveActiveSpriteGrid(ENEMY_ANIM_CLIPS.boss_dragon_claw.idle, rawW, rawH);
+  const cellW = rawW / Math.max(1, grid.cols);
+  const cellH = rawH / Math.max(1, grid.rows);
+
+  // Sprite HD principal (cellule 0)
+  ctx.drawImage(hdDragonImg, 0, 0, cellW, cellH, 0, 0, size, size);
 
   // Lueur chaude additive sur le poitrail / gueule sans casser la transparence
   ctx.save();
@@ -1248,6 +1266,78 @@ export function drawBossDragonPhase2HdCanvas(
 }
 
 /**
+ * Crée une planche complète Phase 2 enflammée pour `boss_dragon_claw` en préservant
+ * exactement la grille `(cols × rows)` de la spritesheet source (4 frames ou 30/45 frames),
+ * permettant au lecteur UV zéro-allocation de fonctionner à l'identique en Phase 2.
+ */
+export function drawBossDragonPhase2SheetCanvas(
+  sheetImg: HTMLImageElement,
+  grid: SpriteGridSpec,
+): HTMLCanvasElement {
+  const w = Math.max(1, sheetImg.naturalWidth || sheetImg.width);
+  const h = Math.max(1, sheetImg.naturalHeight || sheetImg.height);
+  const cols = Math.max(1, grid.cols);
+  const rows = Math.max(1, grid.rows);
+  const cellW = w / cols;
+  const cellH = h / rows;
+
+  const { canvas, ctx } = createCanvas(w, h);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(sheetImg, 0, 0, w, h);
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-atop';
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const cx = (c + 0.5) * cellW;
+      const cy = (r + 0.44) * cellH;
+      const radOuter = Math.max(cellW, cellH) * 0.46;
+      const heat = ctx.createRadialGradient(
+        cx,
+        cy,
+        radOuter * 0.1,
+        cx,
+        cy + cellH * 0.04,
+        radOuter,
+      );
+      heat.addColorStop(0, 'rgba(255, 190, 72, 0.34)');
+      heat.addColorStop(0.55, 'rgba(255, 72, 28, 0.18)');
+      heat.addColorStop(1, 'rgba(180, 15, 25, 0)');
+      ctx.fillStyle = heat;
+      ctx.fillRect(c * cellW, r * cellH, cellW, cellH);
+    }
+  }
+  ctx.restore();
+
+  return canvas;
+}
+
+function getFirstFrameSizeForPortrait(
+  portraitId: Exclude<SpeakerPortraitId, 'hero'>,
+  img: HTMLImageElement,
+): { cellW: number; cellH: number } {
+  const rawW = img.naturalWidth || img.width;
+  const rawH = img.naturalHeight || img.height;
+  if (portraitId === 'boss_rat_king' || portraitId === 'boss_dragon_claw') {
+    const grid = resolveActiveSpriteGrid(ENEMY_ANIM_CLIPS[portraitId].idle, rawW, rawH);
+    return {
+      cellW: rawW / Math.max(1, grid.cols),
+      cellH: rawH / Math.max(1, grid.rows),
+    };
+  }
+  const npcClip = NPC_ANIM_CLIPS[portraitId as NpcId]?.idle;
+  if (npcClip) {
+    const grid = resolveActiveSpriteGrid(npcClip, rawW, rawH);
+    return {
+      cellW: rawW / Math.max(1, grid.cols),
+      cellH: rawH / Math.max(1, grid.rows),
+    };
+  }
+  return { cellW: rawW, cellH: rawH };
+}
+
+/**
  * Retourne un portrait DataURL PNG (256×256 en HD, 128×128 en fallback)
  * pour tous les interlocuteurs de dialogue.
  */
@@ -1259,8 +1349,7 @@ export function drawSpeakerPortraitDataUrl(
   if (portraitId === 'hero') {
     return drawHeroPortraitDataUrl(
       equipped ?? STARTING_EQUIPMENT,
-      hdPortraits?.hero_armor,
-      hdPortraits?.hero_portrait,
+      hdPortraits?.heroModular,
     );
   }
 
@@ -1269,11 +1358,15 @@ export function drawSpeakerPortraitDataUrl(
       ? hdPortraits?.miaou_sprit
       : portraitId === 'mayor_moustache'
         ? hdPortraits?.mayor_moustache
-        : portraitId === 'boss_rat_king'
-          ? hdPortraits?.boss_rat_king
-          : portraitId === 'boss_dragon_claw'
-            ? hdPortraits?.boss_dragon_claw
-            : undefined;
+        : portraitId === 'kit_chat'
+          ? hdPortraits?.kit_chat
+          : portraitId === 'innkeeper'
+            ? hdPortraits?.innkeeper
+            : portraitId === 'boss_rat_king'
+              ? hdPortraits?.boss_rat_king
+              : portraitId === 'boss_dragon_claw'
+                ? hdPortraits?.boss_dragon_claw
+                : undefined;
 
   const cacheKey = `${portraitId}_${hdImg ? 'hd' : 'proc'}`;
   const cached = speakerPortraitCache.get(cacheKey);
@@ -1314,16 +1407,19 @@ export function drawSpeakerPortraitDataUrl(
   ctx.fillRect(0, 0, size, size);
 
   if (hdImg) {
-    const srcW = hdImg.naturalWidth || hdImg.width;
-    const srcH = hdImg.naturalHeight || hdImg.height;
+    const { cellW: srcW, cellH: srcH } = getFirstFrameSizeForPortrait(portraitId, hdImg);
     if (portraitId === 'miaou_sprit') {
       ctx.drawImage(hdImg, srcW * 0.06, srcH * 0.04, srcW * 0.88, srcH * 0.88, 6, 6, size - 12, size - 12);
-    } else if (portraitId === 'mayor_moustache') {
-      ctx.drawImage(hdImg, srcW * 0.14, srcH * 0.02, srcW * 0.72, srcH * 0.72, 0, 4, size, size);
+    } else if (
+      portraitId === 'mayor_moustache' ||
+      portraitId === 'kit_chat' ||
+      portraitId === 'innkeeper'
+    ) {
+      ctx.drawImage(hdImg, srcW * 0.12, srcH * 0.04, srcW * 0.76, srcH * 0.76, 0, 4, size, size);
     } else if (portraitId === 'boss_rat_king') {
       ctx.drawImage(hdImg, srcW * 0.12, srcH * 0.02, srcW * 0.76, srcH * 0.76, 0, 4, size, size);
     } else if (portraitId === 'boss_dragon_claw') {
-      ctx.drawImage(hdImg, srcW * 0.12, srcH * 0.02, srcW * 0.76, srcH * 0.76, 0, 4, size, size);
+      ctx.drawImage(hdImg, srcW * 0.06, srcH * 0.04, srcW * 0.88, srcH * 0.88, 0, 4, size, size);
     }
   } else if (portraitId === 'miaou_sprit') {
     const sprite = drawCompanionCanvas();

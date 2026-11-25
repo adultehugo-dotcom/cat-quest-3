@@ -26,6 +26,9 @@ export function createEmptyInputState(): InputState {
       lightnyan: false,
       freezepaw: false,
       healing_paw: false,
+      aegis_purr: false,
+      pounce_dash: false,
+      meteor_paw: false,
     },
     aimWorldPos: null,
     usingPointerAim: false,
@@ -66,6 +69,9 @@ export class InputManager {
     lightnyan: false,
     freezepaw: false,
     healing_paw: false,
+    aegis_purr: false,
+    pounce_dash: false,
+    meteor_paw: false,
   };
   private syntheticInteract = false;
   private syntheticInventory = false;
@@ -96,6 +102,9 @@ export class InputManager {
 
     if (!this.keysDown.has(e.code)) {
       this.keysJustPressed.add(e.code);
+      if (typeof e.key === 'string' && e.key.toLowerCase() === 'm') {
+        this.keysJustPressed.add('__MapKey__');
+      }
     }
     this.keysDown.add(e.code);
 
@@ -300,10 +309,17 @@ export class InputManager {
       this.keysJustPressed.has('Digit3') || this.keysJustPressed.has('KeyR');
     const kSpellHeal =
       this.keysJustPressed.has('Digit4') || this.keysJustPressed.has('KeyF');
+    const kSpellAegis =
+      this.keysJustPressed.has('Digit5') || this.keysJustPressed.has('KeyC');
+    const kSpellPounce =
+      this.keysJustPressed.has('Digit6') || this.keysJustPressed.has('KeyV');
+    const kSpellMeteor =
+      this.keysJustPressed.has('Digit7') || this.keysJustPressed.has('KeyX');
 
     const kInventoryPressed =
       this.keysJustPressed.has('KeyI') || this.keysJustPressed.has('Tab');
-    const kMapPressed = this.keysJustPressed.has('KeyM');
+    const kMapPressed =
+      this.keysJustPressed.has('KeyM') || this.keysJustPressed.has('__MapKey__');
     const kPausePressed = this.keysJustPressed.has('Escape');
     const kConfirmPressed =
       this.keysJustPressed.has('Enter') ||
@@ -402,6 +418,12 @@ export class InputManager {
       kSpellFreeze || gpSpellFreeze || this.syntheticSpells.freezepaw;
     state.spellPressed.healing_paw =
       kSpellHeal || gpSpellHeal || this.syntheticSpells.healing_paw;
+    state.spellPressed.aegis_purr =
+      kSpellAegis || this.syntheticSpells.aegis_purr;
+    state.spellPressed.pounce_dash =
+      kSpellPounce || this.syntheticSpells.pounce_dash;
+    state.spellPressed.meteor_paw =
+      kSpellMeteor || this.syntheticSpells.meteor_paw;
 
     state.toggleInventoryPressed =
       kInventoryPressed || gpInventoryPressed || this.syntheticInventory;
@@ -439,6 +461,9 @@ export class InputManager {
     this.syntheticSpells.lightnyan = false;
     this.syntheticSpells.freezepaw = false;
     this.syntheticSpells.healing_paw = false;
+    this.syntheticSpells.aegis_purr = false;
+    this.syntheticSpells.pounce_dash = false;
+    this.syntheticSpells.meteor_paw = false;
     this.syntheticInteract = false;
     this.syntheticInventory = false;
     this.syntheticMap = false;

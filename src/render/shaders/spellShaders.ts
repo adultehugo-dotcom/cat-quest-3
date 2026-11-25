@@ -738,3 +738,186 @@ export function createQuestArrowMaterial(): THREE.ShaderMaterial {
     `,
   });
 }
+
+// ============================================================================
+// 6. ÉGIDE DE RONRON : Dôme runique doré-turquoise protecteur (Fresnel + hex)
+// ============================================================================
+
+export function createAegisDomeMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    name: 'AegisPurrDomeShader',
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uTime: { value: 0 },
+      uProgress: { value: 0 },
+    },
+    vertexShader: /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      varying vec3 vNormView;
+      varying vec3 vViewPos;
+      void main() {
+        vUv = uv;
+        vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+        vViewPos = -mvPos.xyz;
+        vNormView = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * mvPos;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      precision highp float;
+      uniform float uTime;
+      uniform float uProgress;
+      varying vec2 vUv;
+      varying vec3 vNormView;
+      varying vec3 vViewPos;
+
+      void main() {
+        vec3 n = normalize(vNormView);
+        vec3 v = normalize(vViewPos);
+        float fresnel = pow(1.0 - abs(dot(n, v)), 2.2);
+
+        // Motif runique en losanges lumineux qui tournent autour du dôme
+        float diagA = abs(sin((vUv.x * 10.0 + vUv.y * 6.0 + uTime * 0.6) * 3.14159));
+        float diagB = abs(sin((vUv.x * 10.0 - vUv.y * 6.0 - uTime * 0.45) * 3.14159));
+        float lattice = smoothstep(0.86, 0.98, max(diagA, diagB));
+        float wave = 0.5 + 0.5 * sin(vUv.y * 16.0 - uTime * 6.0);
+
+        float prog = clamp(uProgress, 0.0, 1.0);
+        float fade = (1.0 - smoothstep(0.72, 1.0, prog)) * smoothstep(0.0, 0.14, prog + 0.08);
+        vec3 gold = vec3(1.05, 0.78, 0.24);
+        vec3 cyan = vec3(0.28, 0.96, 1.18);
+        vec3 col = mix(gold, cyan, fresnel * 0.68 + wave * 0.22) * (0.68 + lattice * 0.58);
+        float alpha = clamp((fresnel * 0.56 + lattice * 0.22 + 0.05) * fade, 0.0, 0.58);
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+  });
+}
+
+// ============================================================================
+// 7. BOND FOUDROYANT : Ruban cinétique turquoise-or de ruée féline
+// ============================================================================
+
+export function createPounceRibbonMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    name: 'PounceDashRibbonShader',
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+    uniforms: {
+      uTime: { value: 0 },
+      uProgress: { value: 0 },
+    },
+    vertexShader: /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      precision highp float;
+      uniform float uTime;
+      uniform float uProgress;
+      varying vec2 vUv;
+
+      void main() {
+        float prog = clamp(uProgress, 0.0, 1.0);
+        float yDist = abs(vUv.y - 0.5) * 2.0;
+
+        // Trois stries de griffes de vent animées le long de la trajectoire
+        float clawCenter = exp(-pow(yDist * 3.8, 2.0));
+        float clawSide = exp(-pow(abs(yDist - 0.52) * 7.0, 2.0));
+        float streak = sin(vUv.x * 18.0 - uTime * 22.0) * 0.25 + 0.75;
+        float tailFade = smoothstep(0.0, 0.18, vUv.x) * (1.0 - smoothstep(0.84, 1.0, vUv.x));
+        float sweepFront = 1.0 - smoothstep(prog * 1.15, prog * 1.15 + 0.22, vUv.x * 0.85);
+        float fadeOut = 1.0 - smoothstep(0.45, 1.0, prog);
+
+        vec3 cyan = vec3(0.32, 1.55, 1.45);
+        vec3 gold = vec3(2.1, 1.75, 0.65);
+        vec3 col = mix(cyan, gold, clawCenter * 0.72 + clawSide * 0.35);
+        float alpha = clamp((clawCenter * 0.88 + clawSide * 0.62) * streak * tailFade * sweepFront * fadeOut, 0.0, 0.94);
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+  });
+}
+
+// ============================================================================
+// 8. CHUTE D'ÉTOILES : Onde de choc astrale & sigil runique d'impact AoE
+// ============================================================================
+
+export function createMeteorBlastMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    name: 'MeteorPawBlastShader',
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+    uniforms: {
+      uTime: { value: 0 },
+      uProgress: { value: 0 },
+    },
+    vertexShader: /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      precision highp float;
+      uniform float uTime;
+      uniform float uProgress;
+      varying vec2 vUv;
+
+      ${SHARED_NOISE_GLSL}
+
+      void main() {
+        vec2 p = (vUv - 0.5) * 2.0;
+        float r = length(p);
+        if (r > 1.0) discard;
+
+        float angle = atan(p.y, p.x);
+        float prog = clamp(uProgress, 0.0, 1.0);
+
+        // Phase 1 (0..0.30) : sigil céleste de visée qui pulse; Phase 2 (0.30..1.0) : onde de choc stellaire
+        float impactT = smoothstep(0.24, 0.34, prog);
+        float postT = clamp((prog - 0.28) / 0.72, 0.0, 1.0);
+        float fadeOut = 1.0 - smoothstep(0.68, 1.0, prog);
+
+        float starRays = pow(abs(cos(angle * 5.0 + uTime * 2.5)), 4.0);
+        float outerSigil = exp(-pow((r - 0.88) * 18.0, 2.0)) * (0.65 + 0.35 * sin(angle * 8.0 - uTime * 6.0));
+        float shockR = mix(0.12, 0.96, 1.0 - pow(1.0 - postT, 2.4));
+        float noise = fbmNoise(vec2(angle * 3.0 + uTime * 2.0, r * 5.5 - uTime * 4.5));
+        float shockRing = exp(-pow((r - shockR + (noise - 0.5) * 0.14) * 9.0, 2.0)) * impactT;
+        float coreBurst = exp(-r * r * 5.5) * impactT * (1.0 - postT * 0.75);
+
+        vec3 violet = vec3(0.92, 0.24, 1.48);
+        vec3 amber = vec3(1.48, 0.86, 0.22);
+        vec3 whiteGold = vec3(1.75, 1.45, 0.88);
+
+        vec3 col = mix(violet, amber, shockRing * 0.72 + starRays * 0.35);
+        col = mix(col, whiteGold, coreBurst * 0.75);
+
+        float preAlpha = (outerSigil * 0.75 + starRays * smoothstep(0.95, 0.1, r) * 0.26) * (1.0 - postT * 0.85);
+        float blastAlpha = (shockRing * 0.85 + coreBurst * 0.62 + starRays * (1.0 - r) * 0.36 * impactT);
+        float alpha = clamp((preAlpha + blastAlpha) * (1.0 - smoothstep(0.84, 1.0, r)) * fadeOut, 0.0, 0.76);
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+  });
+}

@@ -11,22 +11,23 @@ import type {
 import {
   OVERWORLD_DATA,
   OVERWORLD_HALF_SIZE,
-  getIslandRadiusAtAngle,
 } from '../data/worldData';
 import {
   ALL_NEW_ISLANDS,
-  FELINGARD_DOCK_POS,
   NEW_ISLANDS,
-  getNewIslandRadiusAtAngle,
 } from '../data/worldIslands';
+import { getIslandTerrainHeightLocal } from '../game/shorelineNavigation';
 import { DUNGEONS } from '../data/dungeonsData';
 import { DUNGEON_PALETTE, GOLD_LIGHT } from '../art/palette';
 import { TextureRegistry } from '../art/textureRegistry';
 import {
+  type WaterDynamicUpdate,
   createWaterGeometry,
   createWaterMaterial,
   updateWaterMaterial,
 } from './shaders/waterShader';
+import type { WeatherSnapshot } from './weatherSystem';
+import { enableSpriteLighting } from './spriteLighting';
 
 const SPRITE_TILT_X = -0.48;
 const WATER_LEVEL_Y = -0.14;
@@ -35,9 +36,36 @@ export interface TorchLightPosition {
   x: number;
   y: number;
   z: number;
+  intensity?: number;
+  distance?: number;
+  outdoor?: boolean;
 }
 
-export type TorchLightsHandler = (positions: TorchLightPosition[]) => void;
+// Sources lumineuses prévues pour des lampadaires générés. Les huit plus proches
+// sont activées par le pool de SceneManager; chaque coordonnée est dégagée des
+// bâtiments, PNJ, routes principales et obstacles pour ne bloquer aucun passage.
+// La géométrie de sprite visible sera branchée sur ces mêmes coordonnées dès que
+// les visuels générés de lampadaires seront disponibles.
+export const OVERWORLD_LAMP_LIGHTS: readonly TorchLightPosition[] = [
+  { x: 2.4, y: 2.35, z: 21.0, intensity: 2.4, distance: 12.5, outdoor: true },
+  { x: -4.4, y: 2.35, z: 23.2, intensity: 2.35, distance: 12.5, outdoor: true },
+  { x: 5.6, y: 2.35, z: 23.2, intensity: 2.35, distance: 12.5, outdoor: true },
+  { x: 2.8, y: 2.35, z: 31.2, intensity: 2.25, distance: 12.5, outdoor: true },
+  { x: 0.3, y: 2.35, z: 5.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: 4.8, y: 2.35, z: -19.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: 8.2, y: 2.35, z: -36.0, intensity: 2.3, distance: 12.5, outdoor: true },
+  { x: 17.0, y: 2.35, z: 17.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: 27.0, y: 2.35, z: 9.0, intensity: 2.15, distance: 12.5, outdoor: true },
+  { x: -18.0, y: 2.35, z: 10.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: -32.0, y: 2.35, z: -10.0, intensity: 2.15, distance: 12.5, outdoor: true },
+  { x: 86.0, y: 2.35, z: 48.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: 68.0, y: 2.35, z: -84.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: -79.0, y: 2.35, z: 58.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: -111.0, y: 2.35, z: -74.0, intensity: 2.2, distance: 12.5, outdoor: true },
+  { x: 18.0, y: 2.35, z: -107.0, intensity: 2.2, distance: 12.5, outdoor: true },
+];
+
+export type TorchLightsHandler = (positions: readonly TorchLightPosition[]) => void;
 
 interface SwayEntry {
   mesh: THREE.Mesh;
@@ -128,11 +156,9 @@ const PROP_BASE_SIZES: Record<
 };
 
 /**
- * Construit un maillage diorama 3D de l'île de Félingard :
- * - Strictement plat à y = 0 sur toute la zone jouable + plage (`dist <= coastR + 0.35`)
- *   pour garantir un alignement parfait des ombres, télégraphes et collisions.
- * - Pente douce côtière plongeant sous la ligne d'eau (`y = -0.15`) afin que l'océan GLSL
- *   vienne lécher naturellement le rivage sableux sans aucun z-fighting ni bordure carrée !
+ * Construit un maillage diorama 3D de l'île de Félingard à partir de la source de vérité
+ * `getIslandTerrainHeightLocal` (plages douces + escarpements rocheux alignés au millimètre
+ * avec les collisions maritimes et la ligne d'eau `y = -0.14` à `R_coast + 0.60`).
  */
 function createIslandTerrainGeometry(mapSize: number): THREE.PlaneGeometry {
   const geo = new THREE.PlaneGeometry(mapSize, mapSize, 256, 256);
@@ -142,21 +168,7 @@ function createIslandTerrainGeometry(mapSize: number): THREE.PlaneGeometry {
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i);
     const z = pos.getZ(i);
-    const dist = Math.hypot(x, z);
-    const angle = Math.atan2(z, x);
-    const coastR = getIslandRadiusAtAngle(angle);
-
-    const flatEnd = coastR;
-    const slopeEnd = coastR + 3.55;
-    if (dist <= flatEnd) {
-      pos.setY(i, 0);
-    } else if (dist >= slopeEnd) {
-      pos.setY(i, -1.85);
-    } else {
-      const t = (dist - flatEnd) / (slopeEnd - flatEnd);
-      const smooth = t * t * (3 - 2 * t);
-      pos.setY(i, -1.85 * smooth);
-    }
+    pos.setY(i, getIslandTerrainHeightLocal('felingard', x, z));
   }
   pos.needsUpdate = true;
   geo.computeVertexNormals();
@@ -176,17 +188,7 @@ function createNewIslandTerrainGeometry(
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i);
     const z = pos.getZ(i);
-    const distance = Math.hypot(x, z);
-    const coastRadius = getNewIslandRadiusAtAngle(islandId, Math.atan2(z, x));
-    const slopeEnd = coastRadius + 3.55;
-    if (distance <= coastRadius) {
-      pos.setY(i, 0);
-    } else if (distance >= slopeEnd) {
-      pos.setY(i, -1.85);
-    } else {
-      const t = (distance - coastRadius) / (slopeEnd - coastRadius);
-      pos.setY(i, -1.85 * t * t * (3 - 2 * t));
-    }
+    pos.setY(i, getIslandTerrainHeightLocal(islandId, x, z));
   }
   pos.needsUpdate = true;
   geo.computeVertexNormals();
@@ -226,7 +228,6 @@ export class WorldRenderer {
   private readonly rootGroup = new THREE.Group();
   private zoneGroup: THREE.Group | null = null;
   private currentZoneId: ZoneId | null = null;
-  private currentIslandId: GameState['islandId'] | null = null;
   private torchLightsHandler: TorchLightsHandler | null = null;
 
   // Géométries partagées réutilisables (disposées uniquement dans dispose())
@@ -251,6 +252,30 @@ export class WorldRenderer {
   private waterMesh: THREE.Mesh | null = null;
   private waterTex: THREE.CanvasTexture | null = null;
   private waterShaderMat: THREE.ShaderMaterial | null = null;
+  private seaLabelMats: THREE.MeshBasicMaterial[] = [];
+  private readonly waterUpdatePayload: WaterDynamicUpdate = {
+    time: 0,
+    fogNear: 115,
+    fogFar: 265,
+    waveAmplitude: 1.18,
+    waveChoppiness: 0.48,
+    stormIntensity: 0,
+    windDirX: 0.86,
+    windDirZ: 0.51,
+    windIntensity: 0.2,
+    sunGlintIntensity: 1.05,
+    causticsIntensity: 0.9,
+    sunsetFactor: 0,
+    nightFactor: 0,
+    lightningFlash: 0,
+    shipX: 0,
+    shipZ: 53.03,
+    shipHeading: 0,
+    shipSignedSpeedRatio: 0,
+    shipAbsSpeedRatio: 0,
+    shipTurnRate: 0,
+    shipActive: true,
+  };
   private swayProps: SwayEntry[] = [];
   private portals: PortalVisual[] = [];
   private exitPortalMesh: THREE.Mesh | null = null;
@@ -260,7 +285,6 @@ export class WorldRenderer {
   private npcs: NpcVisual[] = [];
   private chests = new Map<string, ChestVisual>();
   private crystals = new Map<string, CrystalVisual>();
-  private shipGroup: THREE.Group | null = null;
 
   private animTime = 0;
 
@@ -398,6 +422,7 @@ export class WorldRenderer {
         side: THREE.DoubleSide,
       }),
     );
+    enableSpriteLighting(material);
     const mesh = new THREE.Mesh(this.spriteGeo, material);
     mesh.position.set(x, options.y ?? 0, z);
     mesh.scale.set(width, height, 1);
@@ -428,6 +453,7 @@ export class WorldRenderer {
     this.waterMesh = null;
     this.waterTex = null;
     this.waterShaderMat = null;
+    this.seaLabelMats = [];
     this.swayProps = [];
     this.portals = [];
     this.exitPortalMesh = null;
@@ -437,7 +463,6 @@ export class WorldRenderer {
     this.npcs = [];
     this.chests.clear();
     this.crystals.clear();
-    this.shipGroup = null;
   }
 
   /**
@@ -446,7 +471,6 @@ export class WorldRenderer {
   public loadZone(zoneId: ZoneId, state?: GameState): void {
     this.clearZone();
     this.currentZoneId = zoneId;
-    this.currentIslandId = state?.islandId ?? 'felingard';
 
     const group = new THREE.Group();
     group.name = `Zone_${zoneId}`;
@@ -454,7 +478,7 @@ export class WorldRenderer {
     this.rootGroup.add(group);
 
     if (zoneId === 'overworld') {
-      this.torchLightsHandler?.([]);
+      this.torchLightsHandler?.(OVERWORLD_LAMP_LIGHTS);
       this.buildOverworld(group, state);
     } else {
       const dungeon = DUNGEONS[zoneId];
@@ -545,12 +569,14 @@ export class WorldRenderer {
   }
 
   private buildOverworld(group: THREE.Group, state?: GameState): void {
-    // 1. Océan GLSL animé (Ondes Gerstner, profondeur turquoise→abysse, caustiques & écume côtière)
-    const waterGeo = this.trackDisposable(createWaterGeometry(360, 256));
+    // 1. Océan GLSL réaliste & agité (6 trains Gerstner, profondeur Beer-Lambert, Fresnel, écume organique sur 6 îles)
+    const waterGeo = this.trackDisposable(createWaterGeometry(480, 288));
     const waterMat = this.trackDisposable(
       createWaterMaterial({
         coastOffset: 0.6,
         waveAmplitude: 1.0,
+        fogNear: 115,
+        fogFar: 265,
         coastIslands: [
           new THREE.Vector4(0, 0, 52.5, 1),
           ...ALL_NEW_ISLANDS.map((islandId) => {
@@ -600,10 +626,10 @@ export class WorldRenderer {
     groundMesh.renderOrder = 0;
     group.add(groundMesh);
 
+    // Rend toutes les 5 îles de l'archipel en continu (zéro rebuild à l'accostage)
     for (const islandId of ALL_NEW_ISLANDS) {
-      const active = islandId === (state?.islandId ?? 'felingard');
       const islandGeo = this.trackDisposable(
-        createNewIslandTerrainGeometry(islandId, active ? 96 : 32),
+        createNewIslandTerrainGeometry(islandId, 76),
       );
       const islandMat = this.trackDisposable(groundMat.clone());
       islandMat.color.setHex(ISLAND_TINTS[islandId]);
@@ -615,20 +641,10 @@ export class WorldRenderer {
         0,
         NEW_ISLANDS[islandId].centerZ,
       );
-      islandMesh.receiveShadow = active;
+      islandMesh.receiveShadow = true;
       islandMesh.castShadow = false;
       group.add(islandMesh);
     }
-
-    this.buildShip(group);
-    this.addDockVisual(
-      group,
-      state?.islandId === 'felingard'
-        ? FELINGARD_DOCK_POS
-        : state?.islandId
-          ? NEW_ISLANDS[state.islandId].dockPos
-          : FELINGARD_DOCK_POS,
-    );
 
     // 2b. Étiquettes cartographiques maritimes (`MER DES RONRONS`) au-dessus de l'océan
     for (const label of OVERWORLD_DATA.mapLabels) {
@@ -642,19 +658,20 @@ export class WorldRenderer {
           opacity: 0.88,
           depthWrite: false,
           side: THREE.DoubleSide,
+          fog: true,
         }),
       );
+      this.seaLabelMats.push(labelMat);
       const labelMesh = new THREE.Mesh(labelGeo, labelMat);
-      labelMesh.position.set(label.x, WATER_LEVEL_Y + 0.44, label.z);
+      labelMesh.position.set(label.x, WATER_LEVEL_Y + 0.62, label.z);
       labelMesh.rotation.y = -(label.rotation ?? 0);
       labelMesh.renderOrder = 1;
       labelMesh.userData.skipSSAO = true;
       group.add(labelMesh);
     }
 
-    // 3. Bâtiments de Miaou-bourg (toits en oreilles de chat + éclairage PBR & ombres portées)
-    const isFelingard = (state?.islandId ?? 'felingard') === 'felingard';
-    for (const b of isFelingard ? OVERWORLD_DATA.buildings : []) {
+    // 3. Bâtiments de Miaou-bourg (toujours présents en overworld)
+    for (const b of OVERWORLD_DATA.buildings) {
       const dims =
         b.kind === 'quest_board'
           ? { w: 2.9, h: 3.0, shadow: 1.15 }
@@ -688,7 +705,7 @@ export class WorldRenderer {
     }
 
     // 4. PNJ (Maire Moustache)
-    for (const npc of isFelingard ? OVERWORLD_DATA.npcs : []) {
+    for (const npc of OVERWORLD_DATA.npcs) {
       const npcId = npc.id;
       const { mesh, material } = this.createCutoutSprite(
         this.textures.getNpcTexture(npcId),
@@ -708,7 +725,7 @@ export class WorldRenderer {
 
     // 5. Entrées des 2 Donjons (+ badge Niv. X + barrière runique dynamique HDR)
     const hasKey = state?.player.hasRunicKey ?? false;
-    for (const portal of isFelingard ? OVERWORLD_DATA.dungeonPortals : []) {
+    for (const portal of OVERWORLD_DATA.dungeonPortals) {
       const theme: 'ghost_cave' | 'dragon_lair' =
         portal.targetZoneId === 'dungeon_dragon_lair' ? 'dragon_lair' : 'ghost_cave';
       const sealed = Boolean(portal.requiresRunicKey && !hasKey);
@@ -783,13 +800,12 @@ export class WorldRenderer {
       });
     }
 
-    // 6. Props 2.5D (arbres par biome, rochers, fleurs, champignons, panneaux)
-    const activeNewIsland =
-      state?.islandId && state.islandId !== 'felingard'
-        ? NEW_ISLANDS[state.islandId]
-        : null;
-    const islandProps = activeNewIsland?.props ?? OVERWORLD_DATA.props;
-    for (const prop of islandProps) {
+    // 6. Props 2.5D de TOUTES les 6 îles (arbres par biome, rochers, fleurs, champignons, panneaux)
+    const allOverworldProps = [
+      ...OVERWORLD_DATA.props,
+      ...ALL_NEW_ISLANDS.flatMap((id) => NEW_ISLANDS[id].props),
+    ];
+    for (const prop of allOverworldProps) {
       const spec = PROP_BASE_SIZES[prop.kind];
       const w = spec.w * prop.scale;
       const h = spec.h * prop.scale;
@@ -829,78 +845,6 @@ export class WorldRenderer {
         });
       }
     }
-  }
-
-  private addDockVisual(group: THREE.Group, position: { x: number; z: number }): void {
-    const wood = this.trackDisposable(
-      new THREE.MeshStandardMaterial({ color: 0x8c542d, roughness: 0.88 }),
-    );
-    const trim = this.trackDisposable(
-      new THREE.MeshStandardMaterial({ color: 0xc18a4d, roughness: 0.8 }),
-    );
-    const platform = new THREE.Group();
-    platform.position.set(position.x, 0.12, position.z - 1.1);
-    for (let plank = -1; plank <= 1; plank++) {
-      const board = new THREE.Mesh(
-        this.trackDisposable(new THREE.BoxGeometry(3.8, 0.22, 1.2)),
-        plank === 0 ? trim : wood,
-      );
-      board.position.z = plank * 1.15;
-      board.castShadow = true;
-      board.receiveShadow = true;
-      platform.add(board);
-    }
-    const postGeometry = this.trackDisposable(new THREE.CylinderGeometry(0.13, 0.16, 1.15, 6));
-    for (const x of [-1.7, 1.7]) {
-      for (const z of [-1.75, 1.75]) {
-        const post = new THREE.Mesh(postGeometry, wood);
-        post.position.set(x, -0.3, z);
-        post.castShadow = true;
-        platform.add(post);
-      }
-    }
-    group.add(platform);
-  }
-
-  private buildShip(group: THREE.Group): void {
-    const ship = new THREE.Group();
-    ship.name = 'IslandTravelShip';
-    const hullMaterial = this.trackDisposable(
-      new THREE.MeshStandardMaterial({ color: 0x8c482d, roughness: 0.8 }),
-    );
-    const sailMaterial = this.trackDisposable(
-      new THREE.MeshStandardMaterial({
-        color: 0xf3e7c7,
-        roughness: 0.95,
-        side: THREE.DoubleSide,
-      }),
-    );
-    const hull = new THREE.Mesh(
-      this.trackDisposable(new THREE.BoxGeometry(2.4, 0.45, 1.15)),
-      hullMaterial,
-    );
-    hull.position.y = 0.42;
-    hull.castShadow = true;
-    hull.receiveShadow = true;
-    ship.add(hull);
-
-    const mast = new THREE.Mesh(
-      this.trackDisposable(new THREE.CylinderGeometry(0.07, 0.09, 1.55, 6)),
-      hullMaterial,
-    );
-    mast.position.set(0, 1.35, 0);
-    mast.castShadow = true;
-    ship.add(mast);
-
-    const sail = new THREE.Mesh(
-      this.trackDisposable(new THREE.PlaneGeometry(1.05, 1.0)),
-      sailMaterial,
-    );
-    sail.position.set(0.05, 1.45, 0.04);
-    sail.castShadow = true;
-    ship.add(sail);
-    group.add(ship);
-    this.shipGroup = ship;
   }
 
   private buildDungeon(group: THREE.Group, dungeon: DungeonDefinition): void {
@@ -1007,11 +951,16 @@ export class WorldRenderer {
       group.add(this.createShadowMesh(pillar.x, pillar.z + 0.1, 1.25, 0.9));
     }
 
-    // 4. Torches au sol vacillantes HDR + Lumières dynamiques (via SceneManager si branché)
+    // 4. Torches au sol vacillantes HDR + Lumières dynamiques alignées sur la flamme exacte
+    const tiltAbs = Math.abs(SPRITE_TILT_X);
+    const flameDist = 1.35; // v ≈ 0.73 sur une torche ancrée au sol de hauteur 1.85
+    const flameLocalY = flameDist * Math.cos(tiltAbs);
+    const flameOffsetZ = -flameDist * Math.sin(tiltAbs);
     const torchPositions: TorchLightPosition[] = dungeon.torches.map((pos) => ({
       x: pos.x,
-      y: 1.5,
-      z: pos.z,
+      y: flameLocalY + 0.14,
+      z: pos.z + flameOffsetZ,
+      distance: 17,
     }));
     const useSceneTorchLights = this.torchLightsHandler !== null;
     if (useSceneTorchLights) {
@@ -1022,8 +971,6 @@ export class WorldRenderer {
     const maxFallbackLights = 6;
     const lightStep = Math.max(1, Math.ceil(torchCount / maxFallbackLights));
     const lightColor = dungeon.theme === 'dragon_lair' ? 0xff8a3d : 0xffaa52;
-    const tiltAbs = Math.abs(SPRITE_TILT_X);
-    const flameDist = 1.35; // v ≈ 0.73 sur une torche ancrée au sol de hauteur 1.85
 
     dungeon.torches.forEach((pos, idx) => {
       const torchTex = this.textures.getTorchTexture(0);
@@ -1041,6 +988,7 @@ export class WorldRenderer {
           side: THREE.DoubleSide,
         }),
       );
+      enableSpriteLighting(mat);
       const mesh = new THREE.Mesh(this.spriteGeo, mat);
       mesh.position.set(pos.x, 0, pos.z);
       mesh.scale.set(1.55, 1.85, 1);
@@ -1054,8 +1002,8 @@ export class WorldRenderer {
 
       const { mesh: glowMesh, material: glowMat } = this.createGlowBillboard(
         pos.x,
-        flameDist * Math.cos(tiltAbs),
-        pos.z - flameDist * Math.sin(tiltAbs) - 0.04,
+        flameLocalY,
+        pos.z + flameOffsetZ - 0.04,
         1.65,
         1.65,
         dungeon.theme === 'dragon_lair' ? 0xff7a2e : 0xffa642,
@@ -1069,8 +1017,8 @@ export class WorldRenderer {
         idx % lightStep === 0 &&
         this.torches.filter((t) => t.light).length < maxFallbackLights
       ) {
-        pointLight = new THREE.PointLight(lightColor, 6.5, 16, 1.6);
-        pointLight.position.set(pos.x, 1.5, pos.z);
+        pointLight = new THREE.PointLight(lightColor, 6.5, 17, 1.65);
+        pointLight.position.set(pos.x, flameLocalY + 0.14, pos.z + flameOffsetZ);
         group.add(pointLight);
       }
 
@@ -1322,48 +1270,104 @@ export class WorldRenderer {
 
   /**
    * Met à jour les animations du monde, la transition Overworld ↔ Donjon,
-   * l'océan GLSL, les coffres, les cristaux, la barrière runique et le halo d'interaction.
+   * l'océan GLSL synchronisé météo/bateau, les coffres, les cristaux et le halo d'interaction.
    */
-  public update(state: GameState, dt: number): void {
+  public update(
+    state: GameState,
+    dt: number,
+    weather?: WeatherSnapshot | null,
+    fogNear = 115,
+    fogFar = 265,
+  ): void {
     const safeDt = Math.min(Math.max(dt, 0), 0.05);
     this.animTime += safeDt;
 
-    if (
-      this.currentZoneId !== state.zoneId ||
-      this.currentIslandId !== state.islandId
-    ) {
+    if (this.currentZoneId !== state.zoneId) {
       this.loadZone(state.zoneId, state);
     }
 
     if (!this.zoneGroup) return;
 
-    if (this.shipGroup) {
-      const dockPosition =
-        state.islandId === 'felingard'
-          ? FELINGARD_DOCK_POS
-          : NEW_ISLANDS[state.islandId].dockPos;
-      const position = state.ship.isSailing ? state.ship.position : dockPosition;
-      this.shipGroup.position.set(position.x, 0, position.z);
-      this.shipGroup.rotation.y = state.ship.angle;
-      this.shipGroup.visible = state.zoneId === 'overworld';
-    }
-
     this.syncChests(state.chests, this.zoneGroup);
     this.syncHealingCrystals(state);
 
-    // 1. Eau océanique animée (Shader GLSL Gerstner/Simplex + écume côtière)
+    // 1. Eau océanique animée (6 trains Gerstner + météo + cycle jour-nuit + couplage bateau)
     if (this.waterShaderMat) {
-      updateWaterMaterial(this.waterShaderMat, this.animTime);
+      const p = this.waterUpdatePayload;
+      p.time = weather ? weather.oceanTime : this.animTime;
+      p.fogNear = fogNear;
+      p.fogFar = fogFar;
+
+      if (weather) {
+        p.sunDirection = weather.sunDirection;
+        p.sunColor = weather.sunColor;
+        p.ambientColor = weather.ambientColor;
+        p.skyReflectColor = weather.skyReflectColor;
+        p.horizonReflectColor = weather.horizonReflectColor;
+        p.shallowColor = weather.waterShallowColor;
+        p.midColor = weather.waterMidColor;
+        p.deepColor = weather.waterDeepColor;
+        p.foamColor = weather.waterFoamColor;
+        p.fogColor = weather.fogColor;
+        p.waveAmplitude = weather.waveAmplitude;
+        p.waveChoppiness = weather.waveChoppiness;
+        p.stormIntensity = weather.stormIntensity;
+        p.windDirX = weather.windDirX;
+        p.windDirZ = weather.windDirZ;
+        p.windIntensity = weather.windIntensity;
+        p.sunGlintIntensity = weather.sunGlintIntensity;
+        p.causticsIntensity = weather.causticsIntensity;
+        p.sunsetFactor = weather.sunsetFactor;
+        p.nightFactor = weather.nightFactor;
+        p.lightningFlash = weather.lightningFlash;
+      }
+
+      const ship = state.ship;
+      const isActivelyMoving = ship.mode === 'sailing' || ship.mode === 'docking';
+      p.shipActive = state.zoneId === 'overworld';
+      p.shipX = ship.position.x;
+      p.shipZ = ship.position.z;
+      p.shipHeading = ship.angle;
+      p.shipSignedSpeedRatio = isActivelyMoving
+        ? ship.speed >= 0
+          ? Math.min(1, ship.speed / 13.5)
+          : -Math.min(1, Math.abs(ship.speed) / 4.2)
+        : 0;
+      p.shipAbsSpeedRatio = isActivelyMoving
+        ? Math.min(1, Math.max(Math.abs(ship.speed) / 13.5, ship.wakeIntensity * 0.85))
+        : 0;
+      p.shipTurnRate = isActivelyMoving
+        ? Math.max(-1, Math.min(1, ship.angularVelocity * 0.65))
+        : 0;
+
+      updateWaterMaterial(this.waterShaderMat, p);
     } else if (this.waterMesh && this.waterTex) {
       this.waterMesh.position.y = WATER_LEVEL_Y + Math.sin(this.animTime * 1.4) * 0.03;
       this.waterTex.offset.x = (this.animTime * 0.012) % 1;
       this.waterTex.offset.y = Math.sin(this.animTime * 0.35) * 0.025;
     }
 
-    // 2. Légère brise sur les arbres
+    // Atténue doucement les étiquettes cartographiques maritimes la nuit, en brouillard ou tempête
+    if (this.seaLabelMats.length > 0) {
+      const labelDim = weather
+        ? Math.max(0.28, 0.82 - weather.fogIntensity * 0.38 - weather.nightFactor * 0.25)
+        : 0.82;
+      for (const mat of this.seaLabelMats) {
+        mat.opacity = labelDim;
+      }
+    }
+
+    // 2. Brise & rafales météo sur les arbres (calme -> souffle tempête)
+    const windPower = weather ? weather.windIntensity : 0.2;
+    const swayFreq = 1.65 + windPower * 2.15;
+    const swayBoost = 0.85 + windPower * 1.65;
     for (const entry of this.swayProps) {
       entry.mesh.rotation.z =
-        Math.sin(this.animTime * 1.65 + entry.phase) * entry.amplitude;
+        Math.sin(this.animTime * swayFreq + entry.phase) * entry.amplitude * swayBoost +
+        Math.sin(this.animTime * (swayFreq * 1.9) + entry.phase * 1.7) *
+          entry.amplitude *
+          windPower *
+          0.45;
     }
 
     // 3. Respiration douce des PNJ (Maire Moustache)
@@ -1463,7 +1467,7 @@ export class WorldRenderer {
       }
     }
 
-    // 9. Halo doré discret sous l'élément interactif le plus proche
+    // 9. Halo doré discret sous l'élément interactif le plus proche (ou zone de débarquement)
     const nearest = state.nearestInteractable;
     if (nearest && state.screen === 'playing' && !state.dialogue.active) {
       this.highlightRing.visible = true;
@@ -1473,16 +1477,22 @@ export class WorldRenderer {
           : nearest.type === 'dungeon_entrance'
             ? 0.25
             : 0;
-      this.highlightRing.position.set(nearest.x, 0.052, nearest.z + zOffset);
+      const ringY =
+        nearest.type === 'ship_board' ? WATER_LEVEL_Y + 0.18 : 0.052;
+      this.highlightRing.position.set(nearest.x, ringY, nearest.z + zOffset);
       const p = 1 + Math.sin(this.animTime * 5.0) * 0.05;
       const baseR =
-        nearest.type === 'dungeon_entrance' || nearest.type === 'dungeon_exit'
-          ? 1.45
-          : nearest.type === 'inn' || nearest.type === 'forge'
-            ? 1.05
-            : nearest.type === 'quest_board'
-              ? 0.85
-              : 1.05;
+        nearest.type === 'ship_board'
+          ? 2.75
+          : nearest.type === 'ship_disembark'
+            ? 1.25
+            : nearest.type === 'dungeon_entrance' || nearest.type === 'dungeon_exit'
+              ? 1.45
+              : nearest.type === 'inn' || nearest.type === 'forge'
+                ? 1.05
+                : nearest.type === 'quest_board'
+                  ? 0.85
+                  : 1.05;
       this.highlightRing.scale.set(baseR * p, 1, baseR * p);
       this.highlightRingMat.opacity = 0.56 + Math.sin(this.animTime * 5.0) * 0.16;
     } else {

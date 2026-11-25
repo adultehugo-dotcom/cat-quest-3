@@ -1,7 +1,9 @@
 import { DUNGEONS } from '../data/dungeonsData';
+import { NEW_ISLANDS } from '../data/worldIslands';
 import type {
   GameEvent,
   GameState,
+  IslandId,
   ScreenMode,
   SpeakerPortraitId,
   ZoneId,
@@ -15,6 +17,7 @@ export interface ScreensCallbacks {
   onReturnToTitle: () => void;
   onRespawnAtInn: () => void;
   onContinueAfterVictory: () => void;
+  onSetWeather: (condition: 'auto' | 'clear' | 'fog' | 'storm') => void;
 }
 
 function encodeSvg(svg: string): string {
@@ -111,8 +114,14 @@ function formatPlayTime(seconds: number): string {
   return `${mins} min ${pad(secs)} s`;
 }
 
-function getZoneBannerName(zoneId: ZoneId | undefined): string {
+function getZoneBannerName(
+  zoneId: ZoneId | undefined,
+  islandId?: IslandId,
+): string {
   if (!zoneId || zoneId === 'overworld') {
+    if (islandId && islandId !== 'felingard') {
+      return NEW_ISLANDS[islandId].name;
+    }
     return 'Île de Félingard';
   }
   return DUNGEONS[zoneId].name;
@@ -240,7 +249,7 @@ export class ScreensController {
         <span class="controls-memo-item"><span class="controls-memo-keys">ZQSD / WASD / Flèches / Stick G</span> Déplacer</span>
         <span class="controls-memo-item"><span class="controls-memo-keys">Clic G / Espace / J / A</span> Attaque (+PM)</span>
         <span class="controls-memo-item"><span class="controls-memo-keys">Clic D / Maj / K / B</span> Roulade</span>
-        <span class="controls-memo-item"><span class="controls-memo-keys">1-4 / A E R F / Gâchettes</span> Sorts</span>
+        <span class="controls-memo-item"><span class="controls-memo-keys">1-7 / A E R F C V X / Gâchettes</span> Sorts</span>
         <span class="controls-memo-item"><span class="controls-memo-keys">E / Entrée / X</span> Interagir</span>
         <span class="controls-memo-item"><span class="controls-memo-keys">I</span> Inventaire • <span class="controls-memo-keys">M</span> Carte • <span class="controls-memo-keys">Échap</span> Pause</span>
       </div>
@@ -331,8 +340,23 @@ export class ScreensController {
     returnTitleBtn.textContent = 'Retour au Titre';
     returnTitleBtn.addEventListener('click', () => this.callbacks.onReturnToTitle());
 
+    const weatherLabel = document.createElement('label');
+    weatherLabel.className = 'pause-weather-row';
+    weatherLabel.innerHTML = '<span>Météo</span>';
+    const weatherSelect = document.createElement('select');
+    weatherSelect.setAttribute('aria-label', 'Choisir la météo');
+    weatherSelect.innerHTML = `
+      <option value="auto">Automatique</option>
+      <option value="clear">Beau temps</option>
+      <option value="fog">Brouillard</option>
+      <option value="storm">Tempête</option>`;
+    weatherSelect.addEventListener('change', () => {
+      this.callbacks.onSetWeather(weatherSelect.value as 'auto' | 'clear' | 'fog' | 'storm');
+    });
+    weatherLabel.appendChild(weatherSelect);
+
     pauseButtons.append(resumeBtn, returnTitleBtn);
-    pauseCard.appendChild(pauseButtons);
+    pauseCard.append(weatherLabel, pauseButtons);
     this.pauseEl.appendChild(pauseCard);
 
     // ========================================================================
@@ -556,7 +580,7 @@ export class ScreensController {
         this.clearZoneBanner();
         this.showTransitionOverlay('Zzz... Miaou !', 1050);
       } else if (ev.type === 'zone_transition') {
-        this.showZoneBanner(getZoneBannerName(ev.zoneId));
+        this.showZoneBanner(getZoneBannerName(ev.zoneId, ev.islandId));
       }
     }
   }

@@ -241,6 +241,10 @@ export class FloatingTextManager {
           break;
         }
         case 'hit_player': {
+          if (ev.spellId === 'aegis_purr' && ev.text) {
+            this.spawn(px, 2.45, pz, ev.text, 'info');
+            break;
+          }
           if (ev.value !== undefined) {
             this.spawn(px, 2.25, pz, `-${ev.value}`, 'player_damage');
           }
@@ -278,6 +282,14 @@ export class FloatingTextManager {
               state.player.z,
               `+${ev.value} PV`,
               'heal',
+            );
+          } else if (ev.spellId === 'aegis_purr' && ev.value && ev.value > 0) {
+            this.spawn(
+              state.player.x,
+              2.65,
+              state.player.z,
+              `Égide +${ev.value}`,
+              'gold',
             );
           }
           break;

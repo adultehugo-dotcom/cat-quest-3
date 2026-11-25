@@ -11,9 +11,11 @@ import {
 import { getSpellDefinition, getSpellUpgradeCost } from '../data/spellsData';
 import { OVERWORLD_DATA } from '../data/worldData';
 import {
+  ALL_EQUIP_SLOTS,
   MAX_PLAYER_LEVEL,
   MAX_SPELL_LEVEL,
   MYSTERY_CHEST_COST,
+  OPTIONAL_EQUIP_SLOTS,
   STARTING_EQUIPMENT,
   type EquipSlot,
   type EquipmentDefinition,
@@ -137,15 +139,7 @@ export function computeAggregatedStats(player: PlayerState): {
   let def = base.def;
   let critChance = base.critChance;
 
-  const slots: EquipSlot[] = [
-    'weapon',
-    'secondary_weapon',
-    'shield',
-    'helmet',
-    'armor',
-    'trinket',
-  ];
-  for (const slot of slots) {
+  for (const slot of ALL_EQUIP_SLOTS) {
     const itemId = player.equipped[slot];
     if (!itemId) continue;
     const owned = player.inventory[itemId];
@@ -207,18 +201,29 @@ export function createInitialPlayerState(
       [STARTING_EQUIPMENT.weapon]: { id: STARTING_EQUIPMENT.weapon, level: 1 },
       [STARTING_EQUIPMENT.helmet]: { id: STARTING_EQUIPMENT.helmet, level: 1 },
       [STARTING_EQUIPMENT.armor]: { id: STARTING_EQUIPMENT.armor, level: 1 },
+      boots_leather: { id: 'boots_leather', level: 1 },
+      gloves_leather: { id: 'gloves_leather', level: 1 },
+      cape_traveler: { id: 'cape_traveler', level: 1 },
+      shield_wood: { id: 'shield_wood', level: 1 },
+      trinket_yarn: { id: 'trinket_yarn', level: 1 },
     },
     spellLevels: {
       flamepurr: 1,
       lightnyan: 1,
       freezepaw: 1,
       healing_paw: 1,
+      aegis_purr: 1,
+      pounce_dash: 1,
+      meteor_paw: 1,
     },
     spellCooldowns: {
       flamepurr: 0,
       lightnyan: 0,
       freezepaw: 0,
       healing_paw: 0,
+      aegis_purr: 0,
+      pounce_dash: 0,
+      meteor_paw: 0,
     },
     comboStep: 0,
     comboResetTimer: 0,
@@ -230,6 +235,9 @@ export function createInitialPlayerState(
     hitFlashTimer: 0,
     regenTimer: 0,
     regenTickAccum: 0,
+    shieldHp: 0,
+    shieldMaxHp: 0,
+    shieldTimer: 0,
     hasRunicKey: false,
     stats: { atk: 14, mag: 14, def: 4, critChance: 0.1 },
     dodgeDirX: 1,
@@ -359,6 +367,17 @@ export function equipItem(player: PlayerState, itemId: string): boolean {
   const def = getEquipmentDefinition(itemId);
   if (!owned || !def) return false;
   player.equipped[def.slot] = itemId;
+  recalculatePlayerStats(player);
+  return true;
+}
+
+/**
+ * Retire l'équipement d'un emplacement optionnel (bottes, gants, cape, bouclier, arme secondaire, accessoire).
+ */
+export function unequipSlot(player: PlayerState, slot: EquipSlot): boolean {
+  if (!OPTIONAL_EQUIP_SLOTS.includes(slot)) return false;
+  if (!player.equipped[slot]) return false;
+  player.equipped[slot] = '';
   recalculatePlayerStats(player);
   return true;
 }

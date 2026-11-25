@@ -14,6 +14,7 @@ import {
   updateTelegraphMaterial,
 } from './shaders/telegraphShader';
 import {
+  createAegisDomeMaterial,
   createFlameRingMaterial,
   createFrostMistMaterial,
   createHealBeamMaterial,
@@ -22,6 +23,8 @@ import {
   createIceCrystalMaterial,
   createLightningBeamMaterial,
   createLightningScorchMaterial,
+  createMeteorBlastMaterial,
+  createPounceRibbonMaterial,
   createQuestArrowMaterial,
 } from './shaders/spellShaders';
 
@@ -65,6 +68,16 @@ interface SpellEffectVisual {
   // Spécifique Soin-velours
   healBeamMesh?: THREE.Mesh;
   healRings?: THREE.Mesh[];
+  // Spécifique Égide de Ronron
+  aegisDomeMesh?: THREE.Mesh;
+  aegisRingMesh?: THREE.Mesh;
+  // Spécifique Bond Foudroyant
+  pounceRibbonMesh?: THREE.Mesh;
+  // Spécifique Chute d'Étoiles
+  meteorBlastMesh?: THREE.Mesh;
+  meteorOrbMesh?: THREE.Mesh;
+  meteorBeamMesh?: THREE.Mesh;
+  meteorImpactBurstDone?: boolean;
   followPlayer?: boolean;
 }
 
@@ -333,6 +346,8 @@ export class EffectsRenderer {
   private readonly beamCylinderGeo: THREE.CylinderGeometry;
   private readonly heatHazeCylinderGeo: THREE.CylinderGeometry;
   private readonly iceCrystalGeo: THREE.ConeGeometry;
+  private readonly aegisDomeGeo: THREE.SphereGeometry;
+  private readonly meteorOrbGeo: THREE.IcosahedronGeometry;
 
   // Flèche dorée directionnelle de quête (y = 0.095, renderOrder = 3)
   private readonly questArrowGroup: THREE.Group;
@@ -365,6 +380,12 @@ export class EffectsRenderer {
     // Cristal de glace 3D hexagonal taillé (base ancrée à y = 0)
     this.iceCrystalGeo = new THREE.ConeGeometry(0.32, 1.0, 6, 1, false);
     this.iceCrystalGeo.translate(0, 0.5, 0);
+
+    // Dôme sphérique hémisphérique partagé pour Égide de Ronron
+    this.aegisDomeGeo = new THREE.SphereGeometry(1.0, 24, 16, 0, Math.PI * 2, 0, Math.PI * 0.62);
+
+    // Orbe météore astral partagé pour Chute d'Étoiles
+    this.meteorOrbGeo = new THREE.IcosahedronGeometry(0.75, 1);
 
     this.ghostGeo = new THREE.PlaneGeometry(1, 1);
     this.ghostGeo.translate(0, 0.5, 0);
@@ -667,6 +688,118 @@ export class EffectsRenderer {
       };
     }
 
+    // --- 5. ÉGIDE DE RONRON : Dôme runique doré-cyan + anneau au sol ---
+    if (eff.spellId === 'aegis_purr') {
+      const domeMat = createAegisDomeMaterial();
+      const aegisDomeMesh = new THREE.Mesh(this.aegisDomeGeo, domeMat);
+      aegisDomeMesh.position.y = 0.05;
+      aegisDomeMesh.renderOrder = 5;
+      aegisDomeMesh.userData.skipSSAO = true;
+      group.add(aegisDomeMesh);
+
+      const ringMat = createHealRingMaterial(0xffd166, 0x66f2ff);
+      const aegisRingMesh = new THREE.Mesh(this.unitDiskGeo, ringMat);
+      aegisRingMesh.position.y = 0.02;
+      aegisRingMesh.renderOrder = 4;
+      aegisRingMesh.userData.skipSSAO = true;
+      group.add(aegisRingMesh);
+
+      disposables.push(domeMat, ringMat);
+      shaderMaterials.push(domeMat, ringMat);
+      this.rootGroup.add(group);
+
+      return {
+        id: eff.id,
+        spellId: eff.spellId,
+        group,
+        disposables,
+        shaderMaterials,
+        radius: eff.radius,
+        width: 0,
+        aegisDomeMesh,
+        aegisRingMesh,
+        followPlayer: true,
+      };
+    }
+
+    // --- 6. BOND FOUDROYANT : Ruban de griffes de vent cinétique ---
+    if (eff.spellId === 'pounce_dash') {
+      const len = Math.max(1.2, eff.radius);
+      const w = eff.width ?? 2.1;
+      const ribbonGeo = new THREE.PlaneGeometry(len, w);
+      ribbonGeo.rotateX(-Math.PI / 2);
+      ribbonGeo.translate(len * 0.5, 0.14, 0);
+      const ribbonMat = createPounceRibbonMaterial();
+      const pounceRibbonMesh = new THREE.Mesh(ribbonGeo, ribbonMat);
+      pounceRibbonMesh.renderOrder = 4;
+      pounceRibbonMesh.userData.skipSSAO = true;
+      group.add(pounceRibbonMesh);
+
+      disposables.push(ribbonGeo, ribbonMat);
+      shaderMaterials.push(ribbonMat);
+      this.rootGroup.add(group);
+
+      return {
+        id: eff.id,
+        spellId: eff.spellId,
+        group,
+        disposables,
+        shaderMaterials,
+        radius: len,
+        width: w,
+        pounceRibbonMesh,
+      };
+    }
+
+    // --- 7. CHUTE D'ÉTOILES : Météore plongeant + Onde de choc astrale AoE ---
+    if (eff.spellId === 'meteor_paw') {
+      const blastMat = createMeteorBlastMaterial();
+      const meteorBlastMesh = new THREE.Mesh(this.unitDiskGeo, blastMat);
+      meteorBlastMesh.scale.set(eff.radius, 1, eff.radius);
+      meteorBlastMesh.renderOrder = 3;
+      meteorBlastMesh.userData.skipSSAO = true;
+      group.add(meteorBlastMesh);
+
+      const orbMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(2.2, 1.35, 2.45),
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      const meteorOrbMesh = new THREE.Mesh(this.meteorOrbGeo, orbMat);
+      meteorOrbMesh.position.set(-2.6, 11.5, -1.8);
+      meteorOrbMesh.renderOrder = 6;
+      meteorOrbMesh.userData.skipSSAO = true;
+      group.add(meteorOrbMesh);
+
+      const beamMat = createHealBeamMaterial(0xc95bff, 0xffbe4d);
+      const meteorBeamMesh = new THREE.Mesh(this.beamCylinderGeo, beamMat);
+      meteorBeamMesh.position.y = -0.04;
+      meteorBeamMesh.scale.set(0.01, 0.01, 0.01);
+      meteorBeamMesh.renderOrder = 5;
+      meteorBeamMesh.userData.skipSSAO = true;
+      group.add(meteorBeamMesh);
+
+      disposables.push(blastMat, orbMat, beamMat);
+      shaderMaterials.push(blastMat, beamMat);
+      this.rootGroup.add(group);
+
+      return {
+        id: eff.id,
+        spellId: eff.spellId,
+        group,
+        disposables,
+        shaderMaterials,
+        radius: eff.radius,
+        width: 0,
+        meteorBlastMesh,
+        meteorOrbMesh,
+        meteorBeamMesh,
+        meteorImpactBurstDone: false,
+      };
+    }
+
     // --- 4. SOIN-VELOURS : Colonne de lumière divine + Anneaux dorés pulsants ---
     const beamMat = createHealBeamMaterial(0x5ce67a, 0xffe570);
     const healBeamMesh = new THREE.Mesh(this.beamCylinderGeo, beamMat);
@@ -803,6 +936,61 @@ export class EffectsRenderer {
             const wScale = Math.max(0.05, spike.baseRadius * (0.6 + 0.4 * melt));
             spike.mesh.scale.set(wScale, hScale, wScale);
           }
+        }
+      } else if (vis.spellId === 'aegis_purr') {
+        if (vis.aegisDomeMesh) {
+          const pop = t < 0.25 ? 0.55 + (t / 0.25) * 0.6 : 1.15 + Math.sin(t * Math.PI) * 0.14;
+          const domeScale = vis.radius * 0.62 * pop;
+          vis.aegisDomeMesh.scale.set(domeScale, domeScale * 1.12, domeScale);
+          vis.aegisDomeMesh.rotation.y = this.animTime * 1.4;
+        }
+        if (vis.aegisRingMesh) {
+          const rScale = vis.radius * (0.65 + easeOut * 0.42);
+          vis.aegisRingMesh.scale.set(rScale, 1, rScale);
+          vis.aegisRingMesh.rotation.y = -this.animTime * 1.9;
+        }
+      } else if (vis.spellId === 'pounce_dash') {
+        if (vis.pounceRibbonMesh) {
+          vis.pounceRibbonMesh.scale.set(1, 1, 1.0 - t * 0.35);
+        }
+      } else if (vis.spellId === 'meteor_paw') {
+        const dropT = Math.min(1, t / 0.3);
+        const postT = Math.max(0, (t - 0.28) / 0.72);
+        if (vis.meteorOrbMesh) {
+          if (t < 0.34) {
+            vis.meteorOrbMesh.visible = true;
+            const easeDrop = dropT * dropT;
+            vis.meteorOrbMesh.position.set(
+              -2.6 * (1 - easeDrop),
+              11.5 * (1 - easeDrop) + 0.45,
+              -1.8 * (1 - easeDrop),
+            );
+            const orbScale = 0.75 + easeDrop * 0.7;
+            vis.meteorOrbMesh.scale.set(orbScale, orbScale, orbScale);
+            vis.meteorOrbMesh.rotation.set(this.animTime * 6, this.animTime * 9, 0);
+          } else {
+            vis.meteorOrbMesh.visible = false;
+          }
+        }
+        if (vis.meteorBeamMesh) {
+          if (postT > 0.01) {
+            const bW = vis.radius * (0.34 + (1 - postT) * 0.25);
+            vis.meteorBeamMesh.scale.set(bW, 0.95 * (1 - postT * 0.45), bW);
+          } else {
+            vis.meteorBeamMesh.scale.set(0.01, 0.01, 0.01);
+          }
+        }
+        if (!vis.meteorImpactBurstDone && t >= 0.28) {
+          vis.meteorImpactBurstDone = true;
+          this.spawnExpandingRing(eff.x, eff.z, '#ffbe4d', 0.6, vis.radius * 1.08, 0.42, 2.2);
+          this.spawnBurst(eff.x, 0.65, eff.z, 28, '#c95bff', 7.4, {
+            size: 0.56,
+            duration: 0.62,
+            star: true,
+            upward: 4.8,
+            gravity: -4.2,
+            hdrBoost: 2.2,
+          });
         }
       } else if (vis.spellId === 'healing_paw') {
         if (vis.healBeamMesh) {
@@ -1215,6 +1403,36 @@ export class EffectsRenderer {
               true,
               1.2,
             );
+          } else if (ev.spellId === 'aegis_purr') {
+            this.spawnExpandingRing(state.player.x, state.player.z, '#ffd166', 0.4, 2.6, 0.46, 1.9);
+            this.spawnStarSpiral(
+              state.player.x,
+              state.player.z,
+              18,
+              '#ffd166',
+              '#66f2ff',
+              true,
+              1.35,
+            );
+          } else if (ev.spellId === 'pounce_dash') {
+            this.spawnExpandingRing(px, pz, '#4de8d6', 0.3, 2.4, 0.34, 2.0);
+            this.spawnBurst(px, 0.6, pz, 16, '#4de8d6', 5.2, {
+              size: 0.44,
+              duration: 0.4,
+              star: true,
+              upward: 2.2,
+              gravity: -2.0,
+              hdrBoost: 2.0,
+            });
+          } else if (ev.spellId === 'meteor_paw') {
+            this.spawnBurst(px, 0.5, pz, 14, '#ffbe4d', 3.4, {
+              size: 0.4,
+              duration: 0.45,
+              star: true,
+              upward: 3.6,
+              gravity: -1.2,
+              hdrBoost: 2.0,
+            });
           }
           break;
         }
@@ -1329,21 +1547,25 @@ export class EffectsRenderer {
       return;
     }
 
-    const dx = target.x - state.player.x;
-    const dz = target.z - state.player.z;
+    const isOnBoat = state.zoneId === 'overworld' && state.ship.mode !== 'parked';
+    const originX = isOnBoat ? state.ship.position.x : state.player.x;
+    const originZ = isOnBoat ? state.ship.position.z : state.player.z;
+
+    const dx = target.x - originX;
+    const dz = target.z - originZ;
     const dist = Math.hypot(dx, dz);
-    if (dist < 3.6) {
+    if (dist < (isOnBoat ? 5.2 : 3.6)) {
       this.questArrowGroup.visible = false;
       return;
     }
 
     const angle = Math.atan2(dz, dx);
-    const orbitRadius = 1.85 + Math.sin(this.animTime * 5.2) * 0.12;
-    const ax = state.player.x + Math.cos(angle) * orbitRadius;
-    const az = state.player.z + Math.sin(angle) * orbitRadius;
+    const orbitRadius = (isOnBoat ? 3.55 : 1.85) + Math.sin(this.animTime * 5.2) * 0.12;
+    const ax = originX + Math.cos(angle) * orbitRadius;
+    const az = originZ + Math.sin(angle) * orbitRadius;
 
     this.questArrowGroup.visible = true;
-    this.questArrowGroup.position.set(ax, QUEST_ARROW_Y, az);
+    this.questArrowGroup.position.set(ax, isOnBoat ? 0.42 : QUEST_ARROW_Y, az);
     this.questArrowGroup.rotation.y = -angle;
     const pulse = 0.78 + Math.sin(this.animTime * 5.2) * 0.06;
     this.questArrowGroup.scale.set(pulse, 1, pulse);
@@ -1547,6 +1769,8 @@ export class EffectsRenderer {
     this.beamCylinderGeo.dispose();
     this.heatHazeCylinderGeo.dispose();
     this.iceCrystalGeo.dispose();
+    this.aegisDomeGeo.dispose();
+    this.meteorOrbGeo.dispose();
     this.ghostGeo.dispose();
   }
 }

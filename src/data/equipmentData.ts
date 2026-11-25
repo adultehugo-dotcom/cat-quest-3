@@ -7,6 +7,7 @@ export const MYSTERY_CHEST_WEIGHTS: Record<Rarity, number> = {
 };
 
 export const EQUIPMENT_LIST: EquipmentDefinition[] = [
+  // --- BOUCLIERS (2) ---
   {
     id: 'shield_wood',
     name: 'Bouclier de Griffoir',
@@ -22,6 +23,22 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
     },
   },
   {
+    id: 'shield_knight',
+    name: 'Écu Royal de Félingard',
+    slot: 'shield',
+    rarity: 'rare',
+    description: 'Un écu d’acier blasonné capable de dévier les coups les plus lourds.',
+    baseStats: { def: 5, hp: 24 },
+    visualStyle: {
+      shape: 'knight_shield',
+      primaryColor: '#d0dce8',
+      secondaryColor: '#2c5ca8',
+      accentColor: '#f2c14e',
+    },
+  },
+
+  // --- ACCESSOIRES (1) ---
+  {
     id: 'trinket_yarn',
     name: 'Pelote Porte-Bonheur',
     slot: 'trinket',
@@ -35,6 +52,7 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
       accentColor: '#ffd8e7',
     },
   },
+
   // --- ARMES (4) ---
   {
     id: 'sword_wood',
@@ -76,6 +94,7 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
       primaryColor: '#6d3fb5',
       secondaryColor: '#3d1f73',
       accentColor: '#56f0ff',
+      luminous: true,
       glowColor: '#68f3ff',
     },
   },
@@ -91,6 +110,7 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
       primaryColor: '#c92a3e',
       secondaryColor: '#f4c542',
       accentColor: '#ff8a2b',
+      luminous: true,
       glowColor: '#ff5e2b',
     },
   },
@@ -136,7 +156,6 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
       primaryColor: '#352f8a',
       secondaryColor: '#211c5c',
       accentColor: '#66ecff',
-      glowColor: '#7be8ff',
     },
   },
   {
@@ -151,7 +170,6 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
       primaryColor: '#f5c242',
       secondaryColor: '#b87616',
       accentColor: '#e63244',
-      glowColor: '#ffd966',
     },
   },
 
@@ -196,7 +214,6 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
       primaryColor: '#263278',
       secondaryColor: '#192052',
       accentColor: '#ffd452',
-      glowColor: '#7be3ff',
     },
   },
   {
@@ -204,16 +221,191 @@ export const EQUIPMENT_LIST: EquipmentDefinition[] = [
     name: "Armure d'Écailles d'Or",
     slot: 'armor',
     rarity: 'epic',
-    description: 'Plastron pourpre et or accompagné d’une cape royale draconique.',
+    description: 'Plastron pourpre et or forgé dans les écailles d’un ancien dragon.',
     baseStats: { hp: 90, def: 14, atk: 10, mag: 10 },
     visualStyle: {
       shape: 'dragon_plate',
       primaryColor: '#7d204f',
       secondaryColor: '#f2be38',
       accentColor: '#ff5247',
-      glowColor: '#ffae38',
-      hasCape: true,
-      capeColor: '#b82534',
+    },
+  },
+
+  // --- BOTTES (4) ---
+  {
+    id: 'boots_leather',
+    name: 'Bottes de Cuir Souple',
+    slot: 'boots',
+    rarity: 'common',
+    description: 'Bottes légères doublées de feutre pour fouler les sentiers en silence.',
+    baseStats: { def: 2, hp: 10 },
+    visualStyle: {
+      shape: 'leather_boots',
+      primaryColor: '#8d552b',
+      secondaryColor: '#593317',
+      accentColor: '#d9a45b',
+    },
+  },
+  {
+    id: 'boots_iron',
+    name: 'Grèves de Chat-Fer',
+    slot: 'boots',
+    rarity: 'common',
+    description: 'Bottes renforcées de plaques d’acier qui encaissent chaque choc.',
+    baseStats: { def: 4, hp: 20 },
+    visualStyle: {
+      shape: 'iron_greaves',
+      primaryColor: '#b9c6d6',
+      secondaryColor: '#69788c',
+      accentColor: '#e0b34c',
+    },
+  },
+  {
+    id: 'boots_arcane',
+    name: 'Bottines Astrales',
+    slot: 'boots',
+    rarity: 'rare',
+    description: 'Bottes indigo brodées de runes qui accélèrent la circulation du mana.',
+    baseStats: { def: 3, mag: 7, mp: 12 },
+    visualStyle: {
+      shape: 'arcane_slippers',
+      primaryColor: '#36328a',
+      secondaryColor: '#221f5e',
+      accentColor: '#6de8ff',
+    },
+  },
+  {
+    id: 'boots_dragon',
+    name: "Bottes d'Écailles Draconiques",
+    slot: 'boots',
+    rarity: 'epic',
+    description: 'Grèves pourpres cerclées d’or, taillées pour charger au cœur des flammes.',
+    baseStats: { def: 6, hp: 30, atk: 5, critChance: 0.02 },
+    visualStyle: {
+      shape: 'dragon_boots',
+      primaryColor: '#8f2238',
+      secondaryColor: '#e8b538',
+      accentColor: '#ff7040',
+    },
+  },
+
+  // --- GANTS (4) ---
+  {
+    id: 'gloves_leather',
+    name: "Gants d'Aventurier",
+    slot: 'gloves',
+    rarity: 'common',
+    description: 'Gants de cuir souple offrant une prise ferme sur n’importe quelle lame.',
+    baseStats: { atk: 2, def: 1 },
+    visualStyle: {
+      shape: 'leather_gloves',
+      primaryColor: '#9c6234',
+      secondaryColor: '#61381b',
+      accentColor: '#e0b379',
+    },
+  },
+  {
+    id: 'gloves_iron',
+    name: "Gantelets d'Acier",
+    slot: 'gloves',
+    rarity: 'common',
+    description: 'Gantelets articulés qui alourdissent chaque coup d’épée.',
+    baseStats: { atk: 4, def: 3 },
+    visualStyle: {
+      shape: 'steel_gauntlets',
+      primaryColor: '#c9d4e0',
+      secondaryColor: '#758599',
+      accentColor: '#e5b94c',
+    },
+  },
+  {
+    id: 'gloves_arcane',
+    name: 'Gants de Tisse-Mana',
+    slot: 'gloves',
+    rarity: 'rare',
+    description: 'Gants enchantés dont les runes canalysent la puissance des sorts.',
+    baseStats: { mag: 8, mp: 10, critChance: 0.02 },
+    visualStyle: {
+      shape: 'arcane_gloves',
+      primaryColor: '#4838a3',
+      secondaryColor: '#291e69',
+      accentColor: '#69f0ff',
+      luminous: true,
+      glowColor: '#68f3ff',
+    },
+  },
+  {
+    id: 'gloves_dragon',
+    name: 'Gantelets du Sang-Dragon',
+    slot: 'gloves',
+    rarity: 'epic',
+    description: 'Gantelets dorés à griffes pourpres, forgés pour fendre la roche.',
+    baseStats: { atk: 8, mag: 6, def: 4, critChance: 0.03 },
+    visualStyle: {
+      shape: 'dragon_gauntlets',
+      primaryColor: '#9c243b',
+      secondaryColor: '#f2c142',
+      accentColor: '#ff6f3c',
+    },
+  },
+
+  // --- CAPES (4) ---
+  {
+    id: 'cape_traveler',
+    name: 'Cape du Voyageur',
+    slot: 'cape',
+    rarity: 'common',
+    description: 'Une cape de toile chaude qui claque joyeusement dans la brise des plaines.',
+    baseStats: { hp: 12, def: 2 },
+    visualStyle: {
+      shape: 'traveler_cloak',
+      primaryColor: '#3f7a47',
+      secondaryColor: '#274f2d',
+      accentColor: '#d9a45b',
+    },
+  },
+  {
+    id: 'cape_knight',
+    name: 'Manteau de Chat-valier',
+    slot: 'cape',
+    rarity: 'common',
+    description: 'Cape bleu royal bordée d’or, portée par les défenseurs de Miaou-bourg.',
+    baseStats: { hp: 24, def: 4 },
+    visualStyle: {
+      shape: 'knight_mantle',
+      primaryColor: '#2c5ca8',
+      secondaryColor: '#1b3a70',
+      accentColor: '#f2c249',
+    },
+  },
+  {
+    id: 'cape_starlight',
+    name: 'Cape de Nuit Étoilée',
+    slot: 'cape',
+    rarity: 'rare',
+    description: 'Tissu astral constellé de lueurs douces qui scintillent dans le vent.',
+    baseStats: { hp: 18, mag: 9, mp: 18 },
+    visualStyle: {
+      shape: 'starlight_cape',
+      primaryColor: '#3a2b82',
+      secondaryColor: '#201552',
+      accentColor: '#7be3ff',
+      luminous: true,
+      glowColor: '#7be3ff',
+    },
+  },
+  {
+    id: 'cape_dragon',
+    name: 'Cape Royale Draconique',
+    slot: 'cape',
+    rarity: 'epic',
+    description: 'Majestueuse cape pourpre bordée d’or, emblème des héros du Sang-Dragon.',
+    baseStats: { hp: 40, def: 6, atk: 6, mag: 6 },
+    visualStyle: {
+      shape: 'dragon_cape',
+      primaryColor: '#b82534',
+      secondaryColor: '#70121e',
+      accentColor: '#f5c242',
     },
   },
 ];

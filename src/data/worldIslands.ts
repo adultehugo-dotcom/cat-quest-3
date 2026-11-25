@@ -3,20 +3,20 @@ import type {
   ChestDef,
   EnemyCampDef,
   EnemySpawnDef,
+  IslandId,
   MapLabelDef,
   Vec2,
   WorldProp,
 } from '../game/types';
 
 /**
- * Nouvelle archipel de Félingard — îles situées au-delà du périmètre
+ * Archipel de Félingard — îles situées au-delà du périmètre
  * de l'île principale (~57 u). Chaque île possède son propre rayon,
  * son biome, ses props, ses camps et ses coffres.
- * Le joueur accède à ces îles via le système de navigation.
+ * Le joueur accède librement à toutes les plages praticables par navigation.
  */
-export type IslandId = 'felingard' | 'tropical' | 'mountain' | 'mystic' | 'wild' | 'archipelago';
+export type { IslandId };
 export type NewIslandId = Exclude<IslandId, 'felingard'>;
-export const FELINGARD_DOCK_POS: Vec2 = { x: 48, z: 18 };
 
 export interface IslandDef {
   id: IslandId;
@@ -25,7 +25,6 @@ export interface IslandDef {
   centerX: number;
   centerZ: number;
   radius: number; // rayon organique maximal
-  dockPos: Vec2; // position du quai d'embarquement/débarquement
   description: string;
   // Propriétés de génération organique
   radiusOffset: number; // décalage relatif à getIslandRadiusAtAngle (si -1.6 utilisé)
@@ -90,7 +89,7 @@ function createIslandChest(islandId: IslandId, x: number, z: number): ChestDef {
   };
 }
 
-/** Toutes les nouvelles îles accessibles depuis Miaou-bourg */
+/** Toutes les nouvelles îles accessibles depuis Félingard par navigation libre */
 export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
   tropical: {
     id: 'tropical',
@@ -99,7 +98,6 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     centerX: 92,
     centerZ: 48,
     radius: 28,
-    dockPos: { x: 88, z: 52 },
     description: 'Un paradis tropical aux eaux cristallines et au sable fin.',
     radiusOffset: -1.6,
     macroCount: 600,
@@ -114,7 +112,6 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     centerX: 75,
     centerZ: -85,
     radius: 26,
-    dockPos: { x: 70, z: -88 },
     description: 'Des sommets escarpés et des falaises vertigineuses.',
     radiusOffset: -1.6,
     macroCount: 500,
@@ -129,7 +126,6 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     centerX: -80,
     centerZ: 60,
     radius: 24,
-    dockPos: { x: -75, z: 64 },
     description: 'Des ruines anciennes enveloppées de brume mystique.',
     radiusOffset: -1.6,
     macroCount: 550,
@@ -144,7 +140,6 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     centerX: -95,
     centerZ: -75,
     radius: 30,
-    dockPos: { x: -90, z: -78 },
     description: 'Une jungle dense et inexplorée où la nature règne en maître.',
     radiusOffset: -1.6,
     macroCount: 700,
@@ -159,7 +154,6 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     centerX: 18,
     centerZ: -108,
     radius: 18,
-    dockPos: { x: 12, z: -112 },
     description: "Un groupe d'îles petites et verdoyantes reliant le monde.",
     radiusOffset: -1.6,
     macroCount: 400,
@@ -263,7 +257,7 @@ export const NEW_ISLAND_LABELS: MapLabelDef[] = [
     style: 'land',
   },
   {
-    text: 'RIFFE-DE-ROC',
+    text: 'GRIFFE-DE-ROC',
     x: 75,
     z: -85,
     rotation: 0,

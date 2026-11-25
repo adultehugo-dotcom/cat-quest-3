@@ -349,7 +349,7 @@ body,
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 155px;
+  max-width: 225px;
 }
 
 .hud-gold-pill {
@@ -739,17 +739,34 @@ body,
 }
 
 .interact-prompt.is-hidden {
+  display: none;
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
   animation: none;
 }
 
+.interact-prompt.is-status {
+  cursor: default;
+  pointer-events: none;
+  animation: none;
+  border-color: #66d4e0;
+  background: linear-gradient(180deg, rgba(22, 54, 72, 0.92) 0%, rgba(15, 36, 52, 0.95) 100%);
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.44),
+    0 0 14px rgba(102, 212, 224, 0.28);
+}
+
+.interact-prompt .keycap.is-hidden {
+  display: none;
+}
+
 .spell-bar {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 9px 14px;
+  gap: 8px;
+  padding: 8px 12px;
+  max-width: calc(100vw - 16px);
   border-radius: 18px;
   background: linear-gradient(180deg, rgba(72, 43, 25, 0.92) 0%, rgba(44, 25, 14, 0.95) 100%);
   border: 2.5px solid var(--gold);
@@ -757,6 +774,10 @@ body,
     0 8px 24px rgba(0, 0, 0, 0.5),
     inset 0 1px 0 rgba(255, 229, 138, 0.35);
   transition: opacity 0.18s ease, transform 0.18s ease, visibility 0.18s ease;
+}
+
+.bar-track.has-shield {
+  box-shadow: 0 0 0 2px rgba(255, 214, 102, 0.85), 0 0 10px rgba(102, 242, 255, 0.55);
 }
 
 .spell-bar.is-hidden {
@@ -773,8 +794,8 @@ body,
 .spell-slot {
   pointer-events: auto;
   position: relative;
-  width: 68px;
-  height: 72px;
+  width: 58px;
+  height: 64px;
   padding: 0;
   border-radius: 13px;
   border: 2.5px solid var(--gold-deep);
@@ -1484,12 +1505,12 @@ body,
 
 .map-marker.is-label-above .map-marker-label {
   top: auto;
-  bottom: calc(100% + 8px);
+  bottom: calc(100% + 12px);
 }
 
 .map-marker.is-label-above-offset .map-marker-label {
   top: auto;
-  bottom: calc(100% + 22px);
+  bottom: calc(100% + 24px);
 }
 
 .map-marker.is-label-above .map-marker-label::after,
@@ -1565,6 +1586,24 @@ body,
   animation: mapPulse 1.3s ease-in-out infinite;
 }
 
+.map-ship-pin {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  background: linear-gradient(180deg, #fff5dc 0%, #e5b75a 100%);
+  border: 2px solid var(--wood-dark);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5), 0 0 10px rgba(242, 190, 66, 0.55);
+  z-index: 7;
+  pointer-events: none;
+}
+
 .map-legend {
   display: flex;
   flex-wrap: wrap;
@@ -1583,6 +1622,10 @@ body,
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.map-mobile-key {
+  display: none;
 }
 
 .map-legend-swatch {
@@ -2160,6 +2203,31 @@ body,
   width: 100%;
 }
 
+.pause-weather-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 1.5px solid var(--parchment-edge);
+  border-radius: 10px;
+  background: rgba(94, 57, 34, 0.09);
+  color: var(--ink);
+  font-weight: 700;
+  text-align: left;
+}
+
+.pause-weather-row select {
+  min-width: 165px;
+  padding: 8px 10px;
+  border: 1px solid var(--parchment-edge);
+  border-radius: 8px;
+  background: #fff8e8;
+  color: var(--ink);
+  font: inherit;
+}
+
 .victory-stats-grid {
   width: 100%;
   display: grid;
@@ -2345,9 +2413,19 @@ body,
     min-width: 240px;
   }
 
+  .spell-bar {
+    gap: 6px;
+    padding: 7px 9px;
+  }
+
   .spell-slot {
-    width: 58px;
-    height: 62px;
+    width: 48px;
+    height: 54px;
+  }
+
+  .spell-slot-icon {
+    width: 32px;
+    height: 32px;
   }
 
   .title-hero-banner {
@@ -2357,6 +2435,178 @@ body,
   .title-crest {
     width: 58px;
     height: 58px;
+  }
+}
+
+@media (max-width: 560px) {
+  .hud-hero {
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    min-width: 0;
+    padding: 6px 8px;
+    gap: 8px;
+  }
+
+  .hud-portrait-wrap,
+  .hud-portrait-frame {
+    width: 44px;
+    height: 44px;
+  }
+
+  .hud-level-badge {
+    white-space: nowrap;
+    font-size: 9.5px;
+    height: 19px;
+    padding: 0 5px;
+  }
+
+  .hud-bars-col {
+    min-width: 0;
+    gap: 3px;
+  }
+
+  .hud-zone-label {
+    font-size: 11px;
+    max-width: 185px;
+  }
+
+  .bar-track {
+    height: 15px;
+  }
+
+  .hud-top-right {
+    top: 128px;
+    right: 8px;
+    gap: 6px;
+  }
+
+  .hud-btn {
+    width: 38px;
+    height: 38px;
+    font-size: 16px;
+  }
+
+  .hud-quest-card {
+    width: 210px;
+    padding: 7px 9px;
+  }
+
+  .hud-boss {
+    top: 304px;
+    width: min(350px, calc(100vw - 16px));
+    min-width: 220px;
+  }
+
+  .toast-stack {
+    top: 304px;
+    max-width: 92vw;
+  }
+
+  .spell-bar {
+    gap: 5px;
+    padding: 6px 7px;
+    border-radius: 14px;
+  }
+
+  .spell-slot {
+    width: 42px;
+    height: 48px;
+    border-radius: 10px;
+  }
+
+  .spell-slot-icon {
+    width: 26px;
+    height: 26px;
+  }
+
+  .spell-slot-key {
+    min-width: 17px;
+    height: 16px;
+    font-size: 9.5px;
+    top: -6px;
+    left: -4px;
+    padding: 0 3px;
+  }
+
+  .spell-slot-lvl {
+    font-size: 8.5px;
+    padding: 0 3px;
+    top: -6px;
+    right: -4px;
+  }
+
+  .spell-slot-mp {
+    font-size: 8.5px;
+    padding: 0 4px;
+    bottom: -7px;
+  }
+}
+
+@media (max-width: 560px) {
+  .map-marker-label {
+    display: none;
+  }
+
+  .map-marker-dot {
+    position: relative;
+    font-size: 0;
+  }
+
+  .map-marker-dot::after {
+    content: attr(data-map-index);
+    font-size: 11px;
+    font-weight: 900;
+    line-height: 1;
+  }
+
+  .map-legend {
+    justify-content: flex-start;
+    gap: 7px 12px;
+    padding: 8px 10px;
+    font-size: 10px;
+  }
+
+  .map-mobile-key {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 10px;
+    padding: 9px 10px;
+    border-radius: 10px;
+    background: rgba(255, 251, 241, 0.78);
+    border: 1.5px solid var(--parchment-edge);
+    font-size: 10px;
+    line-height: 1.25;
+    color: var(--ink);
+  }
+
+  .map-mobile-key b {
+    display: inline-flex;
+    width: 17px;
+    height: 17px;
+    margin-right: 3px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: var(--wood-dark);
+    color: var(--gold-bright);
+  }
+
+  .modal-body,
+  .forge-spells-grid,
+  .forge-spell-card,
+  .forge-spell-head > div:last-child {
+    min-width: 0;
+  }
+
+  .forge-spells-grid {
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .forge-spell-head > div:last-child > div:first-child,
+  .forge-spell-footer {
+    flex-wrap: wrap;
   }
 }
 

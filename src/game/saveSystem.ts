@@ -7,9 +7,11 @@ import { ENEMIES } from '../data/enemiesData';
 import { EQUIPMENT } from '../data/equipmentData';
 import { SPELL_ORDER } from '../data/spellsData';
 import {
+  ALL_EQUIP_SLOTS,
   AUDIO_PREFS_STORAGE_KEY,
   MAX_PLAYER_LEVEL,
   MAX_SPELL_LEVEL,
+  OPTIONAL_EQUIP_SLOTS,
   SAVE_STORAGE_KEY,
   STARTING_EQUIPMENT,
   type AudioPrefs,
@@ -22,8 +24,13 @@ import {
   type QuestProgress,
   type QuestStatus,
   type SaveData,
+  type SavedShipData,
+  type SavedShipMode,
+  type ShipBlueprint,
+  type ShipSlot,
   type SpellId,
   type StorageAdapter,
+  type Vec2,
 } from './types';
 
 export type StorageLike = StorageAdapter;
@@ -43,6 +50,39 @@ const VALID_QUEST_STATUSES: readonly QuestStatus[] = [
   'available',
   'active',
   'completed',
+];
+
+const VALID_ISLAND_IDS: readonly IslandId[] = [
+  'felingard',
+  'tropical',
+  'mountain',
+  'mystic',
+  'wild',
+  'archipelago',
+];
+
+const VALID_SHIP_MODES: readonly SavedShipMode[] = ['parked', 'sailing'];
+
+const VALID_SHIP_SLOTS: readonly ShipSlot[] = [
+  'coque',
+  'puissance_canon',
+  'cadence',
+  'capacite_munitions',
+  'rechargement',
+  'patte_boost',
+  'super_patte_canon',
+  'patte_canon_magma',
+  'patte_canon_electrique',
+  'patte_canon_maudite',
+  'redoutable_canard',
+];
+
+const VALID_SHIP_BLUEPRINTS: readonly ShipBlueprint[] = [
+  'coque_cuirassée',
+  'canon_foudre',
+  'cadence_double',
+  'grenier_munitions',
+  'rechargement_rapide',
 ];
 
 /**
@@ -99,12 +139,109 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+function validateSavedShipData(rawShip: unknown): SavedShipData | null {
+  if (!isPlainObject(rawShip)) return null;
+
+  if (
+    typeof rawShip.mode !== 'string' ||
+    !VALID_SHIP_MODES.includes(rawShip.mode as SavedShipMode)
+  ) {
+    return null;
+  }
+
+  if (
+    !isPlainObject(rawShip.position) ||
+    !isFiniteNumber(rawShip.position.x) ||
+    !isFiniteNumber(rawShip.position.z)
+  ) {
+    return null;
+  }
+
+  if (!isFiniteNumber(rawShip.angle)) {
+    return null;
+  }
+
+  let dockedIslandId: IslandId | null;
+  if (rawShip.dockedIslandId === null) {
+    dockedIslandId = null;
+  } else if (
+    typeof rawShip.dockedIslandId === 'string' &&
+    VALID_ISLAND_IDS.includes(rawShip.dockedIslandId as IslandId)
+  ) {
+    dockedIslandId = rawShip.dockedIslandId as IslandId;
+  } else {
+    return null;
+  }
+
+  if (
+    !isFiniteNumber(rawShip.hullHp) ||
+    rawShip.hullHp < 0 ||
+    !isFiniteNumber(rawShip.maxHullHp) ||
+    rawShip.maxHullHp < 0 ||
+    !isFiniteNumber(rawShip.ammo) ||
+    rawShip.ammo < 0 ||
+    !isFiniteNumber(rawShip.maxAmmo) ||
+    rawShip.maxAmmo < 0
+  ) {
+    return null;
+  }
+
+  if (!isPlainObject(rawShip.equippedBlueprints)) return null;
+  const equippedBlueprints: Partial<Record<ShipSlot, ShipBlueprint>> = {};
+  for (const [slotKey, bp] of Object.entries(rawShip.equippedBlueprints)) {
+    if (bp === undefined) continue;
+    if (
+      !VALID_SHIP_SLOTS.includes(slotKey as ShipSlot) ||
+      typeof bp !== 'string' ||
+      !VALID_SHIP_BLUEPRINTS.includes(bp as ShipBlueprint)
+    ) {
+      return null;
+    }
+    equippedBlueprints[slotKey as ShipSlot] = bp as ShipBlueprint;
+  }
+
+  if (!isPlainObject(rawShip.unlockedSlots)) return null;
+  for (const [slotKey, val] of Object.entries(rawShip.unlockedSlots)) {
+    if (!VALID_SHIP_SLOTS.includes(slotKey as ShipSlot) || typeof val !== 'boolean') {
+      return null;
+    }
+  }
+  const unlockedSlots = {} as Record<ShipSlot, boolean>;
+  for (const slot of VALID_SHIP_SLOTS) {
+    const val = rawShip.unlockedSlots[slot];
+    unlockedSlots[slot] = typeof val === 'boolean' ? val : false;
+  }
+
+  const maxHullHp = Math.round(rawShip.maxHullHp);
+  const hullHp =
+    maxHullHp > 0
+      ? Math.min(maxHullHp, Math.round(rawShip.hullHp))
+      : Math.round(rawShip.hullHp);
+  const maxAmmo = Math.floor(rawShip.maxAmmo);
+  const ammo = Math.min(maxAmmo, Math.floor(rawShip.ammo));
+
+  return {
+    mode: rawShip.mode as SavedShipMode,
+    position: { x: rawShip.position.x, z: rawShip.position.z },
+    angle: rawShip.angle,
+    dockedIslandId,
+    hullHp,
+    maxHullHp,
+    ammo,
+    maxAmmo,
+    equippedBlueprints,
+    unlockedSlots,
+  };
+}
+
 /**
  * Valide et nettoie un objet désérialisé en `SaveData` conforme, ou retourne `null`.
+ * Accepte les sauvegardes v1 (sans données bateau) et v2 (avec `ship: SavedShipData`).
  */
 export function validateSaveData(raw: unknown): SaveData | null {
   if (!isPlainObject(raw)) return null;
-  if (raw.version !== 1) return null;
+  if (raw.version !== 1 && raw.version !== 2) return null;
+  const version: 1 | 2 = raw.version;
   if (!isFiniteNumber(raw.timestamp) || raw.timestamp < 0) return null;
 
   // --- Player ---
@@ -126,7 +263,7 @@ export function validateSaveData(raw: unknown): SaveData | null {
   const gold = Math.max(0, Math.floor(rawPlayer.gold));
   const hp = Math.max(0, Math.round(rawPlayer.hp));
   const mp = Math.max(0, Math.round(rawPlayer.mp));
-  let position: { x: number; z: number } | undefined;
+  let position: Vec2 | undefined;
   if (rawPlayer.position !== undefined) {
     if (
       !isPlainObject(rawPlayer.position) ||
@@ -138,50 +275,39 @@ export function validateSaveData(raw: unknown): SaveData | null {
     position = { x: rawPlayer.position.x, z: rawPlayer.position.z };
   }
 
-  const validIslandIds: readonly IslandId[] = [
-    'felingard',
-    'tropical',
-    'mountain',
-    'mystic',
-    'wild',
-    'archipelago',
-  ];
   const islandId =
     raw.islandId === undefined
       ? 'felingard'
       : typeof raw.islandId === 'string' &&
-          validIslandIds.includes(raw.islandId as IslandId)
+          VALID_ISLAND_IDS.includes(raw.islandId as IslandId)
         ? (raw.islandId as IslandId)
         : null;
   if (islandId === null) return null;
 
-  // Equipped
+  // --- Ship (optionnel en v1, validé strictement si présent) ---
+  let ship: SavedShipData | undefined;
+  if (raw.ship !== undefined) {
+    const validatedShip = validateSavedShipData(raw.ship);
+    if (!validatedShip) return null;
+    ship = validatedShip;
+  }
+
+  // Equipped (rétrocompatible avec anciennes sauvegardes v1/v2 sans boots/gloves/cape ou slots optionnels)
   if (!isPlainObject(rawPlayer.equipped)) return null;
-  const equipped: Record<EquipSlot, string> = {
-    weapon: STARTING_EQUIPMENT.weapon,
-    secondary_weapon: STARTING_EQUIPMENT.secondary_weapon,
-    shield: STARTING_EQUIPMENT.shield,
-    helmet: STARTING_EQUIPMENT.helmet,
-    armor: STARTING_EQUIPMENT.armor,
-    trinket: STARTING_EQUIPMENT.trinket,
-  };
-  for (const slot of [
-    'weapon',
-    'secondary_weapon',
-    'shield',
-    'helmet',
-    'armor',
-    'trinket',
-  ] as EquipSlot[]) {
-    const id = rawPlayer.equipped[slot];
+  const equipped: Record<EquipSlot, string> = { ...STARTING_EQUIPMENT };
+  for (const slot of ALL_EQUIP_SLOTS) {
+    const rawId = rawPlayer.equipped[slot];
+    if (rawId === undefined && OPTIONAL_EQUIP_SLOTS.includes(slot)) {
+      equipped[slot] = '';
+      continue;
+    }
     if (
-      typeof id !== 'string' ||
-      (id !== '' &&
-        (!EQUIPMENT[id] || EQUIPMENT[id].slot !== slot))
+      typeof rawId !== 'string' ||
+      (rawId !== '' && (!EQUIPMENT[rawId] || EQUIPMENT[rawId].slot !== slot))
     ) {
       return null;
     }
-    equipped[slot] = id;
+    equipped[slot] = rawId;
   }
 
   // Inventory
@@ -189,6 +315,9 @@ export function validateSaveData(raw: unknown): SaveData | null {
   const inventory: Record<string, OwnedEquipment> = {};
   for (const [key, item] of Object.entries(rawPlayer.inventory)) {
     if (!isPlainObject(item)) return null;
+    // Migration douce : l'ancienne arme secondaire est abandonnée, le reste de
+    // l'inventaire et les autres emplacements sont conservés tels quels.
+    if (key === 'dagger_fang' || item.slot === 'secondary_weapon') continue;
     if (
       typeof item.id !== 'string' ||
       item.id !== key ||
@@ -204,25 +333,28 @@ export function validateSaveData(raw: unknown): SaveData | null {
     };
   }
   // Garantit que chaque objet équipé existe dans l'inventaire
-  for (const slot of [
-    'weapon',
-    'secondary_weapon',
-    'shield',
-    'helmet',
-    'armor',
-    'trinket',
-  ] as EquipSlot[]) {
+  for (const slot of ALL_EQUIP_SLOTS) {
     const id = equipped[slot];
     if (id && !inventory[id]) {
       inventory[id] = { id, level: 1 };
     }
   }
 
-  // Spell levels
+  // Spell levels (rétrocompatible : les nouveaux sorts absents d'une ancienne sauvegarde démarrent au Niv. 1)
   if (!isPlainObject(rawPlayer.spellLevels)) return null;
+  const LEGACY_REQUIRED_SPELLS: readonly SpellId[] = [
+    'flamepurr',
+    'lightnyan',
+    'freezepaw',
+    'healing_paw',
+  ];
   const spellLevels = {} as Record<SpellId, number>;
   for (const spellId of SPELL_ORDER) {
     const lv = rawPlayer.spellLevels[spellId];
+    if (lv === undefined && !LEGACY_REQUIRED_SPELLS.includes(spellId)) {
+      spellLevels[spellId] = 1;
+      continue;
+    }
     if (!isFiniteNumber(lv) || lv < 1) {
       return null;
     }
@@ -298,7 +430,7 @@ export function validateSaveData(raw: unknown): SaveData | null {
   }
 
   return {
-    version: 1,
+    version,
     timestamp: raw.timestamp,
     player: {
       level,
@@ -313,6 +445,7 @@ export function validateSaveData(raw: unknown): SaveData | null {
       ...(position ? { position } : {}),
     },
     islandId,
+    ...(ship ? { ship } : {}),
     quests,
     trackedQuestId,
     openedChestIds,
@@ -326,7 +459,9 @@ export function validateSaveData(raw: unknown): SaveData | null {
 }
 
 /**
- * Construit un snapshot `SaveData` propre à partir du `GameState`.
+ * Construit un snapshot `SaveData` (version 2) propre à partir du `GameState`.
+ * Normalise systématiquement les états transitoires du bateau (`boarding`, `docking`,
+ * `disembarking`) vers un état stable (`parked` ou `sailing`).
  */
 export function serializeGameState(state: GameState): SaveData {
   const inventoryCopy: Record<string, OwnedEquipment> = {};
@@ -345,8 +480,83 @@ export function serializeGameState(state: GameState): SaveData {
     };
   }
 
+  const ship = state.ship;
+  const transition = ship.transition;
+  const shipPosition: Vec2 = { x: ship.position.x, z: ship.position.z };
+  const shipAngle = ship.angle;
+
+  let savedIslandId: IslandId = state.islandId;
+  let savedPlayerPos: Vec2 = { x: state.player.x, z: state.player.z };
+  let savedShipMode: SavedShipMode = 'parked';
+  let savedDockedIslandId: IslandId | null = ship.dockedIslandId ?? state.islandId;
+
+  switch (ship.mode) {
+    case 'boarding': {
+      savedShipMode = 'parked';
+      savedDockedIslandId = state.islandId;
+      savedPlayerPos = transition
+        ? { x: transition.heroStartPos.x, z: transition.heroStartPos.z }
+        : { x: state.player.x, z: state.player.z };
+      break;
+    }
+    case 'docking': {
+      savedShipMode = 'sailing';
+      savedDockedIslandId = null;
+      savedPlayerPos = { x: ship.position.x, z: ship.position.z };
+      break;
+    }
+    case 'disembarking': {
+      const destIsland = transition?.targetIslandId ?? ship.dockedIslandId ?? state.islandId;
+      const land = transition?.landingPos ?? transition?.heroTargetPos;
+      savedShipMode = 'parked';
+      savedIslandId = destIsland;
+      savedDockedIslandId = destIsland;
+      savedPlayerPos = land
+        ? { x: land.x, z: land.z }
+        : { x: state.player.x, z: state.player.z };
+      break;
+    }
+    case 'sailing': {
+      savedShipMode = 'sailing';
+      savedDockedIslandId = null;
+      savedPlayerPos = { x: ship.position.x, z: ship.position.z };
+      break;
+    }
+    case 'parked': {
+      savedShipMode = 'parked';
+      savedDockedIslandId = ship.dockedIslandId ?? state.islandId;
+      savedPlayerPos = { x: state.player.x, z: state.player.z };
+      break;
+    }
+  }
+
+  const equippedBlueprintsCopy: Partial<Record<ShipSlot, ShipBlueprint>> = {};
+  for (const [slot, bp] of Object.entries(ship.equippedBlueprints)) {
+    if (bp !== undefined) {
+      equippedBlueprintsCopy[slot as ShipSlot] = bp;
+    }
+  }
+
+  const unlockedSlotsCopy = {} as Record<ShipSlot, boolean>;
+  for (const slot of VALID_SHIP_SLOTS) {
+    unlockedSlotsCopy[slot] = Boolean(ship.unlockedSlots[slot]);
+  }
+
+  const savedShip: SavedShipData = {
+    mode: savedShipMode,
+    position: shipPosition,
+    angle: shipAngle,
+    dockedIslandId: savedDockedIslandId,
+    hullHp: ship.hullHp,
+    maxHullHp: ship.maxHullHp,
+    ammo: ship.ammo,
+    maxAmmo: ship.maxAmmo,
+    equippedBlueprints: equippedBlueprintsCopy,
+    unlockedSlots: unlockedSlotsCopy,
+  };
+
   return {
-    version: 1,
+    version: 2,
     timestamp: Date.now(),
     player: {
       level: state.player.level,
@@ -358,9 +568,10 @@ export function serializeGameState(state: GameState): SaveData {
       inventory: inventoryCopy,
       spellLevels: { ...state.player.spellLevels },
       hasRunicKey: state.player.hasRunicKey,
-      position: { x: state.player.x, z: state.player.z },
+      position: savedPlayerPos,
     },
-    islandId: state.islandId,
+    islandId: savedIslandId,
+    ship: savedShip,
     quests: questsCopy,
     trackedQuestId: state.trackedQuestId,
     openedChestIds: [...state.openedChestIds],

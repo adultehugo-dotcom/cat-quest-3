@@ -27,8 +27,6 @@ import {
   isInsideVillage,
 } from '../data/worldData';
 import {
-  ALL_NEW_ISLANDS,
-  FELINGARD_DOCK_POS,
   NEW_ISLANDS,
   clampToNewIsland,
   getNewIslandRadiusAtAngle,
@@ -42,6 +40,7 @@ import {
   executeDodgeRoll,
   executeMeleeAttack,
   updatePlayerRegen,
+  updatePlayerShield,
 } from './combat';
 import {
   OVERWORLD_RESPAWN_TIME,
@@ -59,13 +58,14 @@ import {
 } from './math';
 import {
   addEquipment,
-  buyMysteryChest as progressionBuyMysteryChest, 
+  buyMysteryChest as progressionBuyMysteryChest,
   createInitialPlayerState,
   equipItem as progressionEquipItem,
   getXpToNextLevel,
   grantXp,
   recalculatePlayerStats,
   rollEquipmentByWeights,
+  unequipSlot as progressionUnequipSlot,
   upgradeSpell as progressionUpgradeSpell,
   type SpellUpgradeResult,
 } from './progression';
@@ -85,23 +85,50 @@ import {
   serializeGameState,
   type StorageLike,
 } from './saveSystem';
+import {
+  SHIP_BOARDING_RADIUS,
+  SHIP_COMPANION_DECK_LOCAL,
+  SHIP_HERO_DECK_LOCAL,
+  SHIP_PHYSICS_CONFIG,
+  evaluateParabolicJump,
+  getShipDeckWorldAnchor,
+  getShipForward,
+  mapInputStateToShipControls,
+  stepShipPhysics,
+  updateShipIdleBobbing,
+} from './shipPhysics';
+import {
+  ensureBoatOnWater,
+  findSafeDisembarkSpot,
+  findSafeLandPositionOnIsland,
+  getDefaultAnchorageForIsland,
+  getDefaultBoatSpawnOnFelingard,
+  getIslandName,
+  resolveShipCoastCollision,
+} from './shorelineNavigation';
 import type {
   ActiveModal,
   ChestInstance,
   DialogueAction,
   DialogueLine,
   EnemyInstance,
+  EquipSlot,
   GameEvent,
   GameState,
   InputState,
   Interactable,
+  IslandId,
   MusicTrackId,
   MysteryChestResult,
   QuestId,
+  ShipDisembarkStatus,
+  ShipSlot,
+  ShipState,
   SpellId,
   Vec2,
   ZoneId,
 } from './types';
+import { STARTING_EQUIPMENT } from './types';
 
 export interface GameEngineOptions {
   storage?: StorageLike | null;
@@ -110,20 +137,85 @@ export interface GameEngineOptions {
 
 const INN_RESPAWN_POS: Vec2 = { x: -7, z: 23.2 };
 const DODGE_GHOST_INTERVAL = 0.065;
+const BOARDING_DURATION = 0.44;
+const BOARDING_ARC_HEIGHT = 1.95;
+const DISEMBARKING_DURATION = 0.42;
+const DISEMBARKING_ARC_HEIGHT = 1.85;
+const SHIP_REFUSAL_COOLDOWN = 1.4;
+
+function createEmptyDisembarkStatus(): ShipDisembarkStatus {
+  return {
+    canDisembark: false,
+    nearestIslandId: null,
+    coastDistance: Infinity,
+    coastKind: 'beach',
+  };
+}
+
+function createDefaultUnlockedSlots(): Record<ShipSlot, boolean> {
+  return {
+    coque: true,
+    puissance_canon: true,
+    cadence: false,
+    capacite_munitions: false,
+    rechargement: false,
+    patte_boost: false,
+    super_patte_canon: false,
+    patte_canon_magma: false,
+    patte_canon_electrique: false,
+    patte_canon_maudite: false,
+    redoutable_canard: false,
+  };
+}
+
+function createInitialShipState(): ShipState {
+  const spawn = getDefaultBoatSpawnOnFelingard();
+  return {
+    mode: 'parked',
+    isSailing: false,
+    position: { x: spawn.position.x, z: spawn.position.z },
+    angle: spawn.angle,
+    vx: 0,
+    vz: 0,
+    speed: 0,
+    angularVelocity: 0,
+    rudder: 0,
+    roll: 0,
+    pitch: 0,
+    bobPhase: 0,
+    bobY: 0,
+    wakeIntensity: 0,
+    reverseEngageTimer: 0,
+    isCollidingShore: false,
+    nearestCoastIslandId: 'felingard',
+    dockedIslandId: 'felingard',
+    transition: null,
+    disembarkStatus: createEmptyDisembarkStatus(),
+    hullHp: 100,
+    maxHullHp: 100,
+    ammo: 0,
+    maxAmmo: 20,
+    reloadTimer: 0,
+    equippedBlueprints: {},
+    unlockedSlots: createDefaultUnlockedSlots(),
+  };
+}
 
 export class GameEngine {
   public readonly state: GameState;
   private readonly storage?: StorageLike | null;
   private readonly rng: () => number;
   private dodgeGhostAccum = 0;
-  private readonly SHIP_SPEED = 9.0; // unités par seconde
-  private readonly DOCK_RADIUS = 3.5; // rayon d'interaction du quai
+  private shipRefusalCooldown = 0;
+  private disembarkChangedIsland = false;
 
   constructor(options?: GameEngineOptions) {
     this.storage = options?.storage;
     this.rng = options?.rng ?? Math.random;
 
     const player = createInitialPlayerState();
+    player.elevationY = 0;
+    player.onShipDeck = false;
     const quests = createInitialQuests();
 
     this.state = {
@@ -141,33 +233,10 @@ export class GameEngine {
         x: player.x - 1.4,
         z: player.z - 0.8,
         bobPhase: 0,
+        y: 0,
+        onShipDeck: false,
       },
-      ship: {
-        isSailing: false,
-        position: { x: player.x, z: player.z },
-        angle: 0,
-        departureIslandId: null,
-        hasLeftDock: false,
-        hullHp: 100,
-        maxHullHp: 100,
-        ammo: 0,
-        maxAmmo: 20,
-        reloadTimer: 0,
-        equippedBlueprints: {},
-        unlockedSlots: {
-          coque: true,
-          puissance_canon: true,
-          cadence: false,
-          capacite_munitions: false,
-          rechargement: false,
-          patte_boost: false,
-          super_patte_canon: false,
-          patte_canon_magma: false,
-          patte_canon_electrique: false,
-          patte_canon_maudite: false,
-          redoutable_canard: false,
-        },
-      },
+      ship: createInitialShipState(),
       enemies: [],
       telegraphs: [],
       chests: [],
@@ -215,12 +284,13 @@ export class GameEngine {
 
   public startNewGame(): void {
     const freshPlayer = createInitialPlayerState();
+    freshPlayer.elevationY = 0;
+    freshPlayer.onShipDeck = false;
     this.state.player = freshPlayer;
     this.state.islandId = 'felingard';
-    this.state.ship.isSailing = false;
-    this.state.ship.position = { ...OVERWORLD_DATA.playerStart };
-    this.state.ship.departureIslandId = null;
-    this.state.ship.hasLeftDock = false;
+    this.state.ship = createInitialShipState();
+    this.shipRefusalCooldown = 0;
+    this.disembarkChangedIsland = false;
     this.state.quests = createInitialQuests();
     this.state.trackedQuestId = 'main_dragon_blood';
     this.state.openedChestIds = [];
@@ -250,20 +320,23 @@ export class GameEngine {
     p.xp = saved.player.xp;
     p.xpToNext = getXpToNextLevel(p.level);
     p.gold = saved.player.gold;
-    p.equipped = { ...saved.player.equipped };
+    p.equipped = { ...STARTING_EQUIPMENT, ...saved.player.equipped };
     p.inventory = {};
     for (const [id, item] of Object.entries(saved.player.inventory)) {
       p.inventory[id] = { id: item.id, level: item.level };
     }
     p.spellLevels = { ...saved.player.spellLevels };
     p.hasRunicKey = saved.player.hasRunicKey;
+    p.elevationY = 0;
+    p.onShipDeck = false;
 
     recalculatePlayerStats(p);
     p.hp = clamp(saved.player.hp, 1, p.maxHp);
     p.mp = clamp(saved.player.mp, 0, p.maxMp);
 
+    const savedIsland: IslandId = saved.islandId ?? 'felingard';
     this.state.player = p;
-    this.state.islandId = saved.islandId ?? 'felingard';
+    this.state.islandId = savedIsland;
     this.state.quests = {
       main_dragon_blood: { ...saved.quests.main_dragon_blood },
       side_yarn_hunt: { ...saved.quests.side_yarn_hunt },
@@ -289,14 +362,77 @@ export class GameEngine {
     };
     this.state.activeModal = 'none';
     this.state.screen = 'playing';
+    this.shipRefusalCooldown = 0;
+    this.disembarkChangedIsland = false;
 
-    const savedIsland = this.state.islandId;
-    const savedPosition =
-      saved.player.position ??
-      (savedIsland === 'felingard'
-        ? OVERWORLD_DATA.playerStart
-        : this.getLandingPosition(savedIsland));
-    this.loadZone('overworld', { ...savedPosition }, true);
+    // Restauration / migration du bateau (v2 avec ship ou v1 sans ship)
+    const ship = createInitialShipState();
+    this.state.ship = ship;
+
+    if (saved.ship) {
+      ship.hullHp = saved.ship.hullHp;
+      ship.maxHullHp = saved.ship.maxHullHp;
+      ship.ammo = saved.ship.ammo;
+      ship.maxAmmo = saved.ship.maxAmmo;
+      ship.reloadTimer = 0;
+      ship.equippedBlueprints = { ...saved.ship.equippedBlueprints };
+      ship.unlockedSlots = { ...saved.ship.unlockedSlots };
+
+      const preferredIsland = saved.ship.dockedIslandId ?? savedIsland;
+      const safeBoat = ensureBoatOnWater(
+        saved.ship.position,
+        saved.ship.angle,
+        preferredIsland,
+      );
+      ship.position = { x: safeBoat.position.x, z: safeBoat.position.z };
+      ship.angle = safeBoat.angle;
+
+      if (saved.ship.mode === 'sailing') {
+        ship.mode = 'sailing';
+        ship.isSailing = true;
+        ship.dockedIslandId = null;
+        ship.nearestCoastIslandId = null;
+
+        this.loadZone('overworld', { x: ship.position.x, z: ship.position.z }, true);
+        this.state.islandId = savedIsland;
+        this.state.inVillage = false;
+        this.syncCrewToShipDeck();
+        this.refreshShipDisembarkStatus();
+        this.updateNearestInteractable();
+        return true;
+      }
+
+      // Mode 'parked' (v2) : position terrestre sûre + bateau conservé sur l'eau
+      ship.mode = 'parked';
+      ship.isSailing = false;
+      ship.dockedIslandId = saved.ship.dockedIslandId ?? savedIsland;
+      ship.nearestCoastIslandId = ship.dockedIslandId;
+
+      const safeLandPos = findSafeLandPositionOnIsland(
+        savedIsland,
+        saved.player.position,
+      );
+      this.loadZone('overworld', safeLandPos, true);
+      this.state.islandId = savedIsland;
+      return true;
+    }
+
+    // Migration d'une ancienne sauvegarde v1 (sans champ `ship`) :
+    // place le joueur sur terre sûre et ancre le bateau au mouillage côtier sûr de l'île.
+    const anchorage = getDefaultAnchorageForIsland(savedIsland);
+    ship.mode = 'parked';
+    ship.isSailing = false;
+    ship.position = { x: anchorage.position.x, z: anchorage.position.z };
+    ship.angle = anchorage.angle;
+    ship.dockedIslandId = savedIsland;
+    ship.nearestCoastIslandId = savedIsland;
+
+    const safeLandPos =
+      savedIsland === 'felingard' && saved.player.position === undefined
+        ? { ...OVERWORLD_DATA.playerStart }
+        : findSafeLandPositionOnIsland(savedIsland, saved.player.position);
+
+    this.loadZone('overworld', safeLandPos, true);
     this.state.islandId = savedIsland;
     return true;
   }
@@ -314,15 +450,20 @@ export class GameEngine {
       currentIndex: 0,
       onCompleteAction: 'none',
     };
-    const shouldReturnToFelingard =
-      this.state.zoneId !== 'overworld' || this.state.islandId !== 'felingard';
+    const shouldReloadOverworld =
+      this.state.zoneId !== 'overworld' ||
+      this.state.islandId !== 'felingard' ||
+      this.state.ship.mode !== 'parked';
     this.state.screen = 'title';
-    this.state.ship.isSailing = false;
-    this.state.ship.position = { ...OVERWORLD_DATA.playerStart };
-    this.state.ship.departureIslandId = null;
-    this.state.ship.hasLeftDock = false;
     this.state.islandId = 'felingard';
-    if (shouldReturnToFelingard) {
+    this.state.ship = createInitialShipState();
+    this.state.player.elevationY = 0;
+    this.state.player.onShipDeck = false;
+    this.state.companion.y = 0;
+    this.state.companion.onShipDeck = false;
+    this.shipRefusalCooldown = 0;
+    this.disembarkChangedIsland = false;
+    if (shouldReloadOverworld) {
       this.loadZone('overworld', { ...OVERWORLD_DATA.playerStart }, false);
     }
     this.state.transitionTimer = 0;
@@ -350,9 +491,17 @@ export class GameEngine {
     p.attackAnimTimer = 0;
     p.knockbackVx = 0;
     p.knockbackVz = 0;
+    p.elevationY = 0;
+    p.onShipDeck = false;
+    p.shieldHp = 0;
+    p.shieldMaxHp = 0;
+    p.shieldTimer = 0;
     for (const sid of SPELL_ORDER) {
       p.spellCooldowns[sid] = 0;
     }
+
+    this.state.companion.y = 0;
+    this.state.companion.onShipDeck = false;
 
     this.state.activeModal = 'none';
     this.state.dialogue = {
@@ -362,12 +511,38 @@ export class GameEngine {
       onCompleteAction: 'none',
     };
     this.state.screen = 'playing';
+    this.shipRefusalCooldown = 0;
+    this.disembarkChangedIsland = false;
+
+    // Évite tout soft-lock : si le navire était en mer ou sur une autre île,
+    // on le rapatrie au mouillage côtier par défaut de Félingard.
+    // S'il était déjà ancré sur Félingard, on conserve sa position exacte !
+    const ship = this.state.ship;
+    const shouldRepatriateShip =
+      ship.mode !== 'parked' || ship.dockedIslandId !== 'felingard';
+    if (shouldRepatriateShip) {
+      const felingardSpawn = getDefaultBoatSpawnOnFelingard();
+      ship.position = { x: felingardSpawn.position.x, z: felingardSpawn.position.z };
+      ship.angle = felingardSpawn.angle;
+      ship.dockedIslandId = 'felingard';
+      ship.nearestCoastIslandId = 'felingard';
+    }
+    ship.mode = 'parked';
+    ship.isSailing = false;
+    ship.vx = 0;
+    ship.vz = 0;
+    ship.speed = 0;
+    ship.angularVelocity = 0;
+    ship.rudder = 0;
+    ship.roll = 0;
+    ship.pitch = 0;
+    ship.wakeIntensity = 0;
+    ship.reverseEngageTimer = 0;
+    ship.isCollidingShore = false;
+    ship.transition = null;
+    ship.disembarkStatus = createEmptyDisembarkStatus();
 
     this.state.islandId = 'felingard';
-    this.state.ship.isSailing = false;
-    this.state.ship.position = { ...INN_RESPAWN_POS };
-    this.state.ship.departureIslandId = null;
-    this.state.ship.hasLeftDock = false;
     this.loadZone('overworld', { ...INN_RESPAWN_POS }, true);
     this.state.events.push({
       type: 'player_rested',
@@ -439,19 +614,25 @@ export class GameEngine {
       this.state.screenShake = Math.max(0, this.state.screenShake - dt * 2.4);
     }
 
-    // Écran Titre / Défaite / Victoire : horloge ambiante uniquement
+    // Écran Titre / Défaite / Victoire : horloge ambiante + douce flottaison du bateau
     if (
       this.state.screen === 'title' ||
       this.state.screen === 'defeat' ||
       this.state.screen === 'victory'
     ) {
       this.state.time += dt;
+      if (this.state.zoneId === 'overworld' && this.state.ship.mode === 'parked') {
+        updateShipIdleBobbing(this.state.ship, dt);
+      }
       return;
     }
 
     // Dialogue actif : bloque le combat jusqu'à validation
     if (this.state.dialogue.active) {
       this.state.time += dt;
+      if (this.state.zoneId === 'overworld' && this.state.ship.mode === 'parked') {
+        updateShipIdleBobbing(this.state.ship, dt);
+      }
       if (
         input.confirmPressed ||
         input.interactPressed ||
@@ -497,17 +678,14 @@ export class GameEngine {
     // Avance les horloges de jeu
     this.state.time += dt;
     this.state.runStats.playTimeSec += dt;
+    if (this.shipRefusalCooldown > 0) {
+      this.shipRefusalCooldown = Math.max(0, this.shipRefusalCooldown - dt);
+    }
 
     const player = this.state.player;
 
-    if (this.state.ship.isSailing) {
-      this.updateShipMovement(dt, input);
-      this.checkIslandArrival();
-      this.updateNearestInteractable();
-      return;
-    }
-
-    // --- 1. Mise à jour des timers joueur ---
+    // --- 1. Mise à jour des timers joueur, régénération et VFX transitoires ---
+    // (Actifs y compris pendant les transitions/navigation pour ne jamais figer les VFX)
     if (player.attackCooldown > 0) {
       player.attackCooldown = Math.max(0, player.attackCooldown - dt);
     }
@@ -535,11 +713,23 @@ export class GameEngine {
       }
     }
 
-    // Régénération Soin-velours
+    // Régénération Soin-velours & bouclier Égide de Ronron
     updatePlayerRegen(player, dt, this.state.events);
+    updatePlayerShield(player, dt);
 
     // Effets visuels temporaires
     this.updateTransientVisuals(dt);
+
+    // --- Machine à états maritime (boarding | sailing | docking | disembarking) ---
+    if (this.state.ship.mode !== 'parked') {
+      this.stepMaritimeState(dt, input);
+      return;
+    }
+
+    // En mode 'parked' sur l'overworld : flottaison douce du bateau ancré
+    if (this.state.zoneId === 'overworld') {
+      updateShipIdleBobbing(this.state.ship, dt);
+    }
 
     // --- 2. Orientation & Visée ---
     const moveMag = Math.hypot(input.moveX, input.moveZ);
@@ -568,7 +758,7 @@ export class GameEngine {
     if (input.interactPressed && this.state.nearestInteractable) {
       this.interactWith(this.state.nearestInteractable);
       interactedThisTick = true;
-      if (this.state.ship.isSailing) return;
+      if (this.state.ship.mode !== 'parked') return;
       if (
         this.state.dialogue.active ||
         this.state.activeModal !== 'none' ||
@@ -659,7 +849,9 @@ export class GameEngine {
     }
 
     this.state.inVillage =
-      this.state.zoneId === 'overworld' && isInsideVillage(player.x, player.z);
+      this.state.zoneId === 'overworld' &&
+      this.state.islandId === 'felingard' &&
+      isInsideVillage(player.x, player.z);
 
     // --- 6. Attaque Mêlée (Combo 3 coups + auto-aim doux hors visée souris explicite) ---
     if (
@@ -784,9 +976,13 @@ export class GameEngine {
     this.state.player.dodgeTimer = 0;
     this.state.player.knockbackVx = 0;
     this.state.player.knockbackVz = 0;
+    this.state.player.elevationY = 0;
+    this.state.player.onShipDeck = false;
 
     this.state.companion.x = spawnPos.x - this.state.player.facingX * 1.4;
     this.state.companion.z = spawnPos.z - 0.8;
+    this.state.companion.y = 0;
+    this.state.companion.onShipDeck = false;
 
     this.state.telegraphs = [];
     this.state.activeSpellEffects = [];
@@ -800,25 +996,7 @@ export class GameEngine {
     this.state.activeBossId = null;
 
     if (zoneId === 'overworld') {
-      const islandCamps =
-        this.state.islandId === 'felingard'
-          ? OVERWORLD_DATA.camps
-          : NEW_ISLANDS[this.state.islandId].camps;
-      const islandChests =
-        this.state.islandId === 'felingard'
-          ? OVERWORLD_DATA.chests
-          : NEW_ISLANDS[this.state.islandId].chests;
-      for (const camp of islandCamps) {
-        for (const sp of camp.spawns) {
-          this.state.enemies.push(createEnemyInstance(sp));
-        }
-      }
-      this.state.chests = islandChests.map((c) => ({
-        ...c,
-        loot: { ...c.loot },
-        opened: this.state.openedChestIds.includes(c.id),
-        locked: false,
-      }));
+      this.populateOverworldIslandEntities(this.state.islandId);
     } else {
       const def = getDungeonDefinition(zoneId);
       for (const sp of def.spawns) {
@@ -850,7 +1028,9 @@ export class GameEngine {
     }
 
     this.state.inVillage =
-      zoneId === 'overworld' && isInsideVillage(spawnPos.x, spawnPos.z);
+      zoneId === 'overworld' &&
+      this.state.islandId === 'felingard' &&
+      isInsideVillage(spawnPos.x, spawnPos.z);
 
     this.rebuildInteractables();
     this.updateNearestInteractable();
@@ -875,6 +1055,14 @@ export class GameEngine {
   // ==========================================================================
 
   public triggerInteraction(): boolean {
+    if (this.state.ship.mode === 'sailing') {
+      this.refreshShipDisembarkStatus();
+      this.updateNearestInteractable();
+      return this.tryInitiateDocking();
+    }
+    if (this.state.ship.mode !== 'parked') {
+      return false;
+    }
     this.updateNearestInteractable();
     if (!this.state.nearestInteractable) return false;
     this.interactWith(this.state.nearestInteractable);
@@ -1061,6 +1249,14 @@ export class GameEngine {
     return ok;
   }
 
+  public unequipSlot(slot: EquipSlot): boolean {
+    const ok = progressionUnequipSlot(this.state.player, slot);
+    if (ok) {
+      this.saveCurrentGame();
+    }
+    return ok;
+  }
+
   public buyMysteryChest(): MysteryChestResult | null {
     const result = progressionBuyMysteryChest(
       this.state.player,
@@ -1124,7 +1320,8 @@ export class GameEngine {
     if (
       this.state.screen !== 'playing' ||
       this.state.activeModal !== 'none' ||
-      this.state.dialogue.active
+      this.state.dialogue.active ||
+      this.state.ship.mode !== 'parked'
     ) {
       return false;
     }
@@ -1136,6 +1333,10 @@ export class GameEngine {
       this.state.events,
       {
         activeSpellEffects: this.state.activeSpellEffects,
+        dodgeGhosts: this.state.dodgeGhosts,
+        resolveDashPosition: (x, z) =>
+          this.resolvePositionInCurrentZone(x, z, PLAYER_RADIUS, false),
+        clampTargetPoint: (x, z) => this.clampPointToCurrentZone(x, z),
         rng: this.rng,
       },
     );
@@ -1258,18 +1459,13 @@ export class GameEngine {
         break;
       }
 
-      case 'dock': {
-        if (this.state.ship.isSailing) return;
-        this.state.ship.position = { x: this.state.player.x, z: this.state.player.z };
-        this.state.ship.angle = 0;
-        this.state.ship.departureIslandId = this.state.islandId;
-        this.state.ship.hasLeftDock = false;
-        this.state.ship.isSailing = true;
-        this.updateNearestInteractable();
-        this.state.events.push({
-          type: 'toast',
-          text: 'À la barre ! Dirigez-vous avec ZQSD ou les flèches. Approchez un quai pour débarquer.',
-        });
+      case 'ship_board': {
+        this.startBoarding();
+        break;
+      }
+
+      case 'ship_disembark': {
+        this.tryInitiateDocking();
         break;
       }
     }
@@ -1351,19 +1547,14 @@ export class GameEngine {
     const zoneId = this.state.zoneId;
 
     if (zoneId === 'overworld') {
-      const dockPosition =
-        this.state.islandId === 'felingard'
-          ? FELINGARD_DOCK_POS
-          : NEW_ISLANDS[this.state.islandId].dockPos;
       list.push({
-        id: `dock_${this.state.islandId}`,
-        type: 'dock',
-        label: this.state.ship.isSailing ? 'À la barre' : 'Embarquer',
-        x: dockPosition.x,
-        z: dockPosition.z,
-        radius: 3.2,
+        id: 'ship_board',
+        type: 'ship_board',
+        label: 'Monter à bord',
+        x: this.state.ship.position.x,
+        z: this.state.ship.position.z,
+        radius: SHIP_BOARDING_RADIUS,
         zoneId: 'overworld',
-        destinationIslandId: this.state.islandId,
       });
 
       if (this.state.islandId === 'felingard') {
@@ -1465,7 +1656,28 @@ export class GameEngine {
   }
 
   private updateNearestInteractable(): void {
-    if (this.state.ship.isSailing) {
+    const ship = this.state.ship;
+
+    if (ship.mode === 'sailing') {
+      const status = ship.disembarkStatus;
+      if (status.canDisembark && status.landingPos) {
+        this.state.nearestInteractable = {
+          id: 'ship_disembark',
+          type: 'ship_disembark',
+          label: 'Débarquer',
+          x: status.landingPos.x,
+          z: status.landingPos.z,
+          radius: SHIP_BOARDING_RADIUS,
+          zoneId: 'overworld',
+          destinationIslandId: status.nearestIslandId ?? undefined,
+        };
+      } else {
+        this.state.nearestInteractable = null;
+      }
+      return;
+    }
+
+    if (ship.mode !== 'parked') {
       this.state.nearestInteractable = null;
       return;
     }
@@ -1478,6 +1690,10 @@ export class GameEngine {
 
     for (const item of this.state.interactables) {
       if (item.disabled) continue;
+      if (item.type === 'ship_board') {
+        item.x = ship.position.x;
+        item.z = ship.position.z;
+      }
       const d = dist(px, pz, item.x, item.z);
       if (d <= item.radius && d < bestDist) {
         best = item;
@@ -1677,92 +1893,636 @@ export class GameEngine {
   }
 
   // ==========================================================================
-  // NAVIGATION / SAVAGE : déplacement du bateau sur l'océan
+  // MACHINE À ÉTATS MARITIME : parked | boarding | sailing | docking | disembarking
   // ==========================================================================
 
-  /**
-   * Met à jour la position du bateau (`ship.position`) et son angle.
-   * Utilise les vitesses du bateau. Le mouvement est libre sur l'eau.
-   */
-  private updateShipMovement(dt: number, input: InputState): void {
-    let mx = input.moveX ?? 0;
-    let mz = input.moveZ ?? 0;
+  private populateOverworldIslandEntities(islandId: IslandId): void {
+    const islandCamps =
+      islandId === 'felingard'
+        ? OVERWORLD_DATA.camps
+        : NEW_ISLANDS[islandId].camps;
+    const islandChests =
+      islandId === 'felingard'
+        ? OVERWORLD_DATA.chests
+        : NEW_ISLANDS[islandId].chests;
 
-    const inputLength = Math.hypot(mx, mz);
-    if (inputLength > 1) {
-      mx /= inputLength;
-      mz /= inputLength;
-    }
-
-    if (inputLength > 0.05) {
-      this.state.ship.angle = Math.atan2(mz, mx);
-    }
-
-    const position = this.state.ship.position;
-    position.x = clamp(position.x + mx * this.SHIP_SPEED * dt, -155, 155);
-    position.z = clamp(position.z + mz * this.SHIP_SPEED * dt, -155, 155);
-    this.state.player.x = position.x;
-    this.state.player.z = position.z;
-    this.state.player.vx = mx * this.SHIP_SPEED;
-    this.state.player.vz = mz * this.SHIP_SPEED;
-    this.state.companion.x = position.x - Math.cos(this.state.ship.angle) * 1.4;
-    this.state.companion.z = position.z - Math.sin(this.state.ship.angle) * 1.4;
-
-    if (this.state.ship.departureIslandId && !this.state.ship.hasLeftDock) {
-      const departure = this.getDockPosition(this.state.ship.departureIslandId);
-      if (dist(position.x, position.z, departure.x, departure.z) > this.DOCK_RADIUS) {
-        this.state.ship.hasLeftDock = true;
+    this.state.enemies = [];
+    for (const camp of islandCamps) {
+      for (const sp of camp.spawns) {
+        this.state.enemies.push(createEnemyInstance(sp));
       }
+    }
+    this.state.chests = islandChests.map((c) => ({
+      ...c,
+      loot: { ...c.loot },
+      opened: this.state.openedChestIds.includes(c.id),
+      locked: false,
+    }));
+  }
+
+  /**
+   * Bascule en douceur les entités de l'île active lors d'un débarquement
+   * sans déclencher de fondu noir `zone_transition` ni déplacer le bateau.
+   */
+  private switchActiveIsland(targetIslandId: IslandId): void {
+    if (this.state.zoneId !== 'overworld') return;
+
+    if (this.state.islandId !== targetIslandId) {
+      this.state.islandId = targetIslandId;
+      this.state.telegraphs = [];
+      this.state.activeBossId = null;
+      this.populateOverworldIslandEntities(targetIslandId);
+    }
+
+    this.rebuildInteractables();
+    this.refreshQuestTarget();
+  }
+
+  private syncCrewToShipDeck(): void {
+    const ship = this.state.ship;
+    const player = this.state.player;
+    const companion = this.state.companion;
+
+    const heroAnchor = getShipDeckWorldAnchor(ship, SHIP_HERO_DECK_LOCAL);
+    player.x = heroAnchor.x;
+    player.z = heroAnchor.z;
+    player.elevationY = heroAnchor.y;
+    player.onShipDeck = true;
+    player.vx = 0;
+    player.vz = 0;
+
+    const fwd = getShipForward(ship.angle);
+    if (Math.abs(fwd.x) > 0.15) {
+      player.facingX = fwd.x >= 0 ? 1 : -1;
+    }
+
+    const compAnchor = getShipDeckWorldAnchor(ship, SHIP_COMPANION_DECK_LOCAL);
+    companion.x = compAnchor.x;
+    companion.z = compAnchor.z;
+    companion.y = compAnchor.y;
+    companion.onShipDeck = true;
+  }
+
+  private refreshShipDisembarkStatus(): void {
+    const ship = this.state.ship;
+    ship.disembarkStatus = findSafeDisembarkSpot(
+      ship.position.x,
+      ship.position.z,
+      ship.angle,
+      {
+        zoneId: this.state.zoneId,
+        currentIslandId: this.state.islandId,
+        enemies: this.state.enemies,
+      },
+    );
+  }
+
+  private stepMaritimeState(dt: number, input: InputState): void {
+    switch (this.state.ship.mode) {
+      case 'boarding':
+        this.updateBoarding(dt);
+        break;
+      case 'sailing':
+        this.updateSailing(dt, input);
+        break;
+      case 'docking':
+        this.updateDocking(dt);
+        break;
+      case 'disembarking':
+        this.updateDisembarking(dt);
+        break;
+      case 'parked':
+        break;
     }
   }
 
-  private checkIslandArrival(): void {
-    if (!this.state.ship.hasLeftDock) return;
-    const destinations = ['felingard', ...ALL_NEW_ISLANDS] as const;
-    for (const islandId of destinations) {
-      const dock = this.getDockPosition(islandId);
-      if (dist(this.state.ship.position.x, this.state.ship.position.z, dock.x, dock.z) > this.DOCK_RADIUS) {
-        continue;
-      }
+  private startBoarding(): void {
+    const ship = this.state.ship;
+    const player = this.state.player;
+    const companion = this.state.companion;
 
-      this.state.islandId = islandId;
-      this.state.ship.isSailing = false;
-      this.state.ship.departureIslandId = null;
-      this.state.ship.hasLeftDock = false;
-      this.state.ship.position = { ...dock };
-      this.loadZone('overworld', this.getLandingPosition(islandId), true);
-      this.saveCurrentGame();
-      this.state.events.push({
-        type: 'toast',
-        text: `Bienvenue sur ${this.getIslandName(islandId)} !`,
-      });
+    if (
+      this.state.zoneId !== 'overworld' ||
+      ship.mode !== 'parked' ||
+      player.hp <= 0
+    ) {
       return;
     }
-  }
 
-  private getDockPosition(islandId: GameState['islandId']): Vec2 {
-    return islandId === 'felingard'
-      ? FELINGARD_DOCK_POS
-      : NEW_ISLANDS[islandId].dockPos;
-  }
+    player.vx = 0;
+    player.vz = 0;
+    player.dodgeTimer = 0;
+    player.attackAnimTimer = 0;
+    player.knockbackVx = 0;
+    player.knockbackVz = 0;
+    player.onShipDeck = false;
+    player.elevationY = 0;
 
-  private getLandingPosition(islandId: GameState['islandId']): Vec2 {
-    const dock = this.getDockPosition(islandId);
-    const center =
-      islandId === 'felingard'
-        ? { x: 0, z: 0 }
-        : { x: NEW_ISLANDS[islandId].centerX, z: NEW_ISLANDS[islandId].centerZ };
-    const dx = center.x - dock.x;
-    const dz = center.z - dock.z;
-    const length = Math.hypot(dx, dz) || 1;
-    return {
-      x: dock.x + (dx / length) * 2.9,
-      z: dock.z + (dz / length) * 2.9,
+    companion.onShipDeck = false;
+    companion.y = companion.y ?? 0;
+
+    // Désengage les ennemis terrestres & annule les télégraphes en cours
+    for (const enemy of this.state.enemies) {
+      enemy.aggroed = false;
+      if (enemy.state === 'chase' || enemy.state === 'windup') {
+        enemy.state = 'idle';
+        enemy.stateTimer = 0;
+        enemy.vx = 0;
+        enemy.vz = 0;
+      }
+    }
+    this.state.telegraphs = [];
+    this.state.activeBossId = null;
+
+    const heroDeck = getShipDeckWorldAnchor(ship, SHIP_HERO_DECK_LOCAL);
+    const compDeck = getShipDeckWorldAnchor(ship, SHIP_COMPANION_DECK_LOCAL);
+
+    const dxJump = heroDeck.x - player.x;
+    if (Math.abs(dxJump) > 0.05) {
+      player.facingX = dxJump >= 0 ? 1 : -1;
+    }
+
+    ship.mode = 'boarding';
+    ship.isSailing = false;
+    ship.transition = {
+      kind: 'boarding',
+      elapsed: 0,
+      duration: BOARDING_DURATION,
+      targetIslandId: this.state.islandId,
+      shipStartPos: { x: ship.position.x, z: ship.position.z },
+      shipTargetPos: { x: ship.position.x, z: ship.position.z },
+      shipStartAngle: ship.angle,
+      shipTargetAngle: ship.angle,
+      heroStartPos: { x: player.x, z: player.z },
+      heroStartY: 0,
+      heroTargetPos: { x: heroDeck.x, z: heroDeck.z },
+      heroTargetY: heroDeck.y,
+      companionStartPos: { x: companion.x, z: companion.z },
+      companionStartY: companion.y ?? 0,
+      companionTargetPos: { x: compDeck.x, z: compDeck.z },
+      companionTargetY: compDeck.y,
+      arcHeight: BOARDING_ARC_HEIGHT,
     };
+
+    this.state.nearestInteractable = null;
+    this.state.events.push({
+      type: 'ship_boarding',
+      x: ship.position.x,
+      z: ship.position.z,
+    });
   }
 
-  private getIslandName(islandId: GameState['islandId']): string {
-    return islandId === 'felingard' ? 'Félingard' : NEW_ISLANDS[islandId].name;
+  private updateBoarding(dt: number): void {
+    const ship = this.state.ship;
+    const player = this.state.player;
+    const companion = this.state.companion;
+
+    updateShipIdleBobbing(ship, dt);
+    companion.bobPhase += dt * 4;
+    this.state.inVillage = false;
+    this.state.nearestInteractable = null;
+
+    const tr = ship.transition;
+    if (!tr || tr.kind !== 'boarding') {
+      ship.mode = 'sailing';
+      ship.isSailing = true;
+      ship.dockedIslandId = null;
+      ship.transition = null;
+      this.syncCrewToShipDeck();
+      this.refreshShipDisembarkStatus();
+      this.updateNearestInteractable();
+      return;
+    }
+
+    // Suit le léger bobbing vertical du pont en temps réel
+    const liveHeroDeck = getShipDeckWorldAnchor(ship, SHIP_HERO_DECK_LOCAL);
+    const liveCompDeck = getShipDeckWorldAnchor(ship, SHIP_COMPANION_DECK_LOCAL);
+    tr.heroTargetPos.x = liveHeroDeck.x;
+    tr.heroTargetPos.z = liveHeroDeck.z;
+    tr.heroTargetY = liveHeroDeck.y;
+    tr.companionTargetPos.x = liveCompDeck.x;
+    tr.companionTargetPos.z = liveCompDeck.z;
+    tr.companionTargetY = liveCompDeck.y;
+
+    tr.elapsed += dt;
+    const t = clamp(tr.elapsed / Math.max(tr.duration, 1e-4), 0, 1);
+
+    const heroPos = evaluateParabolicJump(
+      tr.heroStartPos,
+      tr.heroTargetPos,
+      tr.heroStartY,
+      tr.heroTargetY,
+      tr.arcHeight,
+      t,
+    );
+    player.x = heroPos.x;
+    player.z = heroPos.z;
+    player.elevationY = heroPos.y;
+    player.onShipDeck = false;
+    player.vx = 0;
+    player.vz = 0;
+
+    const compPos = evaluateParabolicJump(
+      tr.companionStartPos,
+      tr.companionTargetPos,
+      tr.companionStartY,
+      tr.companionTargetY,
+      tr.arcHeight * 0.85,
+      t,
+    );
+    companion.x = compPos.x;
+    companion.z = compPos.z;
+    companion.y = compPos.y;
+    companion.onShipDeck = false;
+
+    if (tr.elapsed >= tr.duration) {
+      ship.mode = 'sailing';
+      ship.isSailing = true;
+      ship.dockedIslandId = null;
+      ship.transition = null;
+      this.syncCrewToShipDeck();
+      this.refreshShipDisembarkStatus();
+      this.updateNearestInteractable();
+      this.refreshQuestTarget();
+      this.state.events.push({
+        type: 'ship_boarded',
+        x: ship.position.x,
+        z: ship.position.z,
+        text: 'À la barre ! ZQSD / WASD / Flèches pour naviguer, E près d’une plage pour débarquer.',
+      });
+    }
   }
 
+  private updateSailing(dt: number, input: InputState): void {
+    const ship = this.state.ship;
+    this.state.companion.bobPhase += dt * 4;
+    this.state.inVillage = false;
+
+    const controls = mapInputStateToShipControls(input);
+    const physRes = stepShipPhysics(
+      ship,
+      controls,
+      dt,
+      SHIP_PHYSICS_CONFIG,
+      (x, z, angle, speed, angVel, cfg, substepDt) =>
+        resolveShipCoastCollision(x, z, angle, speed, angVel, cfg, substepDt),
+    );
+    ship.vx = physRes.vx;
+    ship.vz = physRes.vz;
+
+    this.syncCrewToShipDeck();
+    this.refreshShipDisembarkStatus();
+    this.updateNearestInteractable();
+    this.refreshQuestTarget();
+
+    if (input.interactPressed) {
+      this.tryInitiateDocking();
+    }
+  }
+
+  private tryInitiateDocking(): boolean {
+    const ship = this.state.ship;
+    if (ship.mode !== 'sailing') return false;
+
+    const status = ship.disembarkStatus;
+    if (status.canDisembark && status.landingPos && status.nearestIslandId) {
+      const duration = clamp(0.24 + Math.abs(ship.speed) * 0.032, 0.24, 0.65);
+      const heroDeck = getShipDeckWorldAnchor(ship, SHIP_HERO_DECK_LOCAL);
+      const compDeck = getShipDeckWorldAnchor(ship, SHIP_COMPANION_DECK_LOCAL);
+
+      ship.mode = 'docking';
+      ship.isSailing = true;
+      ship.transition = {
+        kind: 'docking',
+        elapsed: 0,
+        duration,
+        targetIslandId: status.nearestIslandId,
+        shipStartPos: { x: ship.position.x, z: ship.position.z },
+        shipTargetPos: { x: ship.position.x, z: ship.position.z },
+        shipStartAngle: ship.angle,
+        shipTargetAngle: ship.angle,
+        heroStartPos: { x: heroDeck.x, z: heroDeck.z },
+        heroStartY: heroDeck.y,
+        heroTargetPos: { x: status.landingPos.x, z: status.landingPos.z },
+        heroTargetY: 0,
+        companionStartPos: { x: compDeck.x, z: compDeck.z },
+        companionStartY: compDeck.y,
+        companionTargetPos: { x: status.landingPos.x, z: status.landingPos.z },
+        companionTargetY: 0,
+        arcHeight: DISEMBARKING_ARC_HEIGHT,
+        landingPos: { x: status.landingPos.x, z: status.landingPos.z },
+      };
+      this.state.nearestInteractable = null;
+      this.state.events.push({
+        type: 'ship_docking',
+        x: ship.position.x,
+        z: ship.position.z,
+        islandId: status.nearestIslandId,
+      });
+      return true;
+    }
+
+    if (this.shipRefusalCooldown <= 0) {
+      this.shipRefusalCooldown = SHIP_REFUSAL_COOLDOWN;
+      let message: string;
+      switch (status.reason) {
+        case 'inaccessible_cliff':
+          message =
+            'Falaises impraticables — longez la côte vers une plage accessible.';
+          break;
+        case 'no_safe_spot':
+          message =
+            'Rivage encombré ou dangereux — cherchez une plage dégagée.';
+          break;
+        case 'too_far_from_shore':
+        default:
+          message = 'Approchez-vous d’une plage pour débarquer.';
+          break;
+      }
+      this.state.events.push({
+        type: 'ship_refused',
+        x: ship.position.x,
+        z: ship.position.z,
+        text: message,
+        toastVariant: 'warning',
+      });
+    }
+    return false;
+  }
+
+  private updateDocking(dt: number): void {
+    const ship = this.state.ship;
+    this.state.companion.bobPhase += dt * 4;
+    this.state.inVillage = false;
+    this.state.nearestInteractable = null;
+
+    const tr = ship.transition;
+    if (!tr || tr.kind !== 'docking') {
+      ship.mode = 'sailing';
+      ship.isSailing = true;
+      ship.transition = null;
+      this.syncCrewToShipDeck();
+      this.refreshShipDisembarkStatus();
+      this.updateNearestInteractable();
+      return;
+    }
+
+    // Freinage automatique doux vers v = 0 en préservant la collision côtière continue
+    let brakeThrottle = 0;
+    if (ship.speed > SHIP_PHYSICS_CONFIG.stopSpeedEpsilon) {
+      brakeThrottle = -1;
+    } else if (ship.speed < -SHIP_PHYSICS_CONFIG.stopSpeedEpsilon) {
+      brakeThrottle = 1;
+    } else {
+      ship.speed = 0;
+    }
+    // Empêche tout basculement involontaire en marche arrière pendant l'accostage
+    ship.reverseEngageTimer = SHIP_PHYSICS_CONFIG.reverseEngageDelaySec;
+
+    const physRes = stepShipPhysics(
+      ship,
+      { throttle: brakeThrottle, steer: 0 },
+      dt,
+      SHIP_PHYSICS_CONFIG,
+      (x, z, angle, speed, angVel, cfg, substepDt) =>
+        resolveShipCoastCollision(x, z, angle, speed, angVel, cfg, substepDt),
+    );
+    ship.vx = physRes.vx;
+    ship.vz = physRes.vz;
+
+    if (
+      (brakeThrottle < 0 && ship.speed < 0) ||
+      (brakeThrottle > 0 && ship.speed > 0)
+    ) {
+      ship.speed = 0;
+      ship.vx = 0;
+      ship.vz = 0;
+    }
+
+    tr.shipTargetPos.x = ship.position.x;
+    tr.shipTargetPos.z = ship.position.z;
+    tr.shipTargetAngle = ship.angle;
+
+    this.syncCrewToShipDeck();
+    tr.elapsed += dt;
+
+    const isStopped = Math.abs(ship.speed) <= 0.15;
+    if (
+      (tr.elapsed >= tr.duration && isStopped) ||
+      tr.elapsed >= tr.duration + 0.35
+    ) {
+      ship.speed = 0;
+      ship.vx = 0;
+      ship.vz = 0;
+      ship.angularVelocity = 0;
+      ship.rudder = 0;
+      ship.wakeIntensity = 0;
+      ship.reverseEngageTimer = 0;
+
+      // Re-valide le point de débarquement à l'emplacement final exact du navire
+      const recheck = findSafeDisembarkSpot(
+        ship.position.x,
+        ship.position.z,
+        ship.angle,
+        {
+          zoneId: this.state.zoneId,
+          currentIslandId: this.state.islandId,
+          enemies: this.state.enemies,
+        },
+      );
+      ship.disembarkStatus = recheck;
+
+      let targetIslandId: IslandId = tr.targetIslandId;
+      let landingPos: Vec2 | null = null;
+      if (recheck.canDisembark && recheck.landingPos && recheck.nearestIslandId) {
+        targetIslandId = recheck.nearestIslandId;
+        landingPos = { x: recheck.landingPos.x, z: recheck.landingPos.z };
+      } else if (
+        tr.landingPos &&
+        dist(ship.position.x, ship.position.z, tr.landingPos.x, tr.landingPos.z) <=
+          SHIP_BOARDING_RADIUS
+      ) {
+        landingPos = { x: tr.landingPos.x, z: tr.landingPos.z };
+      }
+
+      if (!landingPos) {
+        ship.mode = 'sailing';
+        ship.isSailing = true;
+        ship.transition = null;
+        this.updateNearestInteractable();
+        this.state.events.push({
+          type: 'ship_refused',
+          x: ship.position.x,
+          z: ship.position.z,
+          text: 'Rivage encombré ou hors de portée — cherchez une plage dégagée.',
+          toastVariant: 'warning',
+        });
+        return;
+      }
+
+      this.beginDisembarking(targetIslandId, landingPos);
+    }
+  }
+
+  private beginDisembarking(targetIslandId: IslandId, landingPos: Vec2): void {
+    const ship = this.state.ship;
+    const player = this.state.player;
+    const companion = this.state.companion;
+
+    this.disembarkChangedIsland = targetIslandId !== this.state.islandId;
+    this.switchActiveIsland(targetIslandId);
+
+    const heroDeck = getShipDeckWorldAnchor(ship, SHIP_HERO_DECK_LOCAL);
+    const compDeck = getShipDeckWorldAnchor(ship, SHIP_COMPANION_DECK_LOCAL);
+
+    const dxJump = landingPos.x - heroDeck.x;
+    if (Math.abs(dxJump) > 0.05) {
+      player.facingX = dxJump >= 0 ? 1 : -1;
+    }
+
+    const compDesired: Vec2 = {
+      x: landingPos.x - player.facingX * 1.4,
+      z: landingPos.z - 0.8,
+    };
+    const compLanding = findSafeLandPositionOnIsland(targetIslandId, compDesired);
+
+    ship.mode = 'disembarking';
+    ship.isSailing = false;
+    ship.dockedIslandId = targetIslandId;
+    ship.nearestCoastIslandId = targetIslandId;
+    ship.transition = {
+      kind: 'disembarking',
+      elapsed: 0,
+      duration: DISEMBARKING_DURATION,
+      targetIslandId,
+      shipStartPos: { x: ship.position.x, z: ship.position.z },
+      shipTargetPos: { x: ship.position.x, z: ship.position.z },
+      shipStartAngle: ship.angle,
+      shipTargetAngle: ship.angle,
+      heroStartPos: { x: heroDeck.x, z: heroDeck.z },
+      heroStartY: heroDeck.y,
+      heroTargetPos: { x: landingPos.x, z: landingPos.z },
+      heroTargetY: 0,
+      companionStartPos: { x: compDeck.x, z: compDeck.z },
+      companionStartY: compDeck.y,
+      companionTargetPos: { x: compLanding.x, z: compLanding.z },
+      companionTargetY: 0,
+      arcHeight: DISEMBARKING_ARC_HEIGHT,
+      landingPos: { x: landingPos.x, z: landingPos.z },
+    };
+
+    player.onShipDeck = false;
+    companion.onShipDeck = false;
+    this.state.nearestInteractable = null;
+  }
+
+  private updateDisembarking(dt: number): void {
+    const ship = this.state.ship;
+    const player = this.state.player;
+    const companion = this.state.companion;
+
+    // Le bateau flotte doucement SANS jamais bouger sa position ni son cap !
+    updateShipIdleBobbing(ship, dt);
+    companion.bobPhase += dt * 4;
+    this.state.nearestInteractable = null;
+
+    const tr = ship.transition;
+    if (!tr || tr.kind !== 'disembarking') {
+      const safePos = findSafeLandPositionOnIsland(this.state.islandId, {
+        x: player.x,
+        z: player.z,
+      });
+      player.x = safePos.x;
+      player.z = safePos.z;
+      player.elevationY = 0;
+      player.onShipDeck = false;
+      companion.y = 0;
+      companion.onShipDeck = false;
+      ship.mode = 'parked';
+      ship.isSailing = false;
+      ship.transition = null;
+      this.rebuildInteractables();
+      this.updateNearestInteractable();
+      return;
+    }
+
+    tr.elapsed += dt;
+    const t = clamp(tr.elapsed / Math.max(tr.duration, 1e-4), 0, 1);
+
+    const heroPos = evaluateParabolicJump(
+      tr.heroStartPos,
+      tr.heroTargetPos,
+      tr.heroStartY,
+      tr.heroTargetY,
+      tr.arcHeight,
+      t,
+    );
+    player.x = heroPos.x;
+    player.z = heroPos.z;
+    player.elevationY = heroPos.y;
+    player.onShipDeck = false;
+    player.vx = 0;
+    player.vz = 0;
+
+    const compPos = evaluateParabolicJump(
+      tr.companionStartPos,
+      tr.companionTargetPos,
+      tr.companionStartY,
+      tr.companionTargetY,
+      tr.arcHeight * 0.85,
+      t,
+    );
+    companion.x = compPos.x;
+    companion.z = compPos.z;
+    companion.y = compPos.y;
+    companion.onShipDeck = false;
+
+    if (tr.elapsed >= tr.duration) {
+      const finalLanding = tr.landingPos ?? tr.heroTargetPos;
+      const targetIslandId = tr.targetIslandId;
+      const changedIsland = this.disembarkChangedIsland;
+      this.disembarkChangedIsland = false;
+
+      player.x = finalLanding.x;
+      player.z = finalLanding.z;
+      player.elevationY = 0;
+      player.onShipDeck = false;
+      player.vx = 0;
+      player.vz = 0;
+
+      companion.x = tr.companionTargetPos.x;
+      companion.z = tr.companionTargetPos.z;
+      companion.y = 0;
+      companion.onShipDeck = false;
+
+      ship.mode = 'parked';
+      ship.isSailing = false;
+      ship.transition = null;
+      ship.dockedIslandId = targetIslandId;
+      ship.nearestCoastIslandId = targetIslandId;
+      ship.disembarkStatus = createEmptyDisembarkStatus();
+
+      this.state.islandId = targetIslandId;
+      this.state.inVillage =
+        this.state.zoneId === 'overworld' &&
+        targetIslandId === 'felingard' &&
+        isInsideVillage(player.x, player.z);
+
+      this.rebuildInteractables();
+      this.updateNearestInteractable();
+      this.updateActiveBoss();
+      this.refreshQuestTarget();
+      this.saveCurrentGame();
+
+      this.state.events.push({
+        type: 'ship_disembarked',
+        x: player.x,
+        z: player.z,
+        islandId: targetIslandId,
+        ...(changedIsland
+          ? { text: `Bienvenue sur ${getIslandName(targetIslandId)} !` }
+          : {}),
+      });
+    }
+  }
 }

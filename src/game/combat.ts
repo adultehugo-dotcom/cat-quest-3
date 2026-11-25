@@ -372,6 +372,7 @@ export interface SpellCastResult {
   hitEnemies: EnemyInstance[];
   killedEnemies: EnemyInstance[];
   healAmount: number;
+  shieldAmount?: number;
   triggeredHitstop: boolean;
   shakeAmount: number;
   reason?: 'dead' | 'cooldown' | 'insufficient_mp';
@@ -384,6 +385,9 @@ export function castSpell(
   events: GameEvent[],
   options?: {
     activeSpellEffects?: ActiveSpellEffect[];
+    dodgeGhosts?: DodgeGhost[];
+    resolveDashPosition?: (x: number, z: number) => { x: number; z: number };
+    clampTargetPoint?: (x: number, z: number) => { x: number; z: number };
     rng?: () => number;
   },
 ): SpellCastResult {
@@ -434,9 +438,318 @@ export function castSpell(
   const level = player.spellLevels[spellId] ?? 1;
   const spellPower = getSpellPower(spellId, level, player.stats.mag);
 
-  const effectDuration =
-    spellId === 'healing_paw' ? 0.85 : spellId === 'freezepaw' ? 0.55 : 0.45;
+  // Sort 4 : Soin-velours
+  if (spellId === 'healing_paw') {
+    const instantPct = def.instantHealPct ?? 0.25;
+    const rawHeal = Math.round(player.maxHp * instantPct + spellPower);
+    const prevHp = player.hp;
+    player.hp = Math.min(player.maxHp, player.hp + rawHeal);
+    const actualHeal = Math.max(0, player.hp - prevHp);
 
+    player.regenTimer = def.regenDuration ?? 3.0;
+    player.regenTickAccum = 0;
+
+    options?.activeSpellEffects?.push({
+      id: `spell_fx_${nextSpellEffectId++}`,
+      spellId,
+      x: player.x,
+      z: player.z,
+      angle: player.aimAngle,
+      radius: def.radius,
+      width: def.width,
+      elapsed: 0,
+      duration: 0.85,
+    });
+    events.push({
+      type: 'spell_cast',
+      x: player.x,
+      z: player.z,
+      angle: player.aimAngle,
+      radius: def.radius,
+      spellId,
+      color: def.color,
+    });
+    events.push({
+      type: 'heal_tick',
+      x: player.x,
+      z: player.z,
+      value: rawHeal,
+      text: `+${rawHeal} PV`,
+      spellId: 'healing_paw',
+    });
+
+    return {
+      cast: true,
+      spellId,
+      hitEnemies: [],
+      killedEnemies: [],
+      healAmount: actualHeal > 0 ? actualHeal : rawHeal,
+      triggeredHitstop: false,
+      shakeAmount: 0.1,
+    };
+  }
+
+  // Sort 5 : Égide de Ronron (Défense / Bouclier absorbant les dégâts)
+  if (spellId === 'aegis_purr') {
+    const shieldPct = def.shieldHpPct ?? 0.24;
+    const shieldAmount = Math.max(15, Math.round(player.maxHp * shieldPct + spellPower));
+    const shieldDur = def.shieldDuration ?? 5.5;
+    player.shieldHp = shieldAmount;
+    player.shieldMaxHp = shieldAmount;
+    player.shieldTimer = shieldDur;
+
+    options?.activeSpellEffects?.push({
+      id: `spell_fx_${nextSpellEffectId++}`,
+      spellId,
+      x: player.x,
+      z: player.z,
+      angle: player.aimAngle,
+      radius: def.radius,
+      elapsed: 0,
+      duration: 0.78,
+    });
+    events.push({
+      type: 'spell_cast',
+      x: player.x,
+      z: player.z,
+      angle: player.aimAngle,
+      radius: def.radius,
+      value: shieldAmount,
+      text: `Égide +${shieldAmount}`,
+      spellId,
+      color: def.color,
+    });
+
+    return {
+      cast: true,
+      spellId,
+      hitEnemies: [],
+      killedEnemies: [],
+      healAmount: 0,
+      shieldAmount,
+      triggeredHitstop: false,
+      shakeAmount: 0.14,
+    };
+  }
+
+  // Sort 6 : Bond Foudroyant (Mobilité : ruée directionnelle + i-frames + dégâts traversée)
+  if (spellId === 'pounce_dash') {
+    const startX = player.x;
+    const startZ = player.z;
+    const dirX = Math.cos(player.aimAngle);
+    const dirZ = Math.sin(player.aimAngle);
+    const steps = 12;
+    const stepLen = def.radius / steps;
+
+    for (let s = 1; s <= steps; s++) {
+      const candidateX = player.x + dirX * stepLen;
+      const candidateZ = player.z + dirZ * stepLen;
+      const resolved = options?.resolveDashPosition
+        ? options.resolveDashPosition(candidateX, candidateZ)
+        : { x: candidateX, z: candidateZ };
+      player.x = resolved.x;
+      player.z = resolved.z;
+
+      if (options?.dodgeGhosts && s % 3 === 0) {
+        options.dodgeGhosts.push({
+          x: player.x,
+          z: player.z,
+          facingX: Math.abs(dirX) > 0.08 ? (dirX >= 0 ? 1 : -1) : player.facingX,
+          age: 0,
+          duration: 0.28,
+        });
+      }
+    }
+
+    if (Math.abs(dirX) > 0.08) {
+      player.facingX = dirX >= 0 ? 1 : -1;
+    }
+    player.vx = dirX * 14.0;
+    player.vz = dirZ * 14.0;
+    player.invulnTimer = Math.max(player.invulnTimer, def.dashIframes ?? 0.28);
+
+    const traveledDist = Math.max(0.8, Math.hypot(player.x - startX, player.z - startZ));
+    const dashAngle = Math.atan2(player.z - startZ, player.x - startX);
+
+    options?.activeSpellEffects?.push({
+      id: `spell_fx_${nextSpellEffectId++}`,
+      spellId,
+      x: startX,
+      z: startZ,
+      angle: traveledDist > 0.85 ? dashAngle : player.aimAngle,
+      radius: traveledDist,
+      width: def.width ?? 2.1,
+      elapsed: 0,
+      duration: 0.42,
+    });
+    events.push({
+      type: 'spell_cast',
+      x: player.x,
+      z: player.z,
+      angle: traveledDist > 0.85 ? dashAngle : player.aimAngle,
+      radius: traveledDist,
+      spellId,
+      color: def.color,
+    });
+
+    const hitEnemies: EnemyInstance[] = [];
+    const killedEnemies: EnemyInstance[] = [];
+    let triggeredHitstop = false;
+    for (const enemy of enemies) {
+      if (enemy.state === 'dead' || enemy.hp <= 0) continue;
+      const inLine = isPointInLine(
+        enemy.x,
+        enemy.z,
+        startX,
+        startZ,
+        traveledDist > 0.85 ? dashAngle : player.aimAngle,
+        traveledDist,
+        def.width ?? 2.1,
+        enemy.radius,
+      );
+      const inArrival = isPointInCircle(
+        enemy.x,
+        enemy.z,
+        player.x,
+        player.z,
+        2.0,
+        enemy.radius,
+      );
+      if (!inLine && !inArrival) continue;
+
+      const { damage, isCrit } = calculatePlayerDamage(
+        spellPower,
+        player.stats.critChance,
+        rng,
+      );
+      enemy.hp = Math.max(0, enemy.hp - damage);
+      enemy.hitFlashTimer = 0.14;
+      enemy.aggroed = true;
+      const kbScale = enemy.isBoss ? 0.15 : 1.0;
+      enemy.knockbackVx = dirX * 6.2 * kbScale;
+      enemy.knockbackVz = dirZ * 6.2 * kbScale;
+
+      events.push({
+        type: 'hit_enemy',
+        x: enemy.x,
+        z: enemy.z,
+        value: damage,
+        isCrit,
+        spellId,
+        enemyId: enemy.id,
+        enemyTypeId: enemy.typeId,
+      });
+      hitEnemies.push(enemy);
+      if (isCrit || enemy.hp <= 0) triggeredHitstop = true;
+      if (enemy.hp <= 0) killedEnemies.push(enemy);
+    }
+
+    return {
+      cast: true,
+      spellId,
+      hitEnemies,
+      killedEnemies,
+      healAmount: 0,
+      triggeredHitstop,
+      shakeAmount: 0.26,
+    };
+  }
+
+  // Sort 7 : Chute d'Étoiles (Dégâts de zone massifs projetés devant le héros)
+  if (spellId === 'meteor_paw') {
+    const castRange = def.castRange ?? 5.5;
+    let targetX = player.x + Math.cos(player.aimAngle) * Math.min(4.2, castRange);
+    let targetZ = player.z + Math.sin(player.aimAngle) * Math.min(4.2, castRange);
+
+    // Accroche douce sur l'ennemi vivant le plus proche dans le cône avant
+    let bestDist = castRange + 2.2;
+    for (const enemy of enemies) {
+      if (enemy.state === 'dead' || enemy.hp <= 0) continue;
+      const d = Math.hypot(enemy.x - player.x, enemy.z - player.z);
+      if (d < bestDist) {
+        bestDist = d;
+        const clamped = Math.min(d, castRange);
+        const dir = normalize(enemy.x - player.x, enemy.z - player.z);
+        targetX = player.x + dir.x * clamped;
+        targetZ = player.z + dir.z * clamped;
+      }
+    }
+    if (options?.clampTargetPoint) {
+      const clampedPt = options.clampTargetPoint(targetX, targetZ);
+      targetX = clampedPt.x;
+      targetZ = clampedPt.z;
+    }
+
+    options?.activeSpellEffects?.push({
+      id: `spell_fx_${nextSpellEffectId++}`,
+      spellId,
+      x: targetX,
+      z: targetZ,
+      angle: player.aimAngle,
+      radius: def.radius,
+      elapsed: 0,
+      duration: 0.88,
+    });
+    events.push({
+      type: 'spell_cast',
+      x: targetX,
+      z: targetZ,
+      angle: player.aimAngle,
+      radius: def.radius,
+      spellId,
+      color: def.color,
+    });
+
+    const hitEnemies: EnemyInstance[] = [];
+    const killedEnemies: EnemyInstance[] = [];
+    let triggeredHitstop = false;
+
+    for (const enemy of enemies) {
+      if (enemy.state === 'dead' || enemy.hp <= 0) continue;
+      if (!isPointInCircle(enemy.x, enemy.z, targetX, targetZ, def.radius, enemy.radius)) {
+        continue;
+      }
+      const { damage, isCrit } = calculatePlayerDamage(
+        spellPower,
+        player.stats.critChance,
+        rng,
+      );
+      enemy.hp = Math.max(0, enemy.hp - damage);
+      enemy.hitFlashTimer = 0.18;
+      enemy.aggroed = true;
+      const kbScale = enemy.isBoss ? 0.2 : 1.0;
+      const kbDir = normalize(enemy.x - targetX, enemy.z - targetZ);
+      enemy.knockbackVx = kbDir.x * 8.5 * kbScale;
+      enemy.knockbackVz = kbDir.z * 8.5 * kbScale;
+
+      events.push({
+        type: 'hit_enemy',
+        x: enemy.x,
+        z: enemy.z,
+        value: damage,
+        isCrit,
+        spellId,
+        enemyId: enemy.id,
+        enemyTypeId: enemy.typeId,
+      });
+      hitEnemies.push(enemy);
+      if (isCrit || enemy.hp <= 0) triggeredHitstop = true;
+      if (enemy.hp <= 0) killedEnemies.push(enemy);
+    }
+
+    return {
+      cast: true,
+      spellId,
+      hitEnemies,
+      killedEnemies,
+      healAmount: 0,
+      triggeredHitstop,
+      shakeAmount: 0.55,
+    };
+  }
+
+  // Sorts offensifs historiques : flamepurr, lightnyan, freezepaw
+  const effectDuration = spellId === 'freezepaw' ? 0.55 : 0.45;
   options?.activeSpellEffects?.push({
     id: `spell_fx_${nextSpellEffectId++}`,
     spellId,
@@ -459,38 +772,6 @@ export function castSpell(
     color: def.color,
   });
 
-  // Sort 4 : Soin-velours
-  if (spellId === 'healing_paw') {
-    const instantPct = def.instantHealPct ?? 0.25;
-    const rawHeal = Math.round(player.maxHp * instantPct + spellPower);
-    const prevHp = player.hp;
-    player.hp = Math.min(player.maxHp, player.hp + rawHeal);
-    const actualHeal = Math.max(0, player.hp - prevHp);
-
-    player.regenTimer = def.regenDuration ?? 3.0;
-    player.regenTickAccum = 0;
-
-    events.push({
-      type: 'heal_tick',
-      x: player.x,
-      z: player.z,
-      value: rawHeal,
-      text: `+${rawHeal} PV`,
-      spellId: 'healing_paw',
-    });
-
-    return {
-      cast: true,
-      spellId,
-      hitEnemies: [],
-      killedEnemies: [],
-      healAmount: actualHeal > 0 ? actualHeal : rawHeal,
-      triggeredHitstop: false,
-      shakeAmount: 0.1,
-    };
-  }
-
-  // Sorts offensifs : flamepurr, lightnyan, freezepaw
   const hitEnemies: EnemyInstance[] = [];
   const killedEnemies: EnemyInstance[] = [];
   let triggeredHitstop = false;
@@ -627,13 +908,29 @@ export function updatePlayerRegen(
   return ticksFired;
 }
 
-// --- Application de dégâts au joueur (avec i-frames & mitigation DEF) ---
+// --- Application de dégâts au joueur (bouclier Égide, i-frames & mitigation DEF) ---
 
 export interface PlayerHitResult {
   hit: boolean;
   blockedByInvuln: boolean;
+  absorbedByShield?: number;
   damage: number;
   died: boolean;
+}
+
+export function updatePlayerShield(player: PlayerState, dt: number): void {
+  if (dt <= 0) return;
+  if ((player.shieldTimer ?? 0) > 0) {
+    player.shieldTimer = Math.max(0, (player.shieldTimer ?? 0) - dt);
+    if (player.shieldTimer <= 1e-6 || (player.shieldHp ?? 0) <= 0) {
+      player.shieldTimer = 0;
+      player.shieldHp = 0;
+      player.shieldMaxHp = 0;
+    }
+  } else if ((player.shieldHp ?? 0) > 0) {
+    player.shieldHp = 0;
+    player.shieldMaxHp = 0;
+  }
 }
 
 export function applyDamageToPlayer(
@@ -651,7 +948,41 @@ export function applyDamageToPlayer(
     return { hit: false, blockedByInvuln: true, damage: 0, died: false };
   }
 
-  const damage = calculateEnemyDamage(rawEnemyAtk, player.stats.def);
+  let damage = calculateEnemyDamage(rawEnemyAtk, player.stats.def);
+  let absorbedByShield = 0;
+
+  // Absorption prioritaire par le bouclier temporaire (Égide de Ronron)
+  if ((player.shieldHp ?? 0) > 0 && (player.shieldTimer ?? 0) > 0) {
+    const currentShield = player.shieldHp ?? 0;
+    absorbedByShield = Math.min(currentShield, damage);
+    const remainingShield = currentShield - absorbedByShield;
+    damage -= absorbedByShield;
+    player.shieldHp = remainingShield;
+    if (remainingShield <= 0) {
+      player.shieldTimer = 0;
+      player.shieldMaxHp = 0;
+    }
+
+    if (damage <= 0) {
+      player.invulnTimer = 0.25;
+      events.push({
+        type: 'hit_player',
+        x: player.x,
+        z: player.z,
+        value: 0,
+        text: 'BOUCLIER !',
+        spellId: 'aegis_purr',
+      });
+      return {
+        hit: true,
+        blockedByInvuln: false,
+        absorbedByShield,
+        damage: 0,
+        died: false,
+      };
+    }
+  }
+
   player.hp = Math.max(0, player.hp - damage);
   player.invulnTimer = POST_HIT_IFRAMES;
   player.hitFlashTimer = 0.14;
@@ -679,6 +1010,7 @@ export function applyDamageToPlayer(
   return {
     hit: true,
     blockedByInvuln: false,
+    absorbedByShield,
     damage,
     died,
   };

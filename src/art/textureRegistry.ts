@@ -9,19 +9,43 @@ import type {
   SpeakerPortraitId,
 } from '../game/types';
 import {
+  ENEMY_ANIM_CLIPS,
+  HD_CAPE_FABRIC_FILES,
   HD_CHARACTER_FILES,
+  HD_ENEMY_PHASE2_SHEET_FILES,
+  HD_ENEMY_SHEET_FILES,
+  HD_ENEMY_STATE_SHEET_FILES,
+  HD_EQUIPMENT_FILES,
+  HD_EQUIPMENT_SHEET_FILES,
+  HD_HERO_SHEET_FILES,
+  HD_NPC_SHEET_FILES,
   HD_PROP_FILES,
   HD_SURFACE_FILES,
+  HERO_ANIM_CLIPS,
+  NPC_ANIM_CLIPS,
+  type EnemyAnimState,
+  type HdCapeKey,
   type HdCharacterKey,
+  type HdEnemySheetKey,
+  type HdEquipmentKey,
   type HdLoadSummary,
   type HdPbrChannel,
   type HdPropKey,
   type HdSurfaceImages,
   type HdSurfaceKey,
   type HdTerrainBundle,
+  type HeroAnimState,
+  type NpcAnimState,
+  type NpcId,
+  type SpriteAnimClipDescriptor,
+  type SpriteGridSpec,
   configureDioramaTexture,
   extractHtmlImage,
+  getTextureDimensions,
   loadTextureSafe,
+  normalizeSpriteGridSpec,
+  resolveActiveSpriteGrid,
+  resolveEnemyAtlasStateGrid,
 } from './hdAssets';
 import {
   OCEAN_PALETTE,
@@ -31,15 +55,16 @@ import {
 } from './palette';
 import {
   type HeroAnimFrame,
+  type HeroModularImages,
   drawHeroCanvas,
   drawHeroFullPreviewDataUrl,
   drawHeroPortraitDataUrl,
-  getHeroArmorHdKey,
-  getHeroTextureKey,
+  getHeroBodyTextureKey,
 } from './spriteHero';
 import {
   type HdPortraitImages,
   drawBossDragonPhase2HdCanvas,
+  drawBossDragonPhase2SheetCanvas,
   drawCompanionCanvas,
   drawEnemyCanvas,
   drawNpcCanvas,
@@ -87,6 +112,27 @@ export interface WallPbrTextureSet {
   normalMap: THREE.CanvasTexture;
   roughnessMap: THREE.CanvasTexture;
 }
+
+/**
+ * Source d'animation pré-résolue et mise en cache pour exécution zéro-allocation
+ * dans la boucle de rendu (`EntityRenderer`).
+ */
+export interface ResolvedSpriteClipSource {
+  readonly clip: SpriteAnimClipDescriptor;
+  readonly mode: 'uv-grid' | 'frame-sequence';
+  readonly grid: SpriteGridSpec;
+  readonly frameCount: number;
+  readonly sheetTexture: THREE.Texture | null;
+  readonly frames: readonly THREE.Texture[];
+  readonly isDedicatedAsset: boolean;
+}
+
+const SINGLE_CELL_GRID: SpriteGridSpec = {
+  cols: 1,
+  rows: 1,
+  frameCount: 1,
+  startFrame: 0,
+};
 
 function drawWaterTileCanvas(): HTMLCanvasElement {
   const { canvas, ctx } = createCanvas(256, 256);
@@ -142,23 +188,68 @@ function drawStarParticleCanvas(): HTMLCanvasElement {
   return canvas;
 }
 
+function mapHeroStateToLegacyFrame(state: HeroAnimState): HeroAnimFrame {
+  switch (state) {
+    case 'walk':
+      return 'walk1';
+    case 'jump':
+      return 'walk2';
+    case 'attack':
+      return 'attack';
+    case 'roll':
+      return 'roll';
+    case 'hurt':
+      return 'hurt';
+    case 'death':
+      return 'death';
+    default:
+      return 'idle';
+  }
+}
+
 /**
- * Registre centralisé hybride des textures du jeu :
- * - Fallback procédural instantané dès le premier rendu (First Paint zéro attente).
- * - Chargement asynchrone de tous les PNG HD (Personnages, Props, PBR) via `loadAllHdAssets()`.
- * - Calibration rigoureuse `SRGBColorSpace` (albedos) vs `NoColorSpace` (normal/roughness),
- *   mipmaps + anisotropie maximale pour un piqué Diorama irréprochable.
+ * Registre centralisé hybride des textures et animations multi-frames 30 FPS du jeu :
+ * - Fallback procédural instantané dès le premier rendu en navigateur (First Paint zéro attente).
+ * - Chargement asynchrone de tous les PNG HD (Personnages, Planches, Équipements, Props, PBR).
+ * - Résolution mise en cache des clips multi-frames (`uv-grid` ou `frame-sequence`) avec
+ *   rétrocompatibilité 100 % transparente pour les PNG unitaires et planches 4 colonnes actuels.
  */
 export class TextureRegistry {
   private readonly cache = new Map<string, THREE.CanvasTexture>();
+  private readonly headlessCache = new Map<string, THREE.DataTexture>();
   private readonly retiredTextures: THREE.Texture[] = [];
 
   private readonly hdCharacters = new Map<HdCharacterKey, THREE.Texture>();
+  private readonly hdHeroSheets = new Map<HeroAnimState, THREE.Texture>();
+  private readonly hdHeroSheetGridOverrides = new Map<HeroAnimState, SpriteGridSpec>();
+  private readonly hdHeroFrameSequences = new Map<HeroAnimState, readonly THREE.Texture[]>();
+
+  private readonly hdEnemySheets = new Map<HdEnemySheetKey, THREE.Texture>();
+  private readonly hdEnemyPhase2Sheets = new Map<HdEnemySheetKey, THREE.Texture>();
+  private readonly hdEnemyStateSheets = new Map<string, THREE.Texture>();
+  private readonly hdEnemyGridOverrides = new Map<string, SpriteGridSpec>();
+  private readonly hdEnemyFrameSequences = new Map<string, readonly THREE.Texture[]>();
+
+  private readonly hdNpcStateSheets = new Map<string, THREE.Texture>();
+  private readonly hdNpcGridOverrides = new Map<string, SpriteGridSpec>();
+  private readonly hdNpcFrameSequences = new Map<string, readonly THREE.Texture[]>();
+
+  private readonly hdEquipment = new Map<HdEquipmentKey, THREE.Texture>();
+  private readonly hdEquipmentSheets = new Map<
+    HdEquipmentKey,
+    Partial<Record<HeroAnimState, THREE.Texture>>
+  >();
+  private readonly hdCapeFabrics = new Map<string, THREE.Texture>();
   private readonly hdProps = new Map<HdPropKey, THREE.Texture>();
   private readonly hdSurfaces = new Map<
     HdSurfaceKey,
     Partial<Record<HdPbrChannel, THREE.Texture>>
   >();
+  private heroModularCache: HeroModularImages | null = null;
+
+  private readonly heroResolvedClipCache = new Map<string, ResolvedSpriteClipSource>();
+  private readonly enemyResolvedClipCache = new Map<string, ResolvedSpriteClipSource>();
+  private readonly npcResolvedClipCache = new Map<string, ResolvedSpriteClipSource>();
 
   private readonly overworldPbrCache = new Map<string, OverworldPbrTextureSet>();
   private readonly dungeonPbrCache = new Map<string, DungeonFloorPbrTextureSet>();
@@ -168,6 +259,7 @@ export class TextureRegistry {
   private hdLoaded = false;
   private hdLoadPromise: Promise<HdLoadSummary> | null = null;
   private hdSummary: HdLoadSummary = { loaded: 0, failed: 0, total: 0 };
+  private revisionCounter = 1;
 
   public get isHdLoaded(): boolean {
     return this.hdLoaded;
@@ -175,6 +267,19 @@ export class TextureRegistry {
 
   public get hdLoadSummary(): Readonly<HdLoadSummary> {
     return this.hdSummary;
+  }
+
+  /** Compteur de révision monotone incrémenté à chaque rechargement/enregistrement d'assets. */
+  public get revision(): number {
+    return this.revisionCounter;
+  }
+
+  private bumpRevision(): void {
+    this.revisionCounter += 1;
+    this.heroModularCache = null;
+    this.heroResolvedClipCache.clear();
+    this.enemyResolvedClipCache.clear();
+    this.npcResolvedClipCache.clear();
   }
 
   public setMaxAnisotropy(value: number): void {
@@ -185,6 +290,27 @@ export class TextureRegistry {
     for (const tex of this.hdCharacters.values()) {
       tex.anisotropy = this.maxAnisotropy;
     }
+    for (const tex of this.hdHeroSheets.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.hdEnemySheets.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.hdEnemyPhase2Sheets.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.hdEnemyStateSheets.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.hdNpcStateSheets.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.hdEquipment.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.hdCapeFabrics.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
     for (const tex of this.hdProps.values()) {
       tex.anisotropy = this.maxAnisotropy;
     }
@@ -193,6 +319,138 @@ export class TextureRegistry {
         if (tex) tex.anisotropy = this.maxAnisotropy;
       }
     }
+  }
+
+  // ==========================================================================
+  // Enregistrement explicite de spritesheets multi-frames & séquences de textures
+  // ==========================================================================
+
+  public registerHeroSpriteSheet(
+    state: HeroAnimState,
+    sheet: THREE.Texture,
+    gridOverride?: SpriteGridSpec,
+  ): void {
+    this.hdHeroSheets.set(state, sheet);
+    if (gridOverride) {
+      this.hdHeroSheetGridOverrides.set(state, normalizeSpriteGridSpec(gridOverride));
+    } else {
+      this.hdHeroSheetGridOverrides.delete(state);
+    }
+    this.bumpRevision();
+  }
+
+  public registerHeroFrameSequence(
+    state: HeroAnimState,
+    frames: readonly THREE.Texture[],
+  ): void {
+    if (frames.length === 0) {
+      this.hdHeroFrameSequences.delete(state);
+    } else {
+      this.hdHeroFrameSequences.set(state, frames.slice());
+    }
+    this.bumpRevision();
+  }
+
+  public registerEnemySpriteSheet(
+    typeId: EnemyTypeId,
+    sheet: THREE.Texture,
+    options: {
+      state?: EnemyAnimState;
+      phase?: 1 | 2;
+      grid?: SpriteGridSpec;
+    } = {},
+  ): void {
+    const phase = typeId === 'boss_dragon_claw' ? (options.phase ?? 1) : 1;
+    if (options.state) {
+      const stateKey = `${typeId}|${options.state}|p${phase}`;
+      this.hdEnemyStateSheets.set(stateKey, sheet);
+      if (options.grid) {
+        this.hdEnemyGridOverrides.set(stateKey, normalizeSpriteGridSpec(options.grid));
+      } else {
+        this.hdEnemyGridOverrides.delete(stateKey);
+      }
+    } else {
+      if (phase === 2) {
+        this.hdEnemyPhase2Sheets.set(typeId, sheet);
+      } else {
+        this.hdEnemySheets.set(typeId, sheet);
+      }
+      const atlasKey = `${typeId}|*|p${phase}`;
+      if (options.grid) {
+        this.hdEnemyGridOverrides.set(atlasKey, normalizeSpriteGridSpec(options.grid));
+      } else {
+        this.hdEnemyGridOverrides.delete(atlasKey);
+      }
+    }
+    this.bumpRevision();
+  }
+
+  public registerEnemyFrameSequence(
+    typeId: EnemyTypeId,
+    state: EnemyAnimState,
+    frames: readonly THREE.Texture[],
+    phase: 1 | 2 = 1,
+  ): void {
+    const effPhase = typeId === 'boss_dragon_claw' ? phase : 1;
+    const key = `${typeId}|${state}|p${effPhase}`;
+    if (frames.length === 0) {
+      this.hdEnemyFrameSequences.delete(key);
+    } else {
+      this.hdEnemyFrameSequences.set(key, frames.slice());
+    }
+    this.bumpRevision();
+  }
+
+  public registerNpcSpriteSheet(
+    npcId: NpcId,
+    sheet: THREE.Texture,
+    options: { state?: NpcAnimState; grid?: SpriteGridSpec } = {},
+  ): void {
+    if (options.state) {
+      const key = `${npcId}|${options.state}`;
+      this.hdNpcStateSheets.set(key, sheet);
+      if (options.grid) {
+        this.hdNpcGridOverrides.set(key, normalizeSpriteGridSpec(options.grid));
+      } else {
+        this.hdNpcGridOverrides.delete(key);
+      }
+    } else {
+      this.hdCharacters.set(npcId, sheet);
+      const key = `${npcId}|*`;
+      if (options.grid) {
+        this.hdNpcGridOverrides.set(key, normalizeSpriteGridSpec(options.grid));
+      } else {
+        this.hdNpcGridOverrides.delete(key);
+      }
+    }
+    this.bumpRevision();
+  }
+
+  public registerNpcFrameSequence(
+    npcId: NpcId,
+    state: NpcAnimState,
+    frames: readonly THREE.Texture[],
+  ): void {
+    const key = `${npcId}|${state}`;
+    if (frames.length === 0) {
+      this.hdNpcFrameSequences.delete(key);
+    } else {
+      this.hdNpcFrameSequences.set(key, frames.slice());
+    }
+    this.bumpRevision();
+  }
+
+  public registerCapeFabricTexture(
+    capeId: string,
+    texture: THREE.Texture | null,
+  ): void {
+    if (!capeId) return;
+    if (texture) {
+      this.hdCapeFabrics.set(capeId, texture);
+    } else {
+      this.hdCapeFabrics.delete(capeId);
+    }
+    this.bumpRevision();
   }
 
   /**
@@ -222,6 +480,173 @@ export class TextureRegistry {
         }).then((tex) => {
           if (tex) {
             this.hdCharacters.set(key, tex);
+            return true;
+          }
+          return false;
+        }),
+      );
+    }
+
+    for (const [state, path] of Object.entries(HD_HERO_SHEET_FILES) as Array<
+      [HeroAnimState, string | undefined]
+    >) {
+      if (!path) continue;
+      tasks.push(
+        loadTextureSafe(loader, path, {
+          isDataMap: false,
+          repeat: false,
+          anisotropy: this.maxAnisotropy,
+        }).then((tex) => {
+          if (tex) {
+            this.hdHeroSheets.set(state, tex);
+            return true;
+          }
+          return false;
+        }),
+      );
+    }
+
+    for (const [key, path] of Object.entries(HD_ENEMY_SHEET_FILES) as Array<
+      [HdEnemySheetKey, string]
+    >) {
+      tasks.push(
+        loadTextureSafe(loader, path, {
+          isDataMap: false,
+          repeat: false,
+          anisotropy: this.maxAnisotropy,
+        }).then((tex) => {
+          if (tex) {
+            this.hdEnemySheets.set(key, tex);
+            return true;
+          }
+          return false;
+        }),
+      );
+    }
+
+    for (const [key, path] of Object.entries(HD_ENEMY_PHASE2_SHEET_FILES) as Array<
+      [HdEnemySheetKey, string | undefined]
+    >) {
+      if (!path) continue;
+      tasks.push(
+        loadTextureSafe(loader, path, {
+          isDataMap: false,
+          repeat: false,
+          anisotropy: this.maxAnisotropy,
+        }).then((tex) => {
+          if (tex) {
+            this.hdEnemyPhase2Sheets.set(key, tex);
+            return true;
+          }
+          return false;
+        }),
+      );
+    }
+
+    for (const [typeId, stateMap] of Object.entries(HD_ENEMY_STATE_SHEET_FILES) as Array<
+      [HdEnemySheetKey, Partial<Record<EnemyAnimState, string>> | undefined]
+    >) {
+      if (!stateMap) continue;
+      for (const [state, path] of Object.entries(stateMap) as Array<
+        [EnemyAnimState, string | undefined]
+      >) {
+        if (!path) continue;
+        tasks.push(
+          loadTextureSafe(loader, path, {
+            isDataMap: false,
+            repeat: false,
+            anisotropy: this.maxAnisotropy,
+          }).then((tex) => {
+            if (tex) {
+              this.hdEnemyStateSheets.set(`${typeId}|${state}|p1`, tex);
+              return true;
+            }
+            return false;
+          }),
+        );
+      }
+    }
+
+    for (const [npcId, stateMap] of Object.entries(HD_NPC_SHEET_FILES) as Array<
+      [NpcId, Partial<Record<NpcAnimState, string>> | undefined]
+    >) {
+      if (!stateMap) continue;
+      for (const [state, path] of Object.entries(stateMap) as Array<
+        [NpcAnimState, string | undefined]
+      >) {
+        if (!path) continue;
+        tasks.push(
+          loadTextureSafe(loader, path, {
+            isDataMap: false,
+            repeat: false,
+            anisotropy: this.maxAnisotropy,
+          }).then((tex) => {
+            if (tex) {
+              this.hdNpcStateSheets.set(`${npcId}|${state}`, tex);
+              return true;
+            }
+            return false;
+          }),
+        );
+      }
+    }
+
+    for (const [key, path] of Object.entries(HD_EQUIPMENT_FILES) as Array<
+      [HdEquipmentKey, string]
+    >) {
+      tasks.push(
+        loadTextureSafe(loader, path, {
+          isDataMap: false,
+          repeat: false,
+          anisotropy: this.maxAnisotropy,
+        }).then((tex) => {
+          if (tex) {
+            this.hdEquipment.set(key, tex);
+            return true;
+          }
+          return false;
+        }),
+      );
+    }
+
+    for (const [equipKey, stateMap] of Object.entries(HD_EQUIPMENT_SHEET_FILES) as Array<
+      [HdEquipmentKey, Partial<Record<HeroAnimState, string>> | undefined]
+    >) {
+      if (!stateMap) continue;
+      const bucket: Partial<Record<HeroAnimState, THREE.Texture>> = {};
+      this.hdEquipmentSheets.set(equipKey, bucket);
+      for (const [state, path] of Object.entries(stateMap) as Array<
+        [HeroAnimState, string | undefined]
+      >) {
+        if (!path) continue;
+        tasks.push(
+          loadTextureSafe(loader, path, {
+            isDataMap: false,
+            repeat: false,
+            anisotropy: this.maxAnisotropy,
+          }).then((tex) => {
+            if (tex) {
+              bucket[state] = tex;
+              return true;
+            }
+            return false;
+          }),
+        );
+      }
+    }
+
+    for (const [capeKey, path] of Object.entries(HD_CAPE_FABRIC_FILES) as Array<
+      [HdCapeKey, string | undefined]
+    >) {
+      if (!path) continue;
+      tasks.push(
+        loadTextureSafe(loader, path, {
+          isDataMap: false,
+          repeat: false,
+          anisotropy: this.maxAnisotropy,
+        }).then((tex) => {
+          if (tex) {
+            this.hdCapeFabrics.set(capeKey, tex);
             return true;
           }
           return false;
@@ -279,6 +704,7 @@ export class TextureRegistry {
     const total = results.length;
     this.hdSummary = { loaded, failed: total - loaded, total };
     this.hdLoaded = true;
+    this.bumpRevision();
 
     // Retire proprement les anciens caches composites procéduraux afin que les
     // appels suivants retournent immédiatement les composites HD PBR !
@@ -290,12 +716,13 @@ export class TextureRegistry {
     const prefixesToRefresh = [
       'hero_',
       'enemy_',
+      'npc_',
+      'prop_',
       'entrance_',
       'chest_',
       'torch_',
       'pillar_',
       'crystal_',
-      'prop_snow_rock',
     ];
     for (const [key, tex] of this.cache.entries()) {
       if (prefixesToRefresh.some((p) => key.startsWith(p))) {
@@ -348,6 +775,24 @@ export class TextureRegistry {
     return tex;
   }
 
+  private getOrCreateHeadlessDataTexture(
+    key: string,
+    repeat = false,
+  ): THREE.DataTexture {
+    const existing = this.headlessCache.get(key);
+    if (existing) return existing;
+    const data = new Uint8Array([255, 255, 255, 255]);
+    const tex = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+    tex.name = key;
+    configureDioramaTexture(tex, {
+      isDataMap: false,
+      repeat,
+      anisotropy: this.maxAnisotropy,
+    });
+    this.headlessCache.set(key, tex);
+    return tex;
+  }
+
   private getOrCreate(
     key: string,
     factory: () => HTMLCanvasElement,
@@ -355,6 +800,10 @@ export class TextureRegistry {
   ): THREE.CanvasTexture {
     const existing = this.cache.get(key);
     if (existing) return existing;
+
+    if (typeof document === 'undefined') {
+      return this.getOrCreateHeadlessDataTexture(key, repeat) as unknown as THREE.CanvasTexture;
+    }
 
     const tex = this.createCanvasTexture(factory(), { repeat });
     this.cache.set(key, tex);
@@ -391,18 +840,412 @@ export class TextureRegistry {
   }
 
   // ==========================================================================
-  // Personnages & Créatures
+  // Personnages, Couches Modulaires & Résolution Multi-Frames 30 FPS
   // ==========================================================================
+
+  private getHeroModularImages(): HeroModularImages | undefined {
+    if (this.heroModularCache) return this.heroModularCache;
+    const idle = this.getHdCharacterImage('hero_base_idle');
+    if (!idle) return undefined;
+
+    const equipment: Partial<Record<HdEquipmentKey, HTMLImageElement>> = {};
+    for (const [key, tex] of this.hdEquipment.entries()) {
+      const img = extractHtmlImage(tex);
+      if (img) equipment[key] = img;
+    }
+
+    const stateSheets: Partial<Record<HeroAnimState, HTMLImageElement>> = {};
+    for (const [state, tex] of this.hdHeroSheets.entries()) {
+      const img = extractHtmlImage(tex);
+      if (img) stateSheets[state] = img;
+    }
+
+    const equipmentSheets: Partial<
+      Record<HdEquipmentKey, Partial<Record<HeroAnimState, HTMLImageElement>>>
+    > = {};
+    for (const [equipKey, stateBucket] of this.hdEquipmentSheets.entries()) {
+      const imgBucket: Partial<Record<HeroAnimState, HTMLImageElement>> = {};
+      for (const [st, tex] of Object.entries(stateBucket) as Array<
+        [HeroAnimState, THREE.Texture | undefined]
+      >) {
+        const img = extractHtmlImage(tex);
+        if (img) imgBucket[st] = img;
+      }
+      equipmentSheets[equipKey] = imgBucket;
+    }
+
+    this.heroModularCache = {
+      basePoses: {
+        idle,
+        walk1: this.getHdCharacterImage('hero_base_walk1') ?? idle,
+        walk2: this.getHdCharacterImage('hero_base_walk2') ?? idle,
+        attack: this.getHdCharacterImage('hero_base_attack') ?? idle,
+        roll: this.getHdCharacterImage('hero_base_roll') ?? idle,
+      },
+      stateSheets,
+      portraitBase: this.getHdCharacterImage('hero_portrait'),
+      equipment,
+      equipmentSheets,
+    };
+    return this.heroModularCache;
+  }
 
   public getHeroTexture(
     equipped: Record<EquipSlot, string>,
     frame: HeroAnimFrame,
+    subFrameIndex = 0,
+    animStateOverride?: HeroAnimState,
   ): THREE.CanvasTexture {
-    const armorHdKey = getHeroArmorHdKey(equipped.armor);
-    const hdArmorImg = this.getHdCharacterImage(armorHdKey);
-    const tag = hdArmorImg ? 'hd' : 'proc';
-    const key = `hero_${tag}_${getHeroTextureKey(equipped, frame)}`;
-    return this.getOrCreate(key, () => drawHeroCanvas(equipped, frame, hdArmorImg, false));
+    const modular = this.getHeroModularImages();
+    const tag = modular ? 'hd' : 'proc';
+    const key = `hero_${tag}_${getHeroBodyTextureKey(equipped, frame, subFrameIndex)}`;
+    return this.getOrCreate(key, () =>
+      drawHeroCanvas(equipped, frame, modular, false, subFrameIndex, animStateOverride),
+    );
+  }
+
+  /**
+   * Résout et met en cache le clip multi-frames 30 FPS du héros pour l'équipement courant
+   * (hors `cape` : changer la cape ne modifie jamais la clé ni le cache du corps 3D !).
+   */
+  public resolveHeroClip(
+    equipped: Record<EquipSlot, string>,
+    state: HeroAnimState,
+  ): ResolvedSpriteClipSource {
+    const clip = HERO_ANIM_CLIPS[state];
+    const bodyEquipSig = getHeroBodyTextureKey(equipped, 'idle', 0);
+    const cacheKey = `${this.hdLoaded ? 'hd' : 'proc'}|r${this.revisionCounter}|${bodyEquipSig}|${state}`;
+    const cached = this.heroResolvedClipCache.get(cacheKey);
+    if (cached) return cached;
+
+    // 1. Séquence de frames préchargées explicite
+    const directSeq = this.hdHeroFrameSequences.get(state);
+    if (directSeq && directSeq.length > 0) {
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'frame-sequence',
+        grid: { cols: directSeq.length, rows: 1, frameCount: directSeq.length, startFrame: 0 },
+        frameCount: directSeq.length,
+        sheetTexture: null,
+        frames: directSeq,
+        isDedicatedAsset: true,
+      };
+      this.heroResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    // 2. Planche multi-frames enregistrée directement (ex: DataTexture ou sheet pré-assemblée)
+    const directSheet = this.hdHeroSheets.get(state);
+    if (directSheet) {
+      const dims = getTextureDimensions(directSheet);
+      const override = this.hdHeroSheetGridOverrides.get(state);
+      const grid = resolveActiveSpriteGrid(
+        clip,
+        dims?.width ?? 0,
+        dims?.height ?? 0,
+        override,
+      );
+      const sheetHtmlImg = extractHtmlImage(directSheet);
+      if (!sheetHtmlImg) {
+        const resolved: ResolvedSpriteClipSource = {
+          clip,
+          mode: 'uv-grid',
+          grid,
+          frameCount: grid.frameCount,
+          sheetTexture: directSheet,
+          frames: [],
+          isDedicatedAsset: true,
+        };
+        this.heroResolvedClipCache.set(cacheKey, resolved);
+        return resolved;
+      }
+
+      const poseFrame = mapHeroStateToLegacyFrame(state);
+      const frames: THREE.Texture[] = [];
+      for (let i = 0; i < grid.frameCount; i++) {
+        frames.push(this.getHeroTexture(equipped, poseFrame, i, state));
+      }
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'frame-sequence',
+        grid,
+        frameCount: frames.length,
+        sheetTexture: null,
+        frames,
+        isDedicatedAsset: true,
+      };
+      this.heroResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    // 3. Résolution avec partage d'état explicite documenté (`sharedFrom`) et rétrocompatibilité PNG actuels
+    const effectiveState: HeroAnimState =
+      clip.sharedFrom && clip.sharedFrom in HERO_ANIM_CLIPS
+        ? (clip.sharedFrom as HeroAnimState)
+        : state;
+    const isDedicatedAsset = effectiveState === state;
+
+    const modular = this.getHeroModularImages();
+    const poseFrame = mapHeroStateToLegacyFrame(effectiveState);
+    const baseImg = modular?.basePoses[poseFrame] ?? modular?.basePoses.idle;
+
+    if (baseImg) {
+      const bw = baseImg.naturalWidth || baseImg.width;
+      const bh = baseImg.naturalHeight || baseImg.height;
+      const grid = resolveActiveSpriteGrid(HERO_ANIM_CLIPS[effectiveState], bw, bh);
+      if (grid.frameCount > 1) {
+        const frames: THREE.Texture[] = [];
+        for (let i = 0; i < grid.frameCount; i++) {
+          frames.push(this.getHeroTexture(equipped, poseFrame, i, effectiveState));
+        }
+        const resolved: ResolvedSpriteClipSource = {
+          clip,
+          mode: 'frame-sequence',
+          grid,
+          frameCount: frames.length,
+          sheetTexture: null,
+          frames,
+          isDedicatedAsset,
+        };
+        this.heroResolvedClipCache.set(cacheKey, resolved);
+        return resolved;
+      }
+    }
+
+    // Séquence legacy 2 poses pour la marche (`hero_base_walk1` + `hero_base_walk2`)
+    if (effectiveState === 'walk') {
+      const walkFrames: readonly THREE.Texture[] =
+        state === 'jump'
+          ? [this.getHeroTexture(equipped, 'walk2', 0, 'jump')]
+          : [
+              this.getHeroTexture(equipped, 'walk1', 0, 'walk'),
+              this.getHeroTexture(equipped, 'walk2', 0, 'walk'),
+            ];
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'frame-sequence',
+        grid: {
+          cols: walkFrames.length,
+          rows: 1,
+          frameCount: walkFrames.length,
+          startFrame: 0,
+        },
+        frameCount: walkFrames.length,
+        sheetTexture: null,
+        frames: walkFrames,
+        isDedicatedAsset,
+      };
+      this.heroResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    const singleTex = this.getHeroTexture(equipped, poseFrame, 0, effectiveState);
+    const resolved: ResolvedSpriteClipSource = {
+      clip,
+      mode: 'frame-sequence',
+      grid: SINGLE_CELL_GRID,
+      frameCount: 1,
+      sheetTexture: null,
+      frames: [singleTex],
+      isDedicatedAsset,
+    };
+    this.heroResolvedClipCache.set(cacheKey, resolved);
+    return resolved;
+  }
+
+  /** Texture d'équipement de cape (icône/aperçu 2D inventaire). */
+  public getCapeTexture(capeId: string): THREE.Texture | null {
+    if (!capeId) return null;
+    return this.hdEquipment.get(capeId as HdEquipmentKey) ?? null;
+  }
+
+  /** Texture plane de tissu de cape dédiée au maillage Verlet 3D (si fournie séparément). */
+  public getCapeFabricTexture(capeId: string): THREE.Texture | null {
+    if (!capeId) return null;
+    return this.hdCapeFabrics.get(capeId) ?? null;
+  }
+
+  private getOrBuildEnemyPhase2SheetTexture(
+    typeId: EnemyTypeId,
+    baseSheetTex: THREE.Texture,
+    grid: SpriteGridSpec,
+  ): THREE.Texture {
+    const dedicatedP2 = this.hdEnemyPhase2Sheets.get(typeId);
+    if (dedicatedP2) return dedicatedP2;
+
+    if (typeId !== 'boss_dragon_claw') return baseSheetTex;
+
+    const sheetImg = extractHtmlImage(baseSheetTex);
+    if (!sheetImg) return baseSheetTex;
+
+    const key = `enemy_sheet_p2_atlas_${typeId}_r${this.revisionCounter}_${grid.cols}x${grid.rows}`;
+    return this.getOrCreate(key, () => drawBossDragonPhase2SheetCanvas(sheetImg, grid));
+  }
+
+  /**
+   * Résout et met en cache le clip 30 FPS d'un ennemi ou boss (Phase 1 & Phase 2).
+   * Supporte les séquences préchargées, les planches dédiées par état, les atlas multi-lignes
+   * et les planches legacy 4 colonnes `1024×256`.
+   */
+  public resolveEnemyClip(
+    typeId: EnemyTypeId,
+    state: EnemyAnimState,
+    phase: 1 | 2 = 1,
+  ): ResolvedSpriteClipSource {
+    const effPhase: 1 | 2 = typeId === 'boss_dragon_claw' ? phase : 1;
+    const cacheKey = `${typeId}|${state}|p${effPhase}|r${this.revisionCounter}`;
+    const cached = this.enemyResolvedClipCache.get(cacheKey);
+    if (cached) return cached;
+
+    const clip = ENEMY_ANIM_CLIPS[typeId][state];
+
+    // 1. Séquence de textures préchargées
+    const seq =
+      this.hdEnemyFrameSequences.get(`${typeId}|${state}|p${effPhase}`) ??
+      (effPhase === 2 ? this.hdEnemyFrameSequences.get(`${typeId}|${state}|p1`) : undefined);
+    if (seq && seq.length > 0) {
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'frame-sequence',
+        grid: { cols: seq.length, rows: 1, frameCount: seq.length, startFrame: 0 },
+        frameCount: seq.length,
+        sheetTexture: null,
+        frames: seq,
+        isDedicatedAsset: true,
+      };
+      this.enemyResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    // 2. Planche multi-frames dédiée à cet état précis
+    const stateKeyP = `${typeId}|${state}|p${effPhase}`;
+    const stateKeyP1 = `${typeId}|${state}|p1`;
+    const stateSheet =
+      this.hdEnemyStateSheets.get(stateKeyP) ?? this.hdEnemyStateSheets.get(stateKeyP1);
+    if (stateSheet) {
+      const dims = getTextureDimensions(stateSheet);
+      const override =
+        this.hdEnemyGridOverrides.get(stateKeyP) ?? this.hdEnemyGridOverrides.get(stateKeyP1);
+      const grid = resolveActiveSpriteGrid(
+        clip,
+        dims?.width ?? 0,
+        dims?.height ?? 0,
+        override,
+      );
+      const finalSheet =
+        effPhase === 2 && !this.hdEnemyStateSheets.get(stateKeyP)
+          ? this.getOrBuildEnemyPhase2SheetTexture(typeId, stateSheet, grid)
+          : stateSheet;
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'uv-grid',
+        grid,
+        frameCount: grid.frameCount,
+        sheetTexture: finalSheet,
+        frames: [],
+        isDedicatedAsset: true,
+      };
+      this.enemyResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    // 3. Spritesheet partagée (`*_sheet.png` : legacy 1024×256 4×1 ou atlas multi-lignes)
+    const baseSheet =
+      (effPhase === 2 ? this.hdEnemyPhase2Sheets.get(typeId) : undefined) ??
+      this.hdEnemySheets.get(typeId);
+    if (baseSheet) {
+      const dims = getTextureDimensions(baseSheet);
+      const atlasOverride =
+        this.hdEnemyGridOverrides.get(`${typeId}|*|p${effPhase}`) ??
+        this.hdEnemyGridOverrides.get(`${typeId}|*|p1`);
+      const grid = resolveEnemyAtlasStateGrid(
+        typeId,
+        state,
+        dims?.width ?? 0,
+        dims?.height ?? 0,
+        atlasOverride,
+      );
+      const hasDedicatedRow =
+        !clip.sharedFrom ||
+        (grid.rows >= 6 && state === 'death') ||
+        (grid.rows >= 5 && state === 'hurt') ||
+        Boolean(atlasOverride);
+      const finalSheet =
+        effPhase === 2 && !this.hdEnemyPhase2Sheets.get(typeId)
+          ? this.getOrBuildEnemyPhase2SheetTexture(typeId, baseSheet, grid)
+          : baseSheet;
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'uv-grid',
+        grid,
+        frameCount: grid.frameCount,
+        sheetTexture: finalSheet,
+        frames: [],
+        isDedicatedAsset: hasDedicatedRow,
+      };
+      this.enemyResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    // 4. Fallback unitaire (PNG statique ou Canvas2D procédural)
+    const fallbackTex = this.getEnemyTexture(typeId, effPhase);
+    const resolved: ResolvedSpriteClipSource = {
+      clip,
+      mode: 'frame-sequence',
+      grid: SINGLE_CELL_GRID,
+      frameCount: 1,
+      sheetTexture: null,
+      frames: [fallbackTex],
+      isDedicatedAsset: !clip.sharedFrom,
+    };
+    this.enemyResolvedClipCache.set(cacheKey, resolved);
+    return resolved;
+  }
+
+  public getEnemyFrameTexture(
+    typeId: EnemyTypeId,
+    frameIndex = 0,
+    phase: 1 | 2 = 1,
+  ): THREE.Texture {
+    const effectivePhase = typeId === 'boss_dragon_claw' ? phase : 1;
+    const sheetTex = this.hdEnemySheets.get(typeId);
+    const sheetImg = extractHtmlImage(sheetTex);
+    if (sheetImg) {
+      const imgW = sheetImg.naturalWidth || sheetImg.width;
+      const imgH = sheetImg.naturalHeight || sheetImg.height;
+      const grid = resolveActiveSpriteGrid(
+        ENEMY_ANIM_CLIPS[typeId].idle,
+        imgW,
+        imgH,
+        imgW === imgH * 4 ? { cols: 4, rows: 1, frameCount: 4 } : undefined,
+      );
+      const totalCells = Math.max(1, grid.cols * grid.rows);
+      const safeIdx = Math.max(0, Math.min(totalCells - 1, Math.floor(frameIndex)));
+      const key = `enemy_sheet_${typeId}_f${safeIdx}_p${effectivePhase}`;
+      return this.getOrCreate(key, () => {
+        const col = safeIdx % grid.cols;
+        const row = Math.floor(safeIdx / grid.cols);
+        const fw = Math.max(1, Math.floor(imgW / grid.cols));
+        const fh = Math.max(1, Math.floor(imgH / grid.rows));
+        const { canvas, ctx } = createCanvas(256, 256);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(sheetImg, col * fw, row * fh, fw, fh, 0, 0, 256, 256);
+        if (typeId === 'boss_dragon_claw' && effectivePhase === 2) {
+          ctx.save();
+          ctx.globalCompositeOperation = 'source-atop';
+          const heat = ctx.createRadialGradient(128, 110, 12, 128, 120, 118);
+          heat.addColorStop(0, 'rgba(255, 190, 72, 0.34)');
+          heat.addColorStop(0.55, 'rgba(255, 72, 28, 0.18)');
+          heat.addColorStop(1, 'rgba(180, 15, 25, 0)');
+          ctx.fillStyle = heat;
+          ctx.fillRect(0, 0, 256, 256);
+          ctx.restore();
+        }
+        return canvas;
+      });
+    }
+    return this.getEnemyTexture(typeId, effectivePhase);
   }
 
   public getEnemyTexture(
@@ -427,6 +1270,110 @@ export class TextureRegistry {
     return this.getOrCreate(key, () => drawEnemyCanvas(typeId, effectivePhase));
   }
 
+  /**
+   * Résout et met en cache le clip 30 FPS d'un PNJ ou du compagnon `miaou_sprit`.
+   */
+  public resolveNpcClip(
+    npcId: NpcId,
+    state: NpcAnimState,
+  ): ResolvedSpriteClipSource {
+    const cacheKey = `${npcId}|${state}|r${this.revisionCounter}`;
+    const cached = this.npcResolvedClipCache.get(cacheKey);
+    if (cached) return cached;
+
+    const clip = NPC_ANIM_CLIPS[npcId][state];
+    const seqKey = `${npcId}|${state}`;
+    const seq = this.hdNpcFrameSequences.get(seqKey);
+    if (seq && seq.length > 0) {
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'frame-sequence',
+        grid: { cols: seq.length, rows: 1, frameCount: seq.length, startFrame: 0 },
+        frameCount: seq.length,
+        sheetTexture: null,
+        frames: seq,
+        isDedicatedAsset: true,
+      };
+      this.npcResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    const stateSheet = this.hdNpcStateSheets.get(seqKey);
+    if (stateSheet) {
+      const dims = getTextureDimensions(stateSheet);
+      const override = this.hdNpcGridOverrides.get(seqKey);
+      const grid = resolveActiveSpriteGrid(
+        clip,
+        dims?.width ?? 0,
+        dims?.height ?? 0,
+        override,
+      );
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'uv-grid',
+        grid,
+        frameCount: grid.frameCount,
+        sheetTexture: stateSheet,
+        frames: [],
+        isDedicatedAsset: true,
+      };
+      this.npcResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    const charTex = this.hdCharacters.get(npcId);
+    if (charTex) {
+      const dims = getTextureDimensions(charTex);
+      const override = this.hdNpcGridOverrides.get(`${npcId}|*`);
+      const grid = resolveActiveSpriteGrid(
+        NPC_ANIM_CLIPS[npcId].idle,
+        dims?.width ?? 0,
+        dims?.height ?? 0,
+        override,
+      );
+      if (grid.frameCount > 1 || override) {
+        const resolved: ResolvedSpriteClipSource = {
+          clip,
+          mode: 'uv-grid',
+          grid,
+          frameCount: grid.frameCount,
+          sheetTexture: charTex,
+          frames: [],
+          isDedicatedAsset: !clip.sharedFrom,
+        };
+        this.npcResolvedClipCache.set(cacheKey, resolved);
+        return resolved;
+      }
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'frame-sequence',
+        grid: SINGLE_CELL_GRID,
+        frameCount: 1,
+        sheetTexture: null,
+        frames: [charTex],
+        isDedicatedAsset: !clip.sharedFrom,
+      };
+      this.npcResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    const fallback =
+      npcId === 'miaou_sprit'
+        ? this.getCompanionTexture()
+        : this.getNpcTexture(npcId);
+    const resolved: ResolvedSpriteClipSource = {
+      clip,
+      mode: 'frame-sequence',
+      grid: SINGLE_CELL_GRID,
+      frameCount: 1,
+      sheetTexture: null,
+      frames: [fallback],
+      isDedicatedAsset: !clip.sharedFrom,
+    };
+    this.npcResolvedClipCache.set(cacheKey, resolved);
+    return resolved;
+  }
+
   public getCompanionTexture(): THREE.Texture {
     const hd = this.hdCharacters.get('miaou_sprit');
     if (hd) return hd;
@@ -434,8 +1381,12 @@ export class TextureRegistry {
   }
 
   public getNpcTexture(npcId: string): THREE.Texture {
-    if (npcId === 'mayor_moustache') {
-      const hd = this.hdCharacters.get('mayor_moustache');
+    if (
+      npcId === 'mayor_moustache' ||
+      npcId === 'kit_chat' ||
+      npcId === 'innkeeper'
+    ) {
+      const hd = this.hdCharacters.get(npcId);
       if (hd) return hd;
     }
     return this.getOrCreate(`npc_${npcId}`, () => drawNpcCanvas(npcId));
@@ -446,28 +1397,30 @@ export class TextureRegistry {
   // ==========================================================================
 
   public getPropTexture(kind: PropKind): THREE.Texture {
-    if (kind === 'oak_tree') {
-      const hd = this.hdProps.get('tree_oak');
+    const hdPropByKind: Partial<Record<PropKind, HdPropKey>> = {
+      oak_tree: 'tree_oak',
+      twisted_tree: 'tree_dark',
+      snow_pine: 'tree_pine_snow',
+      rock: 'prop_rock',
+      snow_rock: 'prop_rock_snow',
+      flower_patch: 'prop_flower_patch',
+      mushroom: 'prop_mushroom',
+      house_cat: 'house_village',
+      signpost: 'prop_signpost',
+      fence: 'prop_fence',
+    };
+    const mapped = hdPropByKind[kind];
+    if (mapped) {
+      const hd = this.hdProps.get(mapped);
       if (hd) return hd;
-    } else if (kind === 'twisted_tree') {
-      const hd = this.hdProps.get('tree_dark');
-      if (hd) return hd;
-    } else if (kind === 'snow_pine') {
-      const hd = this.hdProps.get('tree_pine_snow');
-      if (hd) return hd;
-    } else if (kind === 'rock') {
-      const hd = this.hdProps.get('prop_rock');
-      if (hd) return hd;
-    } else if (kind === 'snow_rock') {
+    }
+    if (kind === 'snow_rock') {
       const rockImg = this.getHdPropImage('prop_rock');
       if (rockImg) {
         return this.getOrCreate('prop_snow_rock_hd', () =>
           drawSnowRockHdCanvas(rockImg),
         );
       }
-    } else if (kind === 'house_cat') {
-      const hd = this.hdProps.get('house_village');
-      if (hd) return hd;
     }
 
     return this.getOrCreate(`prop_${kind}`, () => drawPropCanvas(kind));
@@ -670,14 +1623,11 @@ export class TextureRegistry {
   }
 
   public getHeroPortraitUrl(equipped: Record<EquipSlot, string>): string {
-    const hdArmorImg = this.getHdCharacterImage(getHeroArmorHdKey(equipped.armor));
-    const hdPortraitImg = this.getHdCharacterImage('hero_portrait');
-    return drawHeroPortraitDataUrl(equipped, hdArmorImg, hdPortraitImg);
+    return drawHeroPortraitDataUrl(equipped, this.getHeroModularImages());
   }
 
   public getHeroFullPreviewUrl(equipped: Record<EquipSlot, string>): string {
-    const hdArmorImg = this.getHdCharacterImage(getHeroArmorHdKey(equipped.armor));
-    return drawHeroFullPreviewDataUrl(equipped, hdArmorImg);
+    return drawHeroFullPreviewDataUrl(equipped, this.getHeroModularImages());
   }
 
   public getSpeakerPortraitUrl(
@@ -687,12 +1637,11 @@ export class TextureRegistry {
     const hdPortraits: HdPortraitImages = {
       miaou_sprit: this.getHdCharacterImage('miaou_sprit'),
       mayor_moustache: this.getHdCharacterImage('mayor_moustache'),
+      kit_chat: this.getHdCharacterImage('kit_chat'),
+      innkeeper: this.getHdCharacterImage('innkeeper'),
       boss_rat_king: this.getHdCharacterImage('boss_rat_king'),
       boss_dragon_claw: this.getHdCharacterImage('boss_dragon_claw'),
-      hero_armor: equipped
-        ? this.getHdCharacterImage(getHeroArmorHdKey(equipped.armor))
-        : undefined,
-      hero_portrait: this.getHdCharacterImage('hero_portrait'),
+      heroModular: this.getHeroModularImages(),
     };
     return drawSpeakerPortraitDataUrl(portraitId, equipped, hdPortraits);
   }
@@ -708,7 +1657,15 @@ export class TextureRegistry {
     }
     return (
       this.cache.size +
+      this.headlessCache.size +
       this.hdCharacters.size +
+      this.hdHeroSheets.size +
+      this.hdEnemySheets.size +
+      this.hdEnemyPhase2Sheets.size +
+      this.hdEnemyStateSheets.size +
+      this.hdNpcStateSheets.size +
+      this.hdEquipment.size +
+      this.hdCapeFabrics.size +
       this.hdProps.size +
       surfaceCount +
       this.overworldPbrCache.size * 3 +
@@ -723,10 +1680,58 @@ export class TextureRegistry {
       tex.dispose();
     }
     this.cache.clear();
+    for (const tex of this.headlessCache.values()) {
+      tex.dispose();
+    }
+    this.headlessCache.clear();
     for (const tex of this.hdCharacters.values()) {
       tex.dispose();
     }
     this.hdCharacters.clear();
+    for (const tex of this.hdHeroSheets.values()) {
+      tex.dispose();
+    }
+    this.hdHeroSheets.clear();
+    this.hdHeroSheetGridOverrides.clear();
+    this.hdHeroFrameSequences.clear();
+    for (const tex of this.hdEnemySheets.values()) {
+      tex.dispose();
+    }
+    this.hdEnemySheets.clear();
+    for (const tex of this.hdEnemyPhase2Sheets.values()) {
+      tex.dispose();
+    }
+    this.hdEnemyPhase2Sheets.clear();
+    for (const tex of this.hdEnemyStateSheets.values()) {
+      tex.dispose();
+    }
+    this.hdEnemyStateSheets.clear();
+    this.hdEnemyGridOverrides.clear();
+    this.hdEnemyFrameSequences.clear();
+    for (const tex of this.hdNpcStateSheets.values()) {
+      tex.dispose();
+    }
+    this.hdNpcStateSheets.clear();
+    this.hdNpcGridOverrides.clear();
+    this.hdNpcFrameSequences.clear();
+    for (const tex of this.hdEquipment.values()) {
+      tex.dispose();
+    }
+    this.hdEquipment.clear();
+    for (const bucket of this.hdEquipmentSheets.values()) {
+      for (const tex of Object.values(bucket)) {
+        tex?.dispose();
+      }
+    }
+    this.hdEquipmentSheets.clear();
+    for (const tex of this.hdCapeFabrics.values()) {
+      tex.dispose();
+    }
+    this.hdCapeFabrics.clear();
+    this.heroModularCache = null;
+    this.heroResolvedClipCache.clear();
+    this.enemyResolvedClipCache.clear();
+    this.npcResolvedClipCache.clear();
     for (const tex of this.hdProps.values()) {
       tex.dispose();
     }
