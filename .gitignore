@@ -3,3 +3,9 @@ dist/
 .vite/
 asset-library/_zips/
 *.log
+/artifacts/
+/release-assets/
+/installer/setup/bin/
+/installer/setup/obj/
+/installer/runtime/bin/
+/installer/runtime/obj/

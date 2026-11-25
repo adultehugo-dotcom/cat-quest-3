@@ -1,0 +1,84 @@
+name: Windows installer
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.x
+
+      - run: npm ci
+      - run: npm test -- --run
+      - run: npm run build
+
+      - name: Build local game server
+        shell: pwsh
+        run: dotnet publish 'installer\runtime\Host.csproj' --configuration Release --output "$env:RUNNER_TEMP\game-host"
+
+      - name: Build installer
+        shell: pwsh
+        run: dotnet publish 'installer\setup\Setup.csproj' --configuration Release --output "$env:RUNNER_TEMP\setup"
+
+      - name: Package Windows installer
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
+          $stage = Join-Path $env:RUNNER_TEMP 'cat-quest-release'
+          New-Item -ItemType Directory -Force -Path $release | Out-Null
+          $site = Join-Path $stage 'site'
+          New-Item -ItemType Directory -Force -Path $site | Out-Null
+          Copy-Item -Path 'dist\*' -Destination $site -Recurse -Force
+
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'game-host\GameHost.exe') $stage
+
+          $zip = Join-Path $release 'cat-quest-3-windows-x64.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "$zip.sha256" -Value "$hash  cat-quest-3-windows-x64.zip" -Encoding ascii
+
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'setup\CatQuestSetup.exe') (Join-Path $release 'Cat-Quest-3-Setup.exe')
+
+      - name: Upload release files
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*
