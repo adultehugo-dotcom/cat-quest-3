@@ -403,3 +403,35 @@ Conformément au protocole strict (exécution uniquement après sauvegarde de l'
 | Suite complète de tests unitaires & intégration | `npm test -- --run` | **PASS** — **`15/15` fichiers, `116/116` tests passés** (dont `12/12` dans `tests/animationRuntime.test.ts` et `13/13` dans `tests/capeLightingEquipment.test.ts`) |
 | Build production Vite | `npm run build` | **PASS** — build Vite généré sans erreur |
 | Campagne E2E GPU Playwright (`work/e2e-runtime-30fps-verify`) | `node tests/e2e/visual-audit.mjs --scenario cape_lighting,maritime,village,ghost_cave,dragon_lair --viewport 1280x720,375x667 --preview --verify --gpu --out work/e2e-runtime-30fps-verify` | Exécutée et inspectée visuellement sur captures PNG (`1280×720` & `375×667`) : sol, voilier et eau intacts, cape Verlet animée et équipement indépendant, ennemis/boss lisibles, `0` erreur 404, `0` erreur console/WebGL/GLSL |
+
+---
+
+## 17. Reprise Assets IA, Audit Statique Vérifié & Intégration Hub Miaou-bourg — 25 novembre 2026
+
+- **Branche de travail** : `assets/ai-overhaul-resume`, créée depuis `origin/main` (`2131eb2cb00878d65dfd5ab3963f76fdbc7be1b1`).
+- **Livrables documentaires ajoutés / mis à jour** : `GRAPHIFY_ASSET_AUDIT.md`, `ASSET_PRODUCTION_MATRIX.md`, `ASSET_INTEGRATION_MANIFEST.md` et la présente section.
+
+### 17.1 Assets générés par IA, inspectés, intégrés et vérifiés (`6` PNG remplacés)
+Six assets statiques 1-frame prioritaires de Miaou-bourg et des coffres interactifs ont été générés via l'outil IA `generate_image` (direction artistique fantasy féline colorée 2D/2.5D, chroma `#FF00FF`), détourés et normalisés en `512×512` RGBA transparent via `scripts/process_characters.mjs` (`0 %` frange magenta, `0` pixel coupé en bordure), inspectés sur planches QA, puis vérifiés en jeu :
+- `public/assets/props/house_village.png` (`512×512` RGBA)
+- `public/assets/props/building_inn.png` (`512×512` RGBA)
+- `public/assets/props/building_forge.png` (`512×512` RGBA)
+- `public/assets/props/prop_quest_board.png` (`512×512` RGBA)
+- `public/assets/props/chest_closed.png` (`512×512` RGBA)
+- `public/assets/props/chest_open.png` (`512×512` RGBA)
+
+### 17.2 Ce qui reste à produire & blocages d'environnement constatés
+- **Assets restants** : les autres props statiques (12), les 27 équipements modulaires (hors `dagger_fang` exclu), les 4 textures tissu cape, les 2 PNJ actifs (`miaou_sprit`, `mayor_moustache`), les spritesheets multi-frames 30 FPS (héros, 5 ennemis standards, 2 boss + Phase 2 `boss_dragon_claw`) ainsi que les icônes UI/VFX restent tracés `à produire` dans `ASSET_PRODUCTION_MATRIX.md` (aucune duplication de frames ni substitut procédural).
+- **Blocages d'environnement (conteneur cloud Linux isolé)** :
+  1. Le checkout local Windows (`C:\Users\hugos\.gemini\antigravity\scratch\cat-quest-proto`) est inaccessible depuis cet environnement ; la branche repart du `main` distant le plus récent (`2131eb2`).
+  2. Le binaire `graphify` n'est pas installé dans ce conteneur ; l'audit repose sur un recoupement statique exhaustif de `src/` et `public/assets/`.
+  3. Aucune authentification GitHub (`gh` / credentials Git) n'est disponible dans ce conteneur : les changements sont prêts et vérifiés localement sur la branche `assets/ai-overhaul-resume`, mais le `git push` et l'ouverture de la PR GitHub nécessitent une connexion GitHub effectuée par l'utilisateur.
+
+### 17.3 Vérifications réellement exécutées & résultats
+| Contrôle | Commande / Méthode | Résultat |
+|---|---|---|
+| Non-modification des zones exclues | `git status` (`public/assets/textures/**`, `shipRenderer.ts`, `shipShaders.ts`, `waterShader.ts`, `public/assets/audio/**`, `src/audio/**`) | **PASS** — `0` modification sur le sol, le bateau, l'eau, l'audio et les assets exclus/orphelins |
+| TypeScript strict | `npx tsc --noEmit` | **PASS** — `0` erreur |
+| Suite Vitest | `npm test -- --run` | **PASS** — **`16/16` fichiers, `124/124` tests passés** |
+| Build production Vite | `npm run build` | **PASS** — build généré sans erreur |
+| Vérification visuelle Playwright (`1280×720` & `375×667`) | `playwright-cli` sur `http://localhost:3000` (écran titre, Miaou-bourg, inventaire 8 emplacements + cape Verlet, déplacement, vue mobile) | **PASS** — `0` erreur console/page/WebGL, `0` requête >= 400 (`0` 404), les 4 bâtiments/panneau Miaou-bourg rendus sans frange ni socle d'herbe collé |
