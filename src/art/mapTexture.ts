@@ -1,4 +1,4 @@
-import type { DungeonDefinition, MapLabelDef, Vec2 } from '../game/types';
+import type { BiomeId, DungeonDefinition, MapLabelDef, Vec2 } from '../game/types';
 import {
   OVERWORLD_DATA,
   OVERWORLD_HALF_SIZE,
@@ -7,6 +7,11 @@ import {
   getBiomeAt,
   getIslandRadiusAtAngle,
 } from '../data/worldData';
+import {
+  ALL_NEW_ISLANDS,
+  NEW_ISLANDS,
+  getNewIslandRadiusAtAngle,
+} from '../data/worldIslands';
 import type { HdSurfaceImages, HdTerrainBundle } from './hdAssets';
 import {
   BIOME_PALETTE,
@@ -22,6 +27,15 @@ import {
 
 const OVERWORLD_CANVAS_SIZE = 2048;
 const BIOME_MASK_SIZE = 512;
+
+export const ARCHIPELAGO_MAP_BOUNDS = {
+  minX: -135,
+  maxX: 135,
+  minZ: -140,
+  maxZ: 80,
+  spanX: 270,
+  spanZ: 220,
+} as const;
 
 export interface OverworldPbrCanvases {
   albedo: HTMLCanvasElement;
@@ -44,8 +58,11 @@ export interface WallPbrCanvases {
 
 let cachedOverworldPbr: OverworldPbrCanvases | null = null;
 let cachedOverworldHdSig = '';
+let cachedArchipelagoCanvas: HTMLCanvasElement | null = null;
+let cachedArchipelagoHdSig = '';
 let cachedMiniMapDataUrl: string | null = null;
 let cachedMiniMapHdSig = '';
+const cachedDungeonMinimapCanvases = new Map<string, HTMLCanvasElement>();
 
 function worldToPx(v: number, halfSize: number, canvasSize: number): number {
   return ((v + halfSize) / (halfSize * 2)) * canvasSize;
@@ -879,9 +896,371 @@ export function generateOverworldMapCanvas(
   return generateOverworldPbrCanvases(hdTerrain).albedo;
 }
 
+const OUTER_ISLAND_PALETTE: Record<
+  BiomeId,
+  { fill: string; highlight: string; shadow: string; accent: string }
+> = {
+  plains: {
+    fill: '#78b94d',
+    highlight: '#9dd66c',
+    shadow: '#538a33',
+    accent: '#e7d28b',
+  },
+  village: {
+    fill: '#c9b489',
+    highlight: '#e6d6b0',
+    shadow: '#947e56',
+    accent: '#f0c451',
+  },
+  forest: {
+    fill: '#3c7a49',
+    highlight: '#599d62',
+    shadow: '#245232',
+    accent: '#7a599c',
+  },
+  frost: {
+    fill: '#d6eaf5',
+    highlight: '#f2faff',
+    shadow: '#94b3c8',
+    accent: '#758fa3',
+  },
+  tropical: {
+    fill: '#66b858',
+    highlight: '#95d96c',
+    shadow: '#3e873c',
+    accent: '#f0cf7d',
+  },
+  mountain: {
+    fill: '#9aa4ad',
+    highlight: '#d7e2ea',
+    shadow: '#636d78',
+    accent: '#eef6fc',
+  },
+  mystic: {
+    fill: '#5c528c',
+    highlight: '#8274b8',
+    shadow: '#3b3261',
+    accent: '#b894f5',
+  },
+  wild: {
+    fill: '#3d8247',
+    highlight: '#5ea85b',
+    shadow: '#265930',
+    accent: '#87c454',
+  },
+};
+
+function traceArchipelagoMainIsland(
+  ctx: CanvasRenderingContext2D,
+  radiusOffset: number,
+  mapW: number,
+  mapH: number,
+  segments = 160,
+): void {
+  const b = ARCHIPELAGO_MAP_BOUNDS;
+  ctx.beginPath();
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    const r = Math.max(4, getIslandRadiusAtAngle(a) + radiusOffset);
+    const wx = Math.cos(a) * r;
+    const wz = Math.sin(a) * r;
+    const px = ((wx - b.minX) / b.spanX) * mapW;
+    const py = ((wz - b.minZ) / b.spanZ) * mapH;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function traceArchipelagoNewIsland(
+  ctx: CanvasRenderingContext2D,
+  islandId: (typeof ALL_NEW_ISLANDS)[number],
+  radiusOffset: number,
+  mapW: number,
+  mapH: number,
+  segments = 96,
+): void {
+  const def = NEW_ISLANDS[islandId];
+  const b = ARCHIPELAGO_MAP_BOUNDS;
+  ctx.beginPath();
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    const r = Math.max(3, getNewIslandRadiusAtAngle(islandId, a) + radiusOffset);
+    const wx = def.centerX + Math.cos(a) * r;
+    const wz = def.centerZ + Math.sin(a) * r;
+    const px = ((wx - b.minX) / b.spanX) * mapW;
+    const py = ((wz - b.minZ) / b.spanZ) * mapH;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
 /**
- * Retourne un DataURL PNG 512×512 complet (océan + écume + île PBR + tous les noms)
- * pour la modale Carte du Monde.
+ * Génère (et met en cache) la carte cartographique complète de l'Archipel de Félingard
+ * en 1080×880 (ratio exact 270:220 correspondant à ARCHIPELAGO_MAP_BOUNDS).
+ * Partagée par la grande Carte du Monde (alignement 1:1 avec worldToMapPercent) et la Minimap HUD.
+ */
+export function getArchipelagoMapCanvas(
+  hdTerrain?: HdTerrainBundle,
+): HTMLCanvasElement {
+  const sig = getTerrainBundleSig(hdTerrain);
+  if (cachedArchipelagoCanvas && cachedArchipelagoHdSig === sig) {
+    return cachedArchipelagoCanvas;
+  }
+
+  const mapW = 1080;
+  const mapH = 880;
+  const b = ARCHIPELAGO_MAP_BOUNDS;
+  const toX = (wx: number): number => ((wx - b.minX) / b.spanX) * mapW;
+  const toY = (wz: number): number => ((wz - b.minZ) / b.spanZ) * mapH;
+  const { canvas, ctx } = createCanvas(mapW, mapH);
+  const rand = createSeededRandom(7331);
+
+  // 1. Fond océan cartographique lumineux à profondeur nuancée
+  const oceanGrad = ctx.createRadialGradient(
+    toX(0),
+    toY(-12),
+    mapW * 0.14,
+    toX(0),
+    toY(-12),
+    mapW * 0.72,
+  );
+  oceanGrad.addColorStop(0, '#3196be');
+  oceanGrad.addColorStop(0.55, '#216e96');
+  oceanGrad.addColorStop(1, '#144466');
+  ctx.fillStyle = oceanGrad;
+  ctx.fillRect(0, 0, mapW, mapH);
+
+  // 2. Quadrillage nautique discret & lignes de rhumbs depuis la Mer des Ronrons
+  ctx.save();
+  ctx.strokeStyle = 'rgba(225, 245, 255, 0.09)';
+  ctx.lineWidth = 1;
+  for (let gx = -120; gx <= 120; gx += 30) {
+    const px = toX(gx);
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, mapH);
+    ctx.stroke();
+  }
+  for (let gz = -120; gz <= 60; gz += 30) {
+    const py = toY(gz);
+    ctx.beginPath();
+    ctx.moveTo(0, py);
+    ctx.lineTo(mapW, py);
+    ctx.stroke();
+  }
+
+  const rhumbX = toX(-58);
+  const rhumbY = toY(-28);
+  ctx.strokeStyle = 'rgba(245, 232, 198, 0.12)';
+  ctx.lineWidth = 1.1;
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(rhumbX, rhumbY);
+    ctx.lineTo(rhumbX + Math.cos(a) * mapW, rhumbY + Math.sin(a) * mapW);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 3. Courants marins & petites vagues cartographiques
+  ctx.save();
+  ctx.strokeStyle = 'rgba(214, 248, 255, 0.16)';
+  ctx.lineWidth = 1.6;
+  ctx.lineCap = 'round';
+  for (let i = 0; i < 64; i++) {
+    const wx = b.minX + 12 + rand() * (b.spanX - 24);
+    const wz = b.minZ + 12 + rand() * (b.spanZ - 24);
+    const px = toX(wx);
+    const py = toY(wz);
+    ctx.beginPath();
+    ctx.moveTo(px - 11, py);
+    ctx.quadraticCurveTo(px - 5, py - 3.5, px, py);
+    ctx.quadraticCurveTo(px + 5, py + 3.5, px + 11, py);
+    ctx.stroke();
+  }
+
+  // Routes maritimes en pointillés reliant Félingard aux 5 îles de l'archipel
+  ctx.strokeStyle = 'rgba(255, 238, 188, 0.28)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 8]);
+  for (const islandId of ALL_NEW_ISLANDS) {
+    const def = NEW_ISLANDS[islandId];
+    const angle = Math.atan2(def.centerZ, def.centerX);
+    const startR = getIslandRadiusAtAngle(angle) + 5;
+    const endDist = Math.hypot(def.centerX, def.centerZ) - def.radius - 4;
+    if (endDist <= startR + 4) continue;
+    const sx = toX(Math.cos(angle) * startR);
+    const sy = toY(Math.sin(angle) * startR);
+    const ex = toX(Math.cos(angle) * endDist);
+    const ey = toY(Math.sin(angle) * endDist);
+    const midX = (sx + ex) * 0.5 - Math.sin(angle) * 18;
+    const midY = (sy + ey) * 0.5 + Math.cos(angle) * 18;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.quadraticCurveTo(midX, midY, ex, ey);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // 4. Île principale de Félingard (projetée exactement sur [-60..60, -60..60])
+  traceArchipelagoMainIsland(ctx, 5.2, mapW, mapH);
+  ctx.fillStyle = 'rgba(104, 218, 238, 0.34)';
+  ctx.fill();
+
+  traceArchipelagoMainIsland(ctx, 2.2, mapW, mapH);
+  ctx.fillStyle = 'rgba(238, 251, 255, 0.78)';
+  ctx.fill();
+
+  ctx.save();
+  traceArchipelagoMainIsland(ctx, 0.8, mapW, mapH);
+  ctx.clip();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  const fullAlbedo = generateOverworldPbrCanvases(hdTerrain).albedo;
+  const mainLeft = toX(-OVERWORLD_HALF_SIZE);
+  const mainTop = toY(-OVERWORLD_HALF_SIZE);
+  const mainW = toX(OVERWORLD_HALF_SIZE) - mainLeft;
+  const mainH = toY(OVERWORLD_HALF_SIZE) - mainTop;
+  ctx.drawImage(fullAlbedo, mainLeft, mainTop, mainW, mainH);
+  ctx.restore();
+
+  traceArchipelagoMainIsland(ctx, 0.8, mapW, mapH);
+  ctx.strokeStyle = 'rgba(92, 60, 28, 0.65)';
+  ctx.lineWidth = 2.4;
+  ctx.stroke();
+
+  // 5. Les 5 îles extérieures de l'archipel (NEW_ISLANDS) à leurs vraies coordonnées & formes
+  for (const islandId of ALL_NEW_ISLANDS) {
+    const def = NEW_ISLANDS[islandId];
+    const pal = OUTER_ISLAND_PALETTE[def.biome] ?? OUTER_ISLAND_PALETTE.wild;
+    const cx = toX(def.centerX);
+    const cy = toY(def.centerZ);
+    const rxPx = (def.radius / b.spanX) * mapW;
+
+    // Halo lagon + écume + bande de plage sableuse
+    traceArchipelagoNewIsland(ctx, islandId, 4.8, mapW, mapH);
+    ctx.fillStyle = 'rgba(102, 218, 236, 0.34)';
+    ctx.fill();
+
+    traceArchipelagoNewIsland(ctx, islandId, 2.0, mapW, mapH);
+    ctx.fillStyle = 'rgba(238, 251, 255, 0.78)';
+    ctx.fill();
+
+    traceArchipelagoNewIsland(ctx, islandId, 0.7, mapW, mapH);
+    ctx.fillStyle = def.biome === 'mountain' ? '#c8c3b4' : OCEAN_PALETTE.sandLight;
+    ctx.fill();
+
+    // Masse terrestre intérieure avec relief et motifs de biome
+    ctx.save();
+    traceArchipelagoNewIsland(ctx, islandId, -1.6, mapW, mapH);
+    ctx.clip();
+
+    const landGrad = ctx.createRadialGradient(
+      cx - rxPx * 0.22,
+      cy - rxPx * 0.2,
+      rxPx * 0.08,
+      cx,
+      cy,
+      rxPx * 1.15,
+    );
+    landGrad.addColorStop(0, pal.highlight);
+    landGrad.addColorStop(0.65, pal.fill);
+    landGrad.addColorStop(1, pal.shadow);
+    ctx.fillStyle = landGrad;
+    ctx.fillRect(cx - rxPx * 1.5, cy - rxPx * 1.5, rxPx * 3, rxPx * 3);
+
+    // Reliefs / bosquets / crêtes stylisés
+    for (let k = 0; k < 14; k++) {
+      const ang = (k / 14) * Math.PI * 2 + rand() * 0.4;
+      const dist = (0.18 + rand() * 0.56) * rxPx;
+      const px = cx + Math.cos(ang) * dist;
+      const py = cy + Math.sin(ang) * dist;
+      const rBlob = 5 + rand() * 9;
+      ctx.fillStyle = k % 3 === 0 ? pal.accent : pal.shadow;
+      ctx.globalAlpha = k % 3 === 0 ? 0.35 : 0.26;
+      ctx.beginPath();
+      ctx.ellipse(px, py, rBlob * 1.3, rBlob * 0.85, rand() * Math.PI, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Courbes de niveau douces (effet carte d'aventure Cat Quest)
+    ctx.strokeStyle = 'rgba(255, 248, 224, 0.25)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rxPx * 0.54, rxPx * 0.46, 0.2, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Petits repères visuels propres au biome
+    if (def.biome === 'mountain') {
+      // Pics neigeux en chevrons
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.78)';
+      ctx.lineWidth = 2.4;
+      for (const [ox, oy] of [
+        [-14, -6],
+        [6, -12],
+        [14, 6],
+      ]) {
+        ctx.beginPath();
+        ctx.moveTo(cx + ox - 9, cy + oy + 6);
+        ctx.lineTo(cx + ox, cy + oy - 7);
+        ctx.lineTo(cx + ox + 9, cy + oy + 6);
+        ctx.stroke();
+      }
+    } else if (def.biome === 'mystic') {
+      // Cercle runique ancien
+      ctx.strokeStyle = 'rgba(218, 186, 255, 0.55)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rxPx * 0.3, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (def.biome === 'tropical') {
+      // Lagon intérieur clair
+      ctx.fillStyle = 'rgba(116, 224, 232, 0.42)';
+      ctx.beginPath();
+      ctx.ellipse(cx - 10, cy + 8, 16, 10, -0.3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Trait de côte encre sépia
+    traceArchipelagoNewIsland(ctx, islandId, 0.7, mapW, mapH);
+    ctx.strokeStyle = 'rgba(92, 60, 28, 0.65)';
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+  }
+
+  // 6. Étiquette maritime "MER DES RONRONS" dans la zone océanique libre (nord-ouest / sud-ouest)
+  ctx.save();
+  ctx.translate(toX(-64), toY(-10));
+  ctx.rotate(-0.18);
+  ctx.font = 'italic bold 22px Georgia, "Palatino Linotype", serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.strokeStyle = 'rgba(12, 46, 74, 0.72)';
+  ctx.lineWidth = 5;
+  ctx.fillStyle = 'rgba(235, 250, 255, 0.86)';
+  drawSpacedText(ctx, 'MER DES RONRONS', 2.8, true);
+  ctx.restore();
+
+  // 7. Bordure cartographique intérieure chaude
+  ctx.save();
+  ctx.strokeStyle = 'rgba(242, 198, 102, 0.38)';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(8, 8, mapW - 16, mapH - 16);
+  ctx.restore();
+
+  cachedArchipelagoCanvas = canvas;
+  cachedArchipelagoHdSig = sig;
+  return canvas;
+}
+
+/**
+ * Retourne un DataURL PNG haute définition de tout l'Archipel de Félingard (1080×880)
+ * aligné 1:1 avec `worldToMapPercent` pour la grande Carte du Monde.
  */
 export function getOverworldMiniMapDataUrl(
   hdTerrain?: HdTerrainBundle,
@@ -891,61 +1270,98 @@ export function getOverworldMiniMapDataUrl(
     return cachedMiniMapDataUrl;
   }
 
-  const size = 512;
-  const { canvas, ctx } = createCanvas(size, size);
-
-  // Fond océan lagon profond pour la carte 2D
-  const oceanGrad = ctx.createRadialGradient(
-    size * 0.5,
-    size * 0.5,
-    size * 0.24,
-    size * 0.5,
-    size * 0.5,
-    size * 0.68,
-  );
-  oceanGrad.addColorStop(0, OCEAN_PALETTE.shallow);
-  oceanGrad.addColorStop(0.55, OCEAN_PALETTE.mid);
-  oceanGrad.addColorStop(1, OCEAN_PALETTE.deep);
-  ctx.fillStyle = oceanGrad;
-  ctx.fillRect(0, 0, size, size);
-
-  // Halo lagon + écume côtière
-  buildIslandPath(ctx, 4.4, size);
-  ctx.fillStyle = 'rgba(94, 210, 232, 0.36)';
-  ctx.fill();
-  buildIslandPath(ctx, 2.0, size);
-  ctx.fillStyle = 'rgba(238, 251, 255, 0.78)';
-  ctx.fill();
-
-  // Découpe de l'île PBR haute définition
-  ctx.save();
-  buildIslandPath(ctx, 0.8, size);
-  ctx.clip();
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  const fullAlbedo = generateOverworldPbrCanvases(hdTerrain).albedo;
-  ctx.drawImage(fullAlbedo, 0, 0, size, size);
-  ctx.restore();
-
-  // Contour côte doux
-  buildIslandPath(ctx, 0.8, size);
-  ctx.strokeStyle = 'rgba(128, 92, 46, 0.45)';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  // Ajoute les étiquettes maritimes (`MER DES RONRONS`) sur la carte 2D
-  ctx.save();
-  ctx.scale(size / OVERWORLD_CANVAS_SIZE, size / OVERWORLD_CANVAS_SIZE);
-  for (const label of OVERWORLD_DATA.mapLabels) {
-    if (label.style === 'sea') {
-      paintMapLabel(ctx, label, OVERWORLD_CANVAS_SIZE);
-    }
-  }
-  ctx.restore();
-
+  const canvas = getArchipelagoMapCanvas(hdTerrain);
   cachedMiniMapDataUrl = canvas.toDataURL('image/png');
   cachedMiniMapHdSig = sig;
   return cachedMiniMapDataUrl;
+}
+
+/**
+ * Génère (et met en cache) un plan architectural 2D propre d'un donjon pour la Minimap HUD.
+ */
+export function getDungeonMinimapCanvas(
+  dungeon: DungeonDefinition,
+): HTMLCanvasElement {
+  const existing = cachedDungeonMinimapCanvases.get(dungeon.id);
+  if (existing) return existing;
+
+  const w = 280;
+  const h = 350;
+  const { canvas, ctx } = createCanvas(w, h);
+  const pal = DUNGEON_PALETTE[dungeon.theme];
+
+  const toPxX = (x: number): number =>
+    ((x + dungeon.width * 0.5) / dungeon.width) * w;
+  const toPxZ = (z: number): number =>
+    ((z + dungeon.depth * 0.5) / dungeon.depth) * h;
+
+  ctx.fillStyle = dungeon.theme === 'dragon_lair' ? '#1e1017' : '#18142b';
+  ctx.fillRect(0, 0, w, h);
+
+  // Sol des salles & couloirs
+  ctx.fillStyle = pal.floorLight;
+  ctx.strokeStyle =
+    dungeon.theme === 'dragon_lair'
+      ? 'rgba(242, 186, 78, 0.55)'
+      : 'rgba(176, 152, 240, 0.52)';
+  ctx.lineWidth = 2;
+  for (const room of dungeon.rooms) {
+    const rx = toPxX(room.minX);
+    const ry = toPxZ(room.minZ);
+    const rw = toPxX(room.maxX) - rx;
+    const rh = toPxZ(room.maxZ) - ry;
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeRect(rx, ry, rw, rh);
+  }
+
+  // Tapis central
+  const carpetW = dungeon.theme === 'dragon_lair' ? 3.0 : 2.2;
+  const cx1 = toPxX(-carpetW);
+  const cx2 = toPxX(carpetW);
+  const czStart = toPxZ(dungeon.exitPortal.z - 1);
+  const czEnd = toPxZ(dungeon.bossArenaCenter.z + 3);
+  ctx.fillStyle = pal.carpetMain;
+  ctx.globalAlpha = 0.72;
+  ctx.fillRect(cx1, czEnd, cx2 - cx1, czStart - czEnd);
+  ctx.globalAlpha = 1;
+
+  // Sceau circulaire de la salle du boss
+  const bx = toPxX(dungeon.bossArenaCenter.x);
+  const bz = toPxZ(dungeon.bossArenaCenter.z);
+  const br = ((dungeon.theme === 'dragon_lair' ? 11.5 : 8.0) / dungeon.width) * w;
+  ctx.strokeStyle =
+    dungeon.theme === 'dragon_lair' ? '#ff9d3b' : '#a985ff';
+  ctx.lineWidth = 2.2;
+  ctx.beginPath();
+  ctx.arc(bx, bz, br, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Murs solides
+  ctx.fillStyle = pal.wallTop;
+  ctx.strokeStyle = '#120b0f';
+  ctx.lineWidth = 1.2;
+  for (const wall of dungeon.walls) {
+    const wx = toPxX(wall.minX);
+    const wy = toPxZ(wall.minZ);
+    const ww = toPxX(wall.maxX) - wx;
+    const wh = toPxZ(wall.maxZ) - wy;
+    ctx.fillRect(wx, wy, ww, wh);
+    ctx.strokeRect(wx, wy, ww, wh);
+  }
+
+  // Portail de sortie
+  const ex = toPxX(dungeon.exitPortal.x);
+  const ez = toPxZ(dungeon.exitPortal.z);
+  ctx.fillStyle = dungeon.theme === 'dragon_lair' ? '#ffaa44' : '#58e2ff';
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  ctx.arc(ex, ez, 5.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  cachedDungeonMinimapCanvases.set(dungeon.id, canvas);
+  return canvas;
 }
 
 // ============================================================================

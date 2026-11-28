@@ -66,6 +66,8 @@ export interface CapeWindInput {
   isOnDeck?: boolean;
   bounceY?: number;
   elevationY?: number;
+  collarSocketOffsetX?: number;
+  collarSocketOffsetY?: number;
   speed: number;
 }
 
@@ -177,19 +179,19 @@ const HERO_COS_TILT = Math.cos(HERO_TILT_RAD);
 const HERO_SIN_TILT = Math.sin(HERO_TILT_RAD);
 const HERO_TAN_TILT = Math.tan(HERO_TILT_RAD);
 
-// Hauteur du col/épaules sur le sprite 512×512 (`HERO_HEIGHT = 2.45`, y_px ≈ 318)
-const COLLAR_SPRITE_Y = 0.94;
-const COLLAR_BASE_Y = COLLAR_SPRITE_Y * HERO_COS_TILT; // ≈ 0.834 u
-const COLLAR_BASE_Z = -COLLAR_SPRITE_Y * HERO_SIN_TILT - 0.088; // ≈ -0.522 u (strictement derrière le cou)
+// Hauteur du col/épaules sur le sprite 512×512 (`HERO_HEIGHT = 3.18`, y_px ≈ 318)
+const COLLAR_SPRITE_Y = 1.22;
+const COLLAR_BASE_Y = COLLAR_SPRITE_Y * HERO_COS_TILT; // ≈ 1.082 u
+const COLLAR_BASE_Z = -COLLAR_SPRITE_Y * HERO_SIN_TILT - 0.092; // ≈ -0.655 u (strictement derrière le cou)
 const GROUND_FLOOR_MARGIN = 0.085;
 
 export class CapeClothSolver {
   public static readonly COLS = 11;
   public static readonly ROWS = 13;
   public static readonly VERT_COUNT = CapeClothSolver.COLS * CapeClothSolver.ROWS;
-  public static readonly WIDTH_TOP = 0.66;
-  public static readonly WIDTH_BOT = 1.44;
-  public static readonly LENGTH = 0.86;
+  public static readonly WIDTH_TOP = 0.84;
+  public static readonly WIDTH_BOT = 1.82;
+  public static readonly LENGTH = 0.96;
 
   public readonly posX = new Float32Array(CapeClothSolver.VERT_COUNT);
   public readonly posY = new Float32Array(CapeClothSolver.VERT_COUNT);
@@ -621,9 +623,15 @@ export class CapeClothSolver {
       this.attackWhipTimer = Math.max(0, this.attackWhipTimer - dt);
     }
 
-    // Position du col animée (suit le rebond de marche, s'abaisse légèrement en roulade)
-    const anchorOffsetX = -0.032 * facingX;
-    const anchorOffsetY = bounceY - (isRolling ? 0.16 : 0) + (isAttacking ? 0.025 : 0);
+    // Position du col animée (suit le socket dorsal + rebond de marche, s'abaisse légèrement en roulade)
+    const sockOffX = Number.isFinite(input.collarSocketOffsetX)
+      ? Math.max(-0.18, Math.min(0.18, input.collarSocketOffsetX as number))
+      : 0;
+    const sockOffY = Number.isFinite(input.collarSocketOffsetY)
+      ? Math.max(-0.14, Math.min(0.14, input.collarSocketOffsetY as number))
+      : 0;
+    const anchorOffsetX = -0.032 * facingX + sockOffX;
+    const anchorOffsetY = bounceY + sockOffY - (isRolling ? 0.16 : 0) + (isAttacking ? 0.025 : 0);
     const anchorOffsetZ = isRolling ? -0.08 : 0;
 
     // 3. Mise à jour des normales courantes avant aérodynamique
@@ -917,13 +925,15 @@ function applyClothTextileShader(
         '#include <common>',
         `#include <common>
         varying vec2 vCapeUv;
-        varying vec3 vCapeWorldPos;`,
+        varying vec3 vCapeWorldPos;
+        varying vec3 vCapeWorldNormal;`,
       )
       .replace(
         '#include <project_vertex>',
         `#include <project_vertex>
         vCapeUv = uv;
-        vCapeWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`,
+        vCapeWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+        vCapeWorldNormal = normalize(mat3(modelMatrix) * objectNormal);`,
       );
 
     shader.fragmentShader = shader.fragmentShader
@@ -932,6 +942,7 @@ function applyClothTextileShader(
         `#include <common>
         varying vec2 vCapeUv;
         varying vec3 vCapeWorldPos;
+        varying vec3 vCapeWorldNormal;
         uniform vec3 uCapePrimary;
         uniform vec3 uCapeSecondary;
         uniform vec3 uCapeAccent;
@@ -1043,31 +1054,41 @@ function applyClothTextileShader(
         float foldRelief = clamp(abs(normal.z) * 0.32 + max(normal.y, 0.0) * 0.18 + 0.68, 0.62, 1.12);
         outgoingLight *= foldRelief;
 
-        // Plancher de lisibilité nocturne identique à spriteLighting.ts
-        outgoingLight = max(outgoingLight, diffuseColor.rgb * 0.34);
+        // Plancher doux de lisibilité nocturne cohérent avec spriteLighting.ts
+        outgoingLight = max(outgoingLight, diffuseColor.rgb * 0.24);
 
         // Éclat stellaire strictement localisé pour les capes lumineuses
         if (uCapeStyle.z > 0.01 && gl_FrontFacing) {
           float hemGlow = smoothstep(0.28, 0.04, vCapeUv.y) * 0.65 + 0.35;
-          outgoingLight += uCapeGlow * uCapeStyle.z * hemGlow * 0.42;
+          outgoingLight += uCapeGlow * uCapeStyle.z * hemGlow * 0.28;
         }
 
-        // Sources dynamiques locales partagées (lampadaires, torches, lanterne du héros)
+        // Sources dynamiques réelles (lampadaires, torches, forge, portails, lanterne, armes, compagnon)
+        vec3 capeN = normalize(vCapeWorldNormal);
+        if (!gl_FrontFacing) capeN = -capeN;
+        vec3 capeV = normalize(cameraPosition - vCapeWorldPos);
+        vec3 capeLightAdd = vec3(0.0);
         for (int i = 0; i < ${SPRITE_LIGHT_COUNT}; i++) {
           vec4 positionRange = uSpriteLightPositionRange[i];
           vec4 colorIntensity = uSpriteLightColorIntensity[i];
-          if (colorIntensity.w <= 0.0) continue;
+          if (colorIntensity.w <= 0.0 || positionRange.w <= 0.001) continue;
           vec3 toLight = positionRange.xyz - vCapeWorldPos;
-          float distanceToLight = length(toLight);
-          float normalizedDistance = distanceToLight / max(positionRange.w, 0.001);
-          float attenuation = pow(max(1.0 - normalizedDistance, 0.0), 2.0);
-          float localStrength = min(colorIntensity.w * 0.11, 0.72) * attenuation;
-          outgoingLight += diffuseColor.rgb * colorIntensity.rgb * localStrength;
+          float dist = length(toLight);
+          float rangeRatio = clamp(dist / positionRange.w, 0.0, 1.0);
+          float windowAtt = pow(max(1.0 - rangeRatio * rangeRatio, 0.0), 2.0);
+          float physAtt = windowAtt / (1.0 + 0.28 * dist * dist);
+          vec3 L = toLight / max(dist, 0.0001);
+          float ndl = clamp(dot(capeN, L) * 0.56 + 0.44, 0.0, 1.0);
+          vec3 H = normalize(L + capeV);
+          float sheenSpec = pow(max(dot(capeN, H), 0.0), 14.0) * uCapeStyle.y * 0.14;
+          vec3 radiance = colorIntensity.rgb * min(colorIntensity.w * 0.042, 0.44) * physAtt;
+          capeLightAdd += (diffuseColor.rgb * ndl + mix(diffuseColor.rgb, uCapeAccent, 0.3) * sheenSpec) * radiance;
         }
+        outgoingLight += capeLightAdd / (vec3(1.0) + capeLightAdd * 0.65);
         #include <opaque_fragment>`,
       );
   };
-  material.customProgramCacheKey = () => 'fel-ingard-soft-cloth-cape-v2';
+  material.customProgramCacheKey = () => 'fel-ingard-soft-cloth-cape-pbr-v5';
   material.needsUpdate = true;
 }
 

@@ -37,10 +37,26 @@ export {
 export {
   TELEGRAPH_VERTEX_SHADER,
   TELEGRAPH_FRAGMENT_SHADER,
+  resolveTelegraphPalette,
   createTelegraphMaterial,
   updateTelegraphMaterial,
+  type TelegraphPalette,
   type TelegraphShaderOptions,
 } from './telegraphShader';
+
+export {
+  createSlashTrailShaderMaterial,
+  createProjectileTrailMaterial,
+  createFlipbookVfxMaterial,
+  type SlashTrailShaderOptions,
+  type ProjectileTrailOptions,
+} from './slashShader';
+
+export {
+  HeatDistortionPostShader,
+  createHeatDistortionMaterial,
+  createHeatDistortionPass,
+} from './heatDistortionShader';
 
 export {
   FLAME_RING_VERTEX_SHADER,
@@ -68,3 +84,16 @@ export {
   createHealRingMaterial,
   createQuestArrowMaterial,
 } from './spellShaders';
+
+export {
+  SHARED_PROP_WIND_UNIFORMS,
+  applyWindSwayShader,
+  applyEmissivePulseShader,
+  createPortalRunicSealMaterial,
+  createPortalExitVortexMaterial,
+  createWeaponSlashArcMaterial,
+  type WindSwayUniforms,
+  type EmissivePulseUniforms,
+  type WindSwayShaderOptions,
+} from './propShaders';
+

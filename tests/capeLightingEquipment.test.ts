@@ -150,23 +150,29 @@ describe('Priorité 1 — Éclairage extérieur & cohérence des emplacements', 
 });
 
 describe('Priorité 2 — Équipement modulaire indépendant & zéro arme secondaire', () => {
-  it('supprime totalement secondary_weapon et dagger_fang des données actives et de l’état initial', () => {
+  it('supprime totalement secondary_weapon, boots, gloves, trinket et dagger_fang des données actives et de l’état initial', () => {
     expect(ALL_EQUIP_SLOTS).toEqual([
       'weapon',
       'shield',
       'helmet',
       'armor',
-      'boots',
-      'gloves',
       'cape',
-      'trinket',
     ]);
     expect((ALL_EQUIP_SLOTS as readonly string[]).includes('secondary_weapon')).toBe(false);
+    expect((ALL_EQUIP_SLOTS as readonly string[]).includes('boots')).toBe(false);
+    expect((ALL_EQUIP_SLOTS as readonly string[]).includes('gloves')).toBe(false);
+    expect((ALL_EQUIP_SLOTS as readonly string[]).includes('trinket')).toBe(false);
     expect(EQUIPMENT['dagger_fang']).toBeUndefined();
+    expect(EQUIPMENT['trinket_yarn']).toBeUndefined();
+    expect(EQUIPMENT['boots_leather']).toBeUndefined();
+    expect(EQUIPMENT['gloves_leather']).toBeUndefined();
     expect(EQUIPMENT_LIST.some((item) => item.id === 'dagger_fang')).toBe(false);
 
     const player = createInitialPlayerState();
     expect(player.inventory['dagger_fang']).toBeUndefined();
+    expect(player.inventory['boots_leather']).toBeUndefined();
+    expect(player.inventory['gloves_leather']).toBeUndefined();
+    expect(player.inventory['trinket_yarn']).toBeUndefined();
     expect(Object.prototype.hasOwnProperty.call(player.equipped, 'secondary_weapon')).toBe(false);
     expect(player.inventory['shield_wood']).toBeDefined();
     expect(player.inventory['cape_traveler']).toBeDefined();

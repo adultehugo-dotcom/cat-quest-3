@@ -71,6 +71,12 @@ export function applyQuestReward(
 ): void {
   if (reward.gold > 0) {
     player.gold += reward.gold;
+    events?.push({
+      type: 'gold_pickup',
+      x: player.x,
+      z: player.z,
+      value: reward.gold,
+    });
   }
   if (reward.xp > 0) {
     grantXp(player, reward.xp, events);

@@ -347,7 +347,7 @@ describe('Voyage et exploration des îles', () => {
       ).toBe(true);
       expect(engine.state.player.gold).toBe(goldAtLanding);
     }
-  }, 10_000);
+  });
 
   it('garde le joueur sur chaque île, bloque les arbres et permet d’ouvrir les coffres locaux', () => {
     for (const islandId of ALL_NEW_ISLANDS) {

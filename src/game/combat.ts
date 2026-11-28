@@ -4,6 +4,8 @@
 // Zéro import Three.js, zéro dépendance DOM.
 // ============================================================================
 
+import { getEnemyDefinition } from '../data/enemiesData';
+import { getWeaponCombatProfile } from '../data/equipmentData';
 import { getSpellDefinition, getSpellPower } from '../data/spellsData';
 import {
   angleBetween,
@@ -13,13 +15,25 @@ import {
   isPointInLine,
   normalize,
 } from './math';
+import {
+  applyStatusEffect,
+  getIncomingDamageMultiplier,
+  getOutgoingDamageMultiplier,
+  isEntityStunned,
+  purgeEntityStatuses,
+  reduceBurnOnDodge,
+} from './statusEffects';
 import type {
   ActiveSpellEffect,
+  AttackMetadata,
   DodgeGhost,
   EnemyInstance,
   GameEvent,
+  PlayerProjectile,
   PlayerState,
   SpellId,
+  TelegraphZone,
+  Vec2,
 } from './types';
 
 // --- Constantes de combat (Section 5 du cahier des charges) ---
@@ -40,6 +54,18 @@ export const POST_HIT_IFRAMES = 0.45;
 export const CRIT_MULTIPLIER = 1.65;
 export const FREEZEPAW_SLOW_FACTOR = 0.4;
 export const HITSTOP_MAJOR_DURATION = 0.045;
+
+export const PERFECT_DODGE_WINDOW_SEC = 0.18;
+export const PERFECT_DODGE_TIMESCALE = 0.3;
+export const PERFECT_DODGE_SLOW_DURATION = 0.22;
+export const PERFECT_DODGE_BUFF_DURATION = 3.0;
+export const PERFECT_DODGE_MP_PCT = 0.15;
+export const PERFECT_DODGE_DAMAGE_MULT = 1.35;
+
+export const STAGGER_DURATION_SEC = 2.2;
+export const STAGGER_DAMAGE_MULT = 1.4;
+
+let nextProjectileId = 1;
 
 export interface MeleeComboStepConfig {
   step: 0 | 1 | 2;
@@ -115,7 +141,62 @@ export function calculateEnemyDamage(enemyAtk: number, playerDef: number): numbe
   return Math.max(1, Math.round(enemyAtk * (100 / (100 + def * 2.2))));
 }
 
-// --- Mêlée 3 coups + Recharge Mana ---
+// --- Mêlée 3 coups + Projectiles + Stagger + Recharge Mana ---
+
+export function applyEnemyStagger(
+  enemy: EnemyInstance,
+  amount: number,
+  telegraphs?: TelegraphZone[],
+  events?: GameEvent[],
+): boolean {
+  if (
+    amount <= 0 ||
+    !enemy.maxStagger ||
+    enemy.maxStagger <= 0 ||
+    enemy.state === 'dead' ||
+    enemy.hp <= 0 ||
+    (enemy.staggeredTimer ?? 0) > 0
+  ) {
+    return false;
+  }
+
+  enemy.stagger = Math.min(enemy.maxStagger, (enemy.stagger ?? 0) + amount);
+  enemy.staggerDecayDelay = 3.0;
+
+  if (enemy.stagger >= enemy.maxStagger) {
+    enemy.stagger = 0;
+    enemy.staggeredTimer = STAGGER_DURATION_SEC;
+    enemy.state = 'staggered';
+    enemy.stateTimer = STAGGER_DURATION_SEC;
+    enemy.attackCooldown = Math.max(enemy.attackCooldown, STAGGER_DURATION_SEC + 0.3);
+    enemy.activePatternId = undefined;
+    enemy.activeLungeAngle = undefined;
+    enemy.activeLungeDist = undefined;
+
+    if (telegraphs && telegraphs.length > 0) {
+      for (let i = telegraphs.length - 1; i >= 0; i--) {
+        if (telegraphs[i].ownerId === enemy.id) {
+          telegraphs[i].resolved = true;
+          telegraphs.splice(i, 1);
+        }
+      }
+    }
+
+    events?.push({
+      type: 'stagger_break',
+      x: enemy.x,
+      z: enemy.z,
+      enemyId: enemy.id,
+      enemyTypeId: enemy.typeId,
+      value: STAGGER_DURATION_SEC,
+      text: 'BRIS DE POSTURE !',
+    });
+
+    return true;
+  }
+
+  return false;
+}
 
 export interface MeleeAttackResult {
   executed: boolean;
@@ -124,6 +205,18 @@ export interface MeleeAttackResult {
   killedEnemies: EnemyInstance[];
   totalMpRestored: number;
   triggeredHitstop: boolean;
+  hitstopSec: number;
+  shakeAmount: number;
+  attackMeta?: AttackMetadata;
+  spawnedProjectile?: PlayerProjectile;
+}
+
+export interface ProjectileUpdateResult {
+  hitEnemies: EnemyInstance[];
+  killedEnemies: EnemyInstance[];
+  totalMpRestored: number;
+  triggeredHitstop: boolean;
+  hitstopSec: number;
   shakeAmount: number;
 }
 
@@ -161,10 +254,17 @@ export function executeMeleeAttack(
     applyDash?: (dx: number, dz: number) => void;
     autoAim?: boolean;
     autoAimRadius?: number;
+    projectiles?: PlayerProjectile[];
+    telegraphs?: TelegraphZone[];
   },
 ): MeleeAttackResult {
   const rng = options?.rng ?? Math.random;
-  if (player.hp <= 0 || player.attackCooldown > 0 || player.dodgeTimer > 0) {
+  if (
+    player.hp <= 0 ||
+    player.attackCooldown > 0 ||
+    player.dodgeTimer > 0 ||
+    isEntityStunned(player)
+  ) {
     return {
       executed: false,
       comboStep: player.comboStep,
@@ -172,6 +272,7 @@ export function executeMeleeAttack(
       killedEnemies: [],
       totalMpRestored: 0,
       triggeredHitstop: false,
+      hitstopSec: 0,
       shakeAmount: 0,
     };
   }
@@ -188,12 +289,25 @@ export function executeMeleeAttack(
 
   const stepIndex = player.comboStep;
   const cfg = MELEE_COMBO_STEPS[stepIndex];
+  const weaponProfile = getWeaponCombatProfile(player.equipped.weapon);
+  const actualReach = cfg.isFinisher ? weaponProfile.reachFinisher : weaponProfile.reach;
+  const actualArc = cfg.isFinisher ? weaponProfile.arcAngleFinisher : weaponProfile.arcAngle;
+  const actualCooldown = Number(
+    (weaponProfile.attackCooldown * (cfg.cooldown / MELEE_COMBO_STEPS[0].cooldown)).toFixed(4),
+  );
+  const stepKnockback =
+    weaponProfile.knockback * (cfg.knockback / MELEE_COMBO_STEPS[0].knockback);
+  const actualDashDist = cfg.dashDist * weaponProfile.dashMult;
+  const maxSteps = Math.max(1, Math.min(3, weaponProfile.comboSteps));
+  const stepDamageMult = weaponProfile.comboMultipliers[stepIndex] ?? cfg.damageMult;
+  const effectiveCritChance = Math.min(0.85, player.stats.critChance + weaponProfile.critBonus);
 
-  player.attackCooldown = cfg.cooldown;
-  player.attackAnimTimer = Math.min(cfg.cooldown, 0.22);
+  player.attackCooldown = actualCooldown;
+  player.attackAnimTimer = Math.min(actualCooldown, weaponProfile.animDuration);
   player.comboResetTimer = COMBO_RESET_WINDOW;
-  player.comboStep = ((stepIndex + 1) % 3) as 0 | 1 | 2;
+  player.comboStep = ((stepIndex + 1) % maxSteps) as 0 | 1 | 2;
   player.lastMeleeAngle = player.aimAngle;
+  player.lastMeleeWeaponId = weaponProfile.weaponId;
 
   const dirX = Math.cos(player.aimAngle);
   const dirZ = Math.sin(player.aimAngle);
@@ -201,9 +315,9 @@ export function executeMeleeAttack(
     player.facingX = dirX >= 0 ? 1 : -1;
   }
 
-  // Léger dash avant
-  const dashX = dirX * cfg.dashDist;
-  const dashZ = dirZ * cfg.dashDist;
+  // Léger dash avant modulé selon l'arme
+  const dashX = dirX * actualDashDist;
+  const dashZ = dirZ * actualDashDist;
   if (options?.applyDash) {
     options.applyDash(dashX, dashZ);
   } else {
@@ -211,39 +325,194 @@ export function executeMeleeAttack(
     player.z += dashZ;
   }
 
+  const sweepDir = stepIndex === 1 ? -1 : 1;
+  const halfSweep =
+    weaponProfile.attackShape === 'thrust_line'
+      ? weaponProfile.weaponId === 'halberd_royal' && cfg.isFinisher
+        ? actualArc * 0.5
+        : 0.32
+      : weaponProfile.attackShape === 'projectile'
+        ? 0.35
+        : actualArc * 0.5;
+  const startAngle = player.aimAngle - halfSweep * sweepDir;
+  const endAngle = player.aimAngle + halfSweep * sweepDir;
+  const element =
+    weaponProfile.statusProc?.statusId ??
+    (weaponProfile.materialSound === 'arcane' ? 'arcane' : 'physical');
+
+  const attackMeta: AttackMetadata = {
+    weaponId: weaponProfile.weaponId,
+    weaponFamily: weaponProfile.weaponFamily,
+    materialSound: weaponProfile.materialSound,
+    attackShape: weaponProfile.attackShape,
+    comboStep: stepIndex,
+    startAngle,
+    endAngle,
+    range: actualReach,
+    windupSec: weaponProfile.windupSec,
+    activeSec: weaponProfile.activeSec,
+    element,
+    color: weaponProfile.slashColor,
+    accentColor: weaponProfile.slashAccent,
+  };
+
   events.push({
     type: 'melee_swing',
     x: player.x,
     z: player.z,
     angle: player.aimAngle,
-    radius: MELEE_RANGE,
+    radius: actualReach,
+    hitArc: actualArc,
     comboStep: stepIndex,
+    weaponId: weaponProfile.weaponId,
+    weaponFamily: weaponProfile.weaponFamily,
+    materialSound: weaponProfile.materialSound,
+    attackShape: weaponProfile.attackShape,
+    startAngle,
+    endAngle,
+    windupSec: weaponProfile.windupSec,
+    activeSec: weaponProfile.activeSec,
+    element,
+    color: weaponProfile.slashColor,
+    accentColor: weaponProfile.slashAccent,
   });
+
+  const hasPerfectDodgeBuff = (player.perfectDodgeBuffTimer ?? 0) > 0;
+  const outgoingMult =
+    getOutgoingDamageMultiplier(player) *
+    (hasPerfectDodgeBuff ? PERFECT_DODGE_DAMAGE_MULT : 1.0);
+
+  // Armes à distance (Bâtons & Arcs/Arbalètes) : génère un vrai PlayerProjectile
+  if (weaponProfile.attackShape === 'projectile') {
+    const speed = weaponProfile.projectileSpeed ?? 18;
+    const { damage, isCrit } = calculatePlayerDamage(
+      player.stats.atk *
+        stepDamageMult *
+        weaponProfile.damageMult *
+        getOutgoingDamageMultiplier(player),
+      effectiveCritChance,
+      rng,
+    );
+
+    const proj: PlayerProjectile = {
+      id: `pproj_${nextProjectileId++}`,
+      projectileId: weaponProfile.projectileId ?? 'arcane_bolt',
+      weaponId: weaponProfile.weaponId,
+      weaponFamily: weaponProfile.weaponFamily,
+      materialSound: weaponProfile.materialSound,
+      x: player.x + dirX * 0.55,
+      z: player.z + dirZ * 0.55,
+      vx: dirX * speed,
+      vz: dirZ * speed,
+      speed,
+      radius: weaponProfile.weaponFamily === 'staff' ? 0.38 : 0.28,
+      distanceTraveled: 0,
+      maxRange: actualReach,
+      damage,
+      isCrit,
+      knockback: stepKnockback,
+      staggerPower: weaponProfile.staggerPower * (cfg.isFinisher ? 1.35 : 1.0),
+      hitstopSec: weaponProfile.hitstopSec,
+      mpGain: cfg.mpGain,
+      comboStep: stepIndex,
+      statusProc: weaponProfile.statusProc,
+      canConsumePerfectDodgeBuff: hasPerfectDodgeBuff,
+      color: weaponProfile.slashColor,
+      accentColor: weaponProfile.slashAccent,
+    };
+
+    options?.projectiles?.push(proj);
+
+    return {
+      executed: true,
+      comboStep: stepIndex,
+      hitEnemies: [],
+      killedEnemies: [],
+      totalMpRestored: 0,
+      triggeredHitstop: false,
+      hitstopSec: 0,
+      shakeAmount: 0.06,
+      attackMeta,
+      spawnedProjectile: proj,
+    };
+  }
 
   const hitEnemies: EnemyInstance[] = [];
   const killedEnemies: EnemyInstance[] = [];
   let totalMpRestored = 0;
   let triggeredHitstop = false;
-  let shakeAmount = 0.08;
+  let shakeAmount = weaponProfile.animStyle === 'dragon_cleave' ? 0.14 : 0.08;
 
   for (const enemy of enemies) {
     if (enemy.state === 'dead' || enemy.hp <= 0) continue;
 
-    const inArc = isPointInCone(
-      enemy.x,
-      enemy.z,
-      player.x,
-      player.z,
-      player.aimAngle,
-      MELEE_RANGE,
-      cfg.arcAngle,
-      enemy.radius,
-    );
-    if (!inArc) continue;
+    let inShape = false;
+    if (weaponProfile.attackShape === 'thrust_line') {
+      const thrustWidth = weaponProfile.weaponId === 'halberd_royal' ? 1.85 : 1.35;
+      inShape = isPointInLine(
+        enemy.x,
+        enemy.z,
+        player.x,
+        player.z,
+        player.aimAngle,
+        actualReach,
+        thrustWidth,
+        enemy.radius,
+      );
+      if (!inShape && weaponProfile.weaponId === 'halberd_royal' && cfg.isFinisher) {
+        inShape = isPointInCone(
+          enemy.x,
+          enemy.z,
+          player.x,
+          player.z,
+          player.aimAngle,
+          actualReach,
+          actualArc,
+          enemy.radius,
+        );
+      }
+    } else if (weaponProfile.attackShape === 'cleave') {
+      inShape =
+        isPointInCone(
+          enemy.x,
+          enemy.z,
+          player.x,
+          player.z,
+          player.aimAngle,
+          actualReach,
+          actualArc,
+          enemy.radius,
+        ) ||
+        isPointInCircle(
+          enemy.x,
+          enemy.z,
+          player.x,
+          player.z,
+          PLAYER_RADIUS + 0.65,
+          enemy.radius,
+        );
+    } else {
+      inShape = isPointInCone(
+        enemy.x,
+        enemy.z,
+        player.x,
+        player.z,
+        player.aimAngle,
+        actualReach,
+        actualArc,
+        enemy.radius,
+      );
+    }
+
+    if (!inShape) continue;
+
+    const staggerMult = (enemy.staggeredTimer ?? 0) > 0 ? STAGGER_DAMAGE_MULT : 1.0;
+    const totalDmgMult =
+      outgoingMult * getIncomingDamageMultiplier(enemy) * staggerMult;
 
     const { damage, isCrit } = calculatePlayerDamage(
-      player.stats.atk * cfg.damageMult,
-      player.stats.critChance,
+      player.stats.atk * stepDamageMult * weaponProfile.damageMult * totalDmgMult,
+      effectiveCritChance,
       rng,
     );
 
@@ -251,10 +520,10 @@ export function executeMeleeAttack(
     enemy.hitFlashTimer = 0.12;
     enemy.aggroed = true;
 
-    // Knockback
+    // Knockback modulé par l'arme (combatProfile.knockback)
     const kbDir = normalize(enemy.x - player.x, enemy.z - player.z);
     const kbScale = enemy.isBoss ? 0.2 : 1.0;
-    const kbForce = cfg.knockback * kbScale;
+    const kbForce = stepKnockback * kbScale;
     enemy.knockbackVx = (kbDir.x || dirX) * kbForce;
     enemy.knockbackVz = (kbDir.z || dirZ) * kbForce;
 
@@ -272,7 +541,11 @@ export function executeMeleeAttack(
       isCrit,
       enemyId: enemy.id,
       enemyTypeId: enemy.typeId,
+      enemyMaterial: getEnemyDefinition(enemy.typeId).materialSound,
       comboStep: stepIndex,
+      weaponId: weaponProfile.weaponId,
+      weaponFamily: weaponProfile.weaponFamily,
+      materialSound: weaponProfile.materialSound,
     });
 
     if (mpDelta > 0) {
@@ -285,8 +558,29 @@ export function executeMeleeAttack(
       });
     }
 
+    if (enemy.hp > 0) {
+      if (weaponProfile.statusProc) {
+        const applied = applyStatusEffect(enemy, weaponProfile.statusProc, events, {
+          rng,
+          sourceId: weaponProfile.weaponId,
+          enemyId: enemy.id,
+          enemyTypeId: enemy.typeId,
+        });
+        if (applied && weaponProfile.statusProc.statusId === 'shock') {
+          enemy.attackCooldown += 0.18;
+        }
+      }
+      const staggerGain = weaponProfile.staggerPower * (cfg.isFinisher ? 1.35 : 1.0);
+      if (applyEnemyStagger(enemy, staggerGain, options?.telegraphs, events)) {
+        triggeredHitstop = true;
+      }
+    }
+
     hitEnemies.push(enemy);
-    shakeAmount = Math.max(shakeAmount, isCrit || cfg.isFinisher ? 0.24 : 0.15);
+    shakeAmount = Math.max(
+      shakeAmount,
+      isCrit || cfg.isFinisher || weaponProfile.animStyle === 'dragon_cleave' ? 0.26 : 0.15,
+    );
 
     if (isCrit || cfg.isFinisher || enemy.hp <= 0) {
       triggeredHitstop = true;
@@ -297,6 +591,10 @@ export function executeMeleeAttack(
     }
   }
 
+  if (hitEnemies.length > 0 && hasPerfectDodgeBuff) {
+    player.perfectDodgeBuffTimer = 0;
+  }
+
   return {
     executed: true,
     comboStep: stepIndex,
@@ -304,6 +602,210 @@ export function executeMeleeAttack(
     killedEnemies,
     totalMpRestored,
     triggeredHitstop,
+    hitstopSec: triggeredHitstop ? weaponProfile.hitstopSec : 0,
+    shakeAmount,
+    attackMeta,
+  };
+}
+
+/**
+ * Met à jour les projectiles lancés par les armes à distance (Bâtons, Arcs, Arbalètes).
+ */
+export function updatePlayerProjectiles(
+  projectiles: PlayerProjectile[],
+  enemies: EnemyInstance[],
+  player: PlayerState,
+  events: GameEvent[],
+  options: {
+    dt: number;
+    rng?: () => number;
+    telegraphs?: TelegraphZone[];
+    isObstacleHit?: (x: number, z: number, radius: number) => boolean;
+  },
+): ProjectileUpdateResult {
+  const hitEnemies: EnemyInstance[] = [];
+  const killedEnemies: EnemyInstance[] = [];
+  let totalMpRestored = 0;
+  let triggeredHitstop = false;
+  let hitstopSec = 0;
+  let shakeAmount = 0;
+
+  const dt = options.dt;
+  if (projectiles.length === 0 || dt <= 0) {
+    return {
+      hitEnemies,
+      killedEnemies,
+      totalMpRestored,
+      triggeredHitstop,
+      hitstopSec,
+      shakeAmount,
+    };
+  }
+
+  const rng = options.rng ?? Math.random;
+
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const p = projectiles[i];
+    const prevX = p.x;
+    const prevZ = p.z;
+    const prevDistanceTraveled = p.distanceTraveled;
+    const stepDist = p.speed * dt;
+
+    p.x += p.vx * dt;
+    p.z += p.vz * dt;
+    p.distanceTraveled += stepDist;
+
+    const dx = p.x - prevX;
+    const dz = p.z - prevZ;
+    const segLenSq = dx * dx + dz * dz;
+
+    let obstacleHitT = Infinity;
+    if (options.isObstacleHit) {
+      for (const sampleT of [0.25, 0.5, 0.75, 1.0]) {
+        if (options.isObstacleHit(prevX + dx * sampleT, prevZ + dz * sampleT, p.radius)) {
+          obstacleHitT = sampleT;
+          break;
+        }
+      }
+    }
+
+    const maxRangeT =
+      stepDist > 1e-8
+        ? Math.max(0, Math.min(1, (p.maxRange - prevDistanceTraveled) / stepDist))
+        : 1;
+    const maxValidT = Math.min(obstacleHitT, maxRangeT);
+
+    let hitEnemy: EnemyInstance | null = null;
+    let bestHitT = Infinity;
+    for (const enemy of enemies) {
+      if (enemy.state === 'dead' || enemy.hp <= 0) continue;
+      const sumR = p.radius + enemy.radius;
+      const fx = prevX - enemy.x;
+      const fz = prevZ - enemy.z;
+      const c = fx * fx + fz * fz - sumR * sumR;
+
+      let hitT: number | null = null;
+      if (c <= 0) {
+        hitT = 0;
+      } else if (segLenSq > 1e-12) {
+        const b = 2 * (fx * dx + fz * dz);
+        const disc = b * b - 4 * segLenSq * c;
+        if (disc >= 0) {
+          const tEntry = (-b - Math.sqrt(disc)) / (2 * segLenSq);
+          if (tEntry >= 0 && tEntry <= 1) {
+            hitT = tEntry;
+          }
+        }
+      }
+
+      if (hitT !== null && hitT <= maxValidT && hitT < bestHitT) {
+        bestHitT = hitT;
+        hitEnemy = enemy;
+      }
+    }
+
+    if (hitEnemy) {
+      const applyPerfectDodgeBuff =
+        p.canConsumePerfectDodgeBuff !== false && (player.perfectDodgeBuffTimer ?? 0) > 0;
+      const perfectDodgeMult = applyPerfectDodgeBuff ? PERFECT_DODGE_DAMAGE_MULT : 1.0;
+      if (applyPerfectDodgeBuff) {
+        player.perfectDodgeBuffTimer = 0;
+      }
+
+      const staggerMult = (hitEnemy.staggeredTimer ?? 0) > 0 ? STAGGER_DAMAGE_MULT : 1.0;
+      const incomingMult = getIncomingDamageMultiplier(hitEnemy);
+      const damage = Math.max(
+        1,
+        Math.round(p.damage * staggerMult * incomingMult * perfectDodgeMult),
+      );
+
+      hitEnemy.hp = Math.max(0, hitEnemy.hp - damage);
+      hitEnemy.hitFlashTimer = 0.12;
+      hitEnemy.aggroed = true;
+
+      const dir = normalize(p.vx, p.vz);
+      const kbScale = hitEnemy.isBoss ? 0.2 : 1.0;
+      hitEnemy.knockbackVx = dir.x * p.knockback * kbScale;
+      hitEnemy.knockbackVz = dir.z * p.knockback * kbScale;
+
+      const prevMp = player.mp;
+      player.mp = Math.min(player.maxMp, player.mp + p.mpGain);
+      const mpDelta = player.mp - prevMp;
+      totalMpRestored += mpDelta;
+
+      events.push({
+        type: 'hit_enemy',
+        x: hitEnemy.x,
+        z: hitEnemy.z,
+        value: damage,
+        isCrit: p.isCrit,
+        enemyId: hitEnemy.id,
+        enemyTypeId: hitEnemy.typeId,
+        enemyMaterial: getEnemyDefinition(hitEnemy.typeId).materialSound,
+        comboStep: p.comboStep,
+        weaponId: p.weaponId,
+        weaponFamily: p.weaponFamily,
+        materialSound: p.materialSound,
+      });
+
+      if (mpDelta > 0) {
+        events.push({
+          type: 'mp_gain',
+          x: player.x,
+          z: player.z,
+          value: mpDelta,
+          text: `+${mpDelta} PM`,
+        });
+      }
+
+      let brokeStagger = false;
+      if (hitEnemy.hp > 0) {
+        if (p.statusProc) {
+          const applied = applyStatusEffect(hitEnemy, p.statusProc, events, {
+            rng,
+            sourceId: p.weaponId,
+            enemyId: hitEnemy.id,
+            enemyTypeId: hitEnemy.typeId,
+          });
+          if (applied && p.statusProc.statusId === 'shock') {
+            hitEnemy.attackCooldown += 0.18;
+          }
+        }
+        brokeStagger = applyEnemyStagger(
+          hitEnemy,
+          p.staggerPower,
+          options.telegraphs,
+          events,
+        );
+      }
+
+      hitEnemies.push(hitEnemy);
+      if (hitEnemy.hp <= 0) {
+        killedEnemies.push(hitEnemy);
+      }
+
+      const isMajor = p.isCrit || p.comboStep === 2 || hitEnemy.hp <= 0 || brokeStagger;
+      if (isMajor) {
+        triggeredHitstop = true;
+        hitstopSec = Math.max(hitstopSec, p.hitstopSec);
+      }
+      shakeAmount = Math.max(shakeAmount, isMajor ? 0.2 : 0.1);
+
+      projectiles.splice(i, 1);
+      continue;
+    }
+
+    if (obstacleHitT <= 1 || p.distanceTraveled >= p.maxRange) {
+      projectiles.splice(i, 1);
+    }
+  }
+
+  return {
+    hitEnemies,
+    killedEnemies,
+    totalMpRestored,
+    triggeredHitstop,
+    hitstopSec,
     shakeAmount,
   };
 }
@@ -317,7 +819,12 @@ export function executeDodgeRoll(
   events: GameEvent[],
   dodgeGhosts?: DodgeGhost[],
 ): boolean {
-  if (player.hp <= 0 || player.dodgeCooldown > 0 || player.dodgeTimer > 0) {
+  if (
+    player.hp <= 0 ||
+    player.dodgeCooldown > 0 ||
+    player.dodgeTimer > 0 ||
+    isEntityStunned(player)
+  ) {
     return false;
   }
 
@@ -361,6 +868,9 @@ export function executeDodgeRoll(
     angle: Math.atan2(dirZ, dirX),
   });
 
+  // Contre-jeu actif : la roulade étouffe/réduit les brûlures actives
+  reduceBurnOnDodge(player, events);
+
   return true;
 }
 
@@ -378,6 +888,132 @@ export interface SpellCastResult {
   reason?: 'dead' | 'cooldown' | 'insufficient_mp';
 }
 
+export const STARFALL_DURATION = 2.15;
+export const STARFALL_WAVE_COUNT = 4;
+export const STARFALL_WAVE_INTERVAL = 0.48;
+
+export function resolveStarfallTarget(
+  player: PlayerState,
+  aimWorldPos: Vec2 | null | undefined,
+  enemies: readonly EnemyInstance[],
+  castRange: number,
+  clampTargetPoint?: (x: number, z: number) => Vec2,
+): Vec2 {
+  let targetX: number;
+  let targetZ: number;
+
+  if (
+    aimWorldPos &&
+    Number.isFinite(aimWorldPos.x) &&
+    Number.isFinite(aimWorldPos.z)
+  ) {
+    // Ciblage prioritaire à la position du curseur, borné à la portée maximale cohérente
+    const dx = aimWorldPos.x - player.x;
+    const dz = aimWorldPos.z - player.z;
+    const distToCursor = Math.hypot(dx, dz);
+    if (distToCursor > castRange && distToCursor > 1e-6) {
+      const scale = castRange / distToCursor;
+      targetX = player.x + dx * scale;
+      targetZ = player.z + dz * scale;
+    } else {
+      targetX = aimWorldPos.x;
+      targetZ = aimWorldPos.z;
+    }
+  } else {
+    // Repli propre directionnel (clavier/manette sans curseur)
+    const fallbackRange = Math.min(5.5, castRange);
+    targetX = player.x + Math.cos(player.aimAngle) * Math.min(4.2, fallbackRange);
+    targetZ = player.z + Math.sin(player.aimAngle) * Math.min(4.2, fallbackRange);
+
+    let bestDist = fallbackRange + 2.2;
+    for (const enemy of enemies) {
+      if (enemy.state === 'dead' || enemy.hp <= 0) continue;
+      const d = Math.hypot(enemy.x - player.x, enemy.z - player.z);
+      if (d < bestDist) {
+        bestDist = d;
+        const clamped = Math.min(d, fallbackRange);
+        const dir = normalize(enemy.x - player.x, enemy.z - player.z);
+        targetX = player.x + dir.x * clamped;
+        targetZ = player.z + dir.z * clamped;
+      }
+    }
+  }
+
+  if (clampTargetPoint) {
+    return clampTargetPoint(targetX, targetZ);
+  }
+  return { x: targetX, z: targetZ };
+}
+
+export function applyStarfallWaveDamage(
+  fx: ActiveSpellEffect,
+  enemies: EnemyInstance[],
+  events: GameEvent[],
+  waveScale = 0.45,
+  rng: () => number = Math.random,
+  telegraphs?: TelegraphZone[],
+): { hitEnemies: EnemyInstance[]; killedEnemies: EnemyInstance[]; triggeredHitstop: boolean } {
+  const targetX = fx.targetX ?? fx.x;
+  const targetZ = fx.targetZ ?? fx.z;
+  const basePower = fx.spellDamage ?? 30;
+  const critChance = fx.spellCritChance ?? 0.08;
+  const hitEnemies: EnemyInstance[] = [];
+  const killedEnemies: EnemyInstance[] = [];
+  let triggeredHitstop = false;
+
+  events.push({
+    type: 'starfall_impact',
+    x: targetX,
+    z: targetZ,
+    radius: fx.radius,
+    spellId: 'meteor_paw',
+    color: '#c95bff',
+  });
+
+  for (const enemy of enemies) {
+    if (enemy.state === 'dead' || enemy.hp <= 0) continue;
+    if (!isPointInCircle(enemy.x, enemy.z, targetX, targetZ, fx.radius, enemy.radius)) {
+      continue;
+    }
+    const staggerMult = (enemy.staggeredTimer ?? 0) > 0 ? STAGGER_DAMAGE_MULT : 1.0;
+    const totalMult = getIncomingDamageMultiplier(enemy) * staggerMult;
+    const { damage, isCrit } = calculatePlayerDamage(
+      basePower * waveScale * totalMult,
+      critChance,
+      rng,
+    );
+    enemy.hp = Math.max(0, enemy.hp - damage);
+    enemy.hitFlashTimer = 0.16;
+    enemy.aggroed = true;
+    const kbScale = enemy.isBoss ? 0.15 : 0.7;
+    const kbDir = normalize(enemy.x - targetX, enemy.z - targetZ);
+    enemy.knockbackVx = kbDir.x * 5.2 * kbScale;
+    enemy.knockbackVz = kbDir.z * 5.2 * kbScale;
+
+    events.push({
+      type: 'hit_enemy',
+      x: enemy.x,
+      z: enemy.z,
+      value: damage,
+      isCrit,
+      spellId: 'meteor_paw',
+      enemyId: enemy.id,
+      enemyTypeId: enemy.typeId,
+      enemyMaterial: getEnemyDefinition(enemy.typeId).materialSound,
+    });
+    if (enemy.hp > 0) {
+      if (applyEnemyStagger(enemy, 22, telegraphs, events)) {
+        triggeredHitstop = true;
+      }
+    }
+    hitEnemies.push(enemy);
+    if (isCrit || enemy.hp <= 0) triggeredHitstop = true;
+    if (enemy.hp <= 0) killedEnemies.push(enemy);
+  }
+
+  return { hitEnemies, killedEnemies, triggeredHitstop };
+}
+
 export function castSpell(
   player: PlayerState,
   spellId: SpellId,
@@ -388,11 +1024,13 @@ export function castSpell(
     dodgeGhosts?: DodgeGhost[];
     resolveDashPosition?: (x: number, z: number) => { x: number; z: number };
     clampTargetPoint?: (x: number, z: number) => { x: number; z: number };
+    aimWorldPos?: Vec2 | null;
     rng?: () => number;
+    telegraphs?: TelegraphZone[];
   },
 ): SpellCastResult {
   const rng = options?.rng ?? Math.random;
-  if (player.hp <= 0) {
+  if (player.hp <= 0 || isEntityStunned(player)) {
     return {
       cast: false,
       spellId,
@@ -438,7 +1076,7 @@ export function castSpell(
   const level = player.spellLevels[spellId] ?? 1;
   const spellPower = getSpellPower(spellId, level, player.stats.mag);
 
-  // Sort 4 : Soin-velours
+  // Sort 4 : Soin-velours (+ purge immédiate des débuffs actifs)
   if (spellId === 'healing_paw') {
     const instantPct = def.instantHealPct ?? 0.25;
     const rawHeal = Math.round(player.maxHp * instantPct + spellPower);
@@ -448,6 +1086,8 @@ export function castSpell(
 
     player.regenTimer = def.regenDuration ?? 3.0;
     player.regenTickAccum = 0;
+
+    purgeEntityStatuses(player, events);
 
     options?.activeSpellEffects?.push({
       id: `spell_fx_${nextSpellEffectId++}`,
@@ -592,6 +1232,10 @@ export function castSpell(
       color: def.color,
     });
 
+    const hasPerfectDodgeBuff = (player.perfectDodgeBuffTimer ?? 0) > 0;
+    const outgoingMult =
+      getOutgoingDamageMultiplier(player) *
+      (hasPerfectDodgeBuff ? PERFECT_DODGE_DAMAGE_MULT : 1.0);
     const hitEnemies: EnemyInstance[] = [];
     const killedEnemies: EnemyInstance[] = [];
     let triggeredHitstop = false;
@@ -617,8 +1261,10 @@ export function castSpell(
       );
       if (!inLine && !inArrival) continue;
 
+      const staggerMult = (enemy.staggeredTimer ?? 0) > 0 ? STAGGER_DAMAGE_MULT : 1.0;
+      const totalDmgMult = outgoingMult * getIncomingDamageMultiplier(enemy) * staggerMult;
       const { damage, isCrit } = calculatePlayerDamage(
-        spellPower,
+        spellPower * totalDmgMult,
         player.stats.critChance,
         rng,
       );
@@ -638,10 +1284,18 @@ export function castSpell(
         spellId,
         enemyId: enemy.id,
         enemyTypeId: enemy.typeId,
+        enemyMaterial: getEnemyDefinition(enemy.typeId).materialSound,
       });
+      if (enemy.hp > 0 && applyEnemyStagger(enemy, 20, options?.telegraphs, events)) {
+        triggeredHitstop = true;
+      }
       hitEnemies.push(enemy);
       if (isCrit || enemy.hp <= 0) triggeredHitstop = true;
       if (enemy.hp <= 0) killedEnemies.push(enemy);
+    }
+
+    if (hitEnemies.length > 0 && hasPerfectDodgeBuff) {
+      player.perfectDodgeBuffTimer = 0;
     }
 
     return {
@@ -655,29 +1309,32 @@ export function castSpell(
     };
   }
 
-  // Sort 7 : Chute d'Étoiles (Dégâts de zone massifs projetés devant le héros)
+  // Sort 7 : Chute d'Étoiles (Pluie stellaire prolongée ciblée au curseur et verrouillée au lancer)
   if (spellId === 'meteor_paw') {
-    const castRange = def.castRange ?? 5.5;
-    let targetX = player.x + Math.cos(player.aimAngle) * Math.min(4.2, castRange);
-    let targetZ = player.z + Math.sin(player.aimAngle) * Math.min(4.2, castRange);
+    const castRange = def.castRange ?? 12.0;
+    const lockedTarget = resolveStarfallTarget(
+      player,
+      options?.aimWorldPos,
+      enemies,
+      castRange,
+      options?.clampTargetPoint,
+    );
+    const targetX = lockedTarget.x;
+    const targetZ = lockedTarget.z;
+    const castAngle = angleBetween(player.x, player.z, targetX, targetZ);
 
-    // Accroche douce sur l'ennemi vivant le plus proche dans le cône avant
-    let bestDist = castRange + 2.2;
-    for (const enemy of enemies) {
-      if (enemy.state === 'dead' || enemy.hp <= 0) continue;
-      const d = Math.hypot(enemy.x - player.x, enemy.z - player.z);
-      if (d < bestDist) {
-        bestDist = d;
-        const clamped = Math.min(d, castRange);
-        const dir = normalize(enemy.x - player.x, enemy.z - player.z);
-        targetX = player.x + dir.x * clamped;
-        targetZ = player.z + dir.z * clamped;
-      }
+    const hasPerfectDodgeBuff = (player.perfectDodgeBuffTimer ?? 0) > 0;
+    const outgoingMult =
+      getOutgoingDamageMultiplier(player) *
+      (hasPerfectDodgeBuff ? PERFECT_DODGE_DAMAGE_MULT : 1.0);
+    const effectiveSpellPower = spellPower * outgoingMult;
+    if (hasPerfectDodgeBuff) {
+      player.perfectDodgeBuffTimer = 0;
     }
-    if (options?.clampTargetPoint) {
-      const clampedPt = options.clampTargetPoint(targetX, targetZ);
-      targetX = clampedPt.x;
-      targetZ = clampedPt.z;
+
+    const starSeeds: number[] = [];
+    for (let i = 0; i < 12; i += 1) {
+      starSeeds.push(rng());
     }
 
     options?.activeSpellEffects?.push({
@@ -685,16 +1342,26 @@ export function castSpell(
       spellId,
       x: targetX,
       z: targetZ,
-      angle: player.aimAngle,
+      targetX,
+      targetZ,
+      angle: castAngle,
       radius: def.radius,
       elapsed: 0,
-      duration: 0.88,
+      duration: STARFALL_DURATION,
+      waveCount: STARFALL_WAVE_COUNT,
+      wavesTriggered: 1,
+      waveInterval: STARFALL_WAVE_INTERVAL,
+      starSeeds,
+      spellDamage: effectiveSpellPower,
+      spellCritChance: player.stats.critChance,
     });
     events.push({
       type: 'spell_cast',
       x: targetX,
       z: targetZ,
-      angle: player.aimAngle,
+      targetX,
+      targetZ,
+      angle: castAngle,
       radius: def.radius,
       spellId,
       color: def.color,
@@ -704,13 +1371,16 @@ export function castSpell(
     const killedEnemies: EnemyInstance[] = [];
     let triggeredHitstop = false;
 
+    // 1re salve d'impact stellaire immédiate (vagues 2..4 déclenchées sur ~2.15 s au point verrouillé)
     for (const enemy of enemies) {
       if (enemy.state === 'dead' || enemy.hp <= 0) continue;
       if (!isPointInCircle(enemy.x, enemy.z, targetX, targetZ, def.radius, enemy.radius)) {
         continue;
       }
+      const staggerMult = (enemy.staggeredTimer ?? 0) > 0 ? STAGGER_DAMAGE_MULT : 1.0;
+      const totalDmgMult = getIncomingDamageMultiplier(enemy) * staggerMult;
       const { damage, isCrit } = calculatePlayerDamage(
-        spellPower,
+        effectiveSpellPower * totalDmgMult,
         player.stats.critChance,
         rng,
       );
@@ -731,7 +1401,11 @@ export function castSpell(
         spellId,
         enemyId: enemy.id,
         enemyTypeId: enemy.typeId,
+        enemyMaterial: getEnemyDefinition(enemy.typeId).materialSound,
       });
+      if (enemy.hp > 0 && applyEnemyStagger(enemy, 35, options?.telegraphs, events)) {
+        triggeredHitstop = true;
+      }
       hitEnemies.push(enemy);
       if (isCrit || enemy.hp <= 0) triggeredHitstop = true;
       if (enemy.hp <= 0) killedEnemies.push(enemy);
@@ -772,6 +1446,10 @@ export function castSpell(
     color: def.color,
   });
 
+  const hasPerfectDodgeBuff = (player.perfectDodgeBuffTimer ?? 0) > 0;
+  const outgoingMult =
+    getOutgoingDamageMultiplier(player) *
+    (hasPerfectDodgeBuff ? PERFECT_DODGE_DAMAGE_MULT : 1.0);
   const hitEnemies: EnemyInstance[] = [];
   const killedEnemies: EnemyInstance[] = [];
   let triggeredHitstop = false;
@@ -807,8 +1485,10 @@ export function castSpell(
 
     if (!hit) continue;
 
+    const staggerMult = (enemy.staggeredTimer ?? 0) > 0 ? STAGGER_DAMAGE_MULT : 1.0;
+    const totalDmgMult = outgoingMult * getIncomingDamageMultiplier(enemy) * staggerMult;
     const { damage, isCrit } = calculatePlayerDamage(
-      spellPower,
+      spellPower * totalDmgMult,
       player.stats.critChance,
       rng,
     );
@@ -820,6 +1500,31 @@ export function castSpell(
     if (spellId === 'freezepaw') {
       const slowDur = def.slowDuration ?? 3.5;
       enemy.slowTimer = Math.max(enemy.slowTimer, slowDur);
+      if (enemy.hp > 0) {
+        applyStatusEffect(
+          enemy,
+          { statusId: 'chill', chance: 1.0, durationSec: slowDur, potency: FREEZEPAW_SLOW_FACTOR },
+          events,
+          { rng, sourceId: 'freezepaw', enemyId: enemy.id, enemyTypeId: enemy.typeId },
+        );
+      }
+    } else if (spellId === 'flamepurr' && enemy.hp > 0) {
+      applyStatusEffect(
+        enemy,
+        { statusId: 'burn', chance: 0.35, durationSec: 3.5, potency: 5 },
+        events,
+        { rng, sourceId: 'flamepurr', enemyId: enemy.id, enemyTypeId: enemy.typeId },
+      );
+    } else if (spellId === 'lightnyan' && enemy.hp > 0) {
+      const applied = applyStatusEffect(
+        enemy,
+        { statusId: 'shock', chance: 0.3, durationSec: 2.5, potency: 1 },
+        events,
+        { rng, sourceId: 'lightnyan', enemyId: enemy.id, enemyTypeId: enemy.typeId },
+      );
+      if (applied) {
+        enemy.attackCooldown += 0.18;
+      }
     }
 
     // Recul léger
@@ -840,7 +1545,15 @@ export function castSpell(
       spellId,
       enemyId: enemy.id,
       enemyTypeId: enemy.typeId,
+      enemyMaterial: getEnemyDefinition(enemy.typeId).materialSound,
     });
+
+    if (enemy.hp > 0) {
+      const spellStagger = spellId === 'lightnyan' ? 18 : 16;
+      if (applyEnemyStagger(enemy, spellStagger, options?.telegraphs, events)) {
+        triggeredHitstop = true;
+      }
+    }
 
     hitEnemies.push(enemy);
     if (isCrit || enemy.hp <= 0) {
@@ -849,6 +1562,10 @@ export function castSpell(
     if (enemy.hp <= 0) {
       killedEnemies.push(enemy);
     }
+  }
+
+  if (hitEnemies.length > 0 && hasPerfectDodgeBuff) {
+    player.perfectDodgeBuffTimer = 0;
   }
 
   return {
@@ -948,7 +1665,10 @@ export function applyDamageToPlayer(
     return { hit: false, blockedByInvuln: true, damage: 0, died: false };
   }
 
-  let damage = calculateEnemyDamage(rawEnemyAtk, player.stats.def);
+  let damage = calculateEnemyDamage(
+    rawEnemyAtk * getIncomingDamageMultiplier(player),
+    player.stats.def,
+  );
   let absorbedByShield = 0;
 
   // Absorption prioritaire par le bouclier temporaire (Égide de Ronron)
@@ -970,6 +1690,8 @@ export function applyDamageToPlayer(
         x: player.x,
         z: player.z,
         value: 0,
+        blocked: true,
+        absorbedByShield: true,
         text: 'BOUCLIER !',
         spellId: 'aegis_purr',
       });
@@ -996,6 +1718,7 @@ export function applyDamageToPlayer(
     x: player.x,
     z: player.z,
     value: damage,
+    ...(absorbedByShield > 0 ? { absorbedByShield: true } : {}),
   });
 
   const died = player.hp <= 0;

@@ -227,6 +227,13 @@ describe('Régressions Gameplay & Intégration Maritime (Section 16.F)', () => {
     engine.step(1 / 60, atk);
 
     expect(enemy.state).toBe('dead');
+    expect(engine.state.lootDrops.length).toBeGreaterThan(0);
+
+    // Le butin physique rebondit puis est aspiré magnétiquement vers le héros
+    for (let i = 0; i < 90 && engine.state.lootDrops.length > 0; i++) {
+      engine.step(1 / 60, createEmptyInputState());
+    }
+    expect(engine.state.lootDrops).toHaveLength(0);
     expect(engine.state.player.gold).toBeGreaterThan(goldBefore);
     expect(engine.state.player.xp).toBeGreaterThan(xpBefore);
     // Le bateau n'a pas bougé d'un millimètre pendant le combat

@@ -6,6 +6,8 @@
 // - Repli procédural Web Audio propre en cas d'indisponibilité de fetch / decodeAudioData
 // ============================================================================
 
+import { AUDIO_WEATHER_TRACKS } from './audioManifest';
+
 export interface WeatherAudioState {
   inOverworld: boolean;
   stormIntensity: number; // [0..1]
@@ -15,22 +17,29 @@ export interface WeatherAudioState {
   seaAgitation: number;   // [0..1]
   seaProximity: number;   // [0..1] (1 en mer / plage, ~0.35 centre d'île)
   shipSpeedRatio: number; // [0..1]
+  /** 0 = jour clair, 1 = nuit noire (coupe les oiseaux de beau temps) */
+  nightFactor?: number;
+  /** Vrai en navigation en mer (coupe les oiseaux forestiers) */
+  isSailing?: boolean;
+  /** Vrai en combat actif (réduit légèrement le lit météo pour la lisibilité) */
+  inCombat?: boolean;
 }
 
 export interface WeatherAudioStatus {
   readonly loadedTracks: readonly string[];
   readonly fallbackTracks: readonly string[];
-  readonly activeGains: Readonly<{ ocean: number; wind: number; rain: number }>;
+  readonly activeGains: Readonly<{ ocean: number; wind: number; rain: number; birds?: number }>;
   readonly thunderCount: number;
 }
 
-export type WeatherLoopTrackId = 'ocean' | 'wind' | 'rain';
+export type WeatherLoopTrackId = 'ocean' | 'wind' | 'rain' | 'birds';
 export type WeatherTrackId = WeatherLoopTrackId | 'thunder';
 
 const WEATHER_TRACK_ORDER: readonly WeatherTrackId[] = [
   'ocean',
   'wind',
   'rain',
+  'birds',
   'thunder',
 ];
 
@@ -38,14 +47,16 @@ const WEATHER_LOOP_TRACKS: readonly WeatherLoopTrackId[] = [
   'ocean',
   'wind',
   'rain',
+  'birds',
 ];
 
 // Fichiers locaux présents dans public/assets/audio/weather/ (zéro URL externe, zéro 404)
 const WEATHER_ASSET_FILES: Readonly<Record<WeatherTrackId, string>> = {
-  ocean: 'assets/audio/weather/ocean_waves.ogg',
-  wind: 'assets/audio/weather/wind_gale.ogg',
-  rain: 'assets/audio/weather/rain_storm.ogg',
-  thunder: 'assets/audio/weather/thunder_clap.ogg',
+  ocean: AUDIO_WEATHER_TRACKS.ocean_waves.path,
+  wind: AUDIO_WEATHER_TRACKS.wind_gale.path,
+  rain: AUDIO_WEATHER_TRACKS.rain_storm.path,
+  birds: AUDIO_WEATHER_TRACKS.birds_day.path,
+  thunder: AUDIO_WEATHER_TRACKS.thunder_clap.path,
 };
 
 const LOOP_CROSSFADE_SEC = 0.35;
@@ -177,6 +188,12 @@ function createProceduralLoopBuffer(
           0.14 * Math.sin(2 * Math.PI * (3 / durationSec) * t - phaseOffset);
         const soft = pink * 0.82 + brownScaled * 0.25;
         data[i] = soft * gust * 0.68;
+      } else if (track === 'birds') {
+        // Repli discret : légers pépiements espacés doux pour beau temps uniquement
+        const chirpCycle = (t * 0.65 + phaseOffset) % 1;
+        const env = chirpCycle < 0.08 ? Math.sin((chirpCycle / 0.08) * Math.PI) : 0;
+        const chirpFreq = 2600 + 650 * Math.sin(t * 28);
+        data[i] = Math.sin(2 * Math.PI * chirpFreq * t) * env * 0.06;
       } else {
         // Pluie régulière : spectre fin + micro-texture de gouttes
         const hpWhite = (white - prev * 0.45) * 0.085;
@@ -195,30 +212,36 @@ interface LoopChannelNodes {
   source: AudioBufferSourceNode | null;
 }
 
-interface ComputedWeatherMix {
+export interface ComputedWeatherMix {
   oceanGain: number;
   windGain: number;
   rainGain: number;
+  birdsGain: number;
   oceanCutoffHz: number;
   windCutoffHz: number;
   rainCutoffHz: number;
+  birdsCutoffHz: number;
   oceanRate: number;
   windRate: number;
   rainRate: number;
+  birdsRate: number;
 }
 
-function computeWeatherMix(state: WeatherAudioState): ComputedWeatherMix {
+export function computeWeatherMix(state: WeatherAudioState): ComputedWeatherMix {
   if (!state.inOverworld) {
     return {
       oceanGain: 0,
       windGain: 0,
       rainGain: 0,
+      birdsGain: 0,
       oceanCutoffHz: 900,
       windCutoffHz: 900,
       rainCutoffHz: 2400,
+      birdsCutoffHz: 3200,
       oceanRate: 1.0,
       windRate: 1.0,
       rainRate: 1.0,
+      birdsRate: 1.0,
     };
   }
 
@@ -229,6 +252,9 @@ function computeWeatherMix(state: WeatherAudioState): ComputedWeatherMix {
   const agitation = clamp01(state.seaAgitation);
   const proximity = clamp01(state.seaProximity);
   const shipSpeed = clamp01(state.shipSpeedRatio);
+  const night = clamp01(state.nightFactor ?? 0);
+  const isSailing = Boolean(state.isSailing);
+  const combatDuck = state.inCombat ? 0.72 : 1.0;
 
   // Mer : toujours perceptible au centre d'île (~0.35), ample sur plage et en mer (1.0)
   const proximityScale = 0.22 + 0.78 * proximity;
@@ -236,7 +262,8 @@ function computeWeatherMix(state: WeatherAudioState): ComputedWeatherMix {
   const oceanGain = clamp(
     (0.32 + 0.36 * agitation + 0.14 * storm + 0.12 * shipSpeed * proximity) *
       proximityScale *
-      fogOceanAtten,
+      fogOceanAtten *
+      combatDuck,
     0,
     0.82,
   );
@@ -246,11 +273,12 @@ function computeWeatherMix(state: WeatherAudioState): ComputedWeatherMix {
     wind > 0.01 || storm > 0.01 || fog > 0.01 || shipSpeed > 0.01;
   const windGain = windActive
     ? clamp(
-        0.05 +
+        (0.05 +
           0.46 * wind +
           0.14 * storm +
           0.08 * fog * (1 - storm) +
-          0.14 * shipSpeed,
+          0.14 * shipSpeed) *
+          combatDuck,
         0,
         0.74,
       )
@@ -258,7 +286,17 @@ function computeWeatherMix(state: WeatherAudioState): ComputedWeatherMix {
 
   // Pluie : silencieuse hors averse, montée progressive et naturelle vers pluie dense
   const rainGain =
-    rain <= 0.01 ? 0 : clamp(Math.pow(rain, 0.85) * (0.64 + 0.08 * storm), 0, 0.74);
+    rain <= 0.01
+      ? 0
+      : clamp(Math.pow(rain, 0.85) * (0.64 + 0.08 * storm) * combatDuck, 0, 0.74);
+
+  // Oiseaux de beau temps : STRICTEMENT coupés par temps d'orage, pluie, nuit, donjon ou pleine mer
+  const stormSilence = storm > 0.12 || rain > 0.14 ? 0 : 1 - Math.max(storm / 0.12, rain / 0.14);
+  const dayFactor = night > 0.45 ? 0 : 1 - night / 0.45;
+  const landFactor = isSailing ? 0 : clamp01(1.15 - proximity * 0.65);
+  const fogAtten = 1 - fog * 0.65;
+  const rawBirds = 0.26 * stormSilence * dayFactor * landFactor * fogAtten * combatDuck;
+  const birdsGain = rawBirds < 0.005 ? 0 : clamp(rawBirds, 0, 0.28);
 
   // Filtrage fréquentiel dynamique : mer sourde en brouillard, spectre ouvert en tempête
   const fogOceanMuffle = 1 - 0.72 * fog * (1 - 0.65 * storm);
@@ -282,26 +320,32 @@ function computeWeatherMix(state: WeatherAudioState): ComputedWeatherMix {
     11000,
   );
 
+  const birdsCutoffHz = clamp(7800 - fog * 2800, 3200, 9500);
+
   // Légère modulation de vitesse de lecture pour renforcer la nervosité en tempête / navigation
   const oceanRate = clamp(0.96 + 0.11 * agitation + 0.04 * shipSpeed, 0.9, 1.14);
   const windRate = clamp(0.94 + 0.14 * wind + 0.06 * shipSpeed, 0.9, 1.16);
   const rainRate = clamp(0.96 + 0.08 * storm, 0.92, 1.08);
+  const birdsRate = 1.0;
 
   return {
     oceanGain,
     windGain,
     rainGain,
+    birdsGain,
     oceanCutoffHz,
     windCutoffHz,
     rainCutoffHz,
+    birdsCutoffHz,
     oceanRate,
     windRate,
     rainRate,
+    birdsRate,
   };
 }
 
 /**
- * Contrôleur des ambiances météo & maritimes (mer, vent, pluie, tonnerre).
+ * Contrôleur des ambiances météo & maritimes (mer, vent, pluie, oiseaux de beau temps, tonnerre).
  * Connecté sur le bus `weatherGain` de l'`AudioEngine`.
  */
 export class WeatherAudioController {
@@ -316,6 +360,7 @@ export class WeatherAudioController {
     ocean: 'idle',
     wind: 'idle',
     rain: 'idle',
+    birds: 'idle',
     thunder: 'idle',
   };
 
@@ -330,15 +375,18 @@ export class WeatherAudioController {
     oceanGain: 0,
     windGain: 0,
     rainGain: 0,
+    birdsGain: 0,
     oceanCutoffHz: 2400,
     windCutoffHz: 1800,
     rainCutoffHz: 5000,
+    birdsCutoffHz: 7800,
     oceanRate: 1.0,
     windRate: 1.0,
     rainRate: 1.0,
+    birdsRate: 1.0,
   };
 
-  private smoothedGains = { ocean: 0, wind: 0, rain: 0 };
+  private smoothedGains = { ocean: 0, wind: 0, rain: 0, birds: 0 };
   private thunderCount = 0;
   private lastThunderMs = -Infinity;
 
@@ -350,6 +398,7 @@ export class WeatherAudioController {
       ocean: this.createLoopChannel(2400),
       wind: this.createLoopChannel(1800),
       rain: this.createLoopChannel(5000),
+      birds: this.createLoopChannel(7800),
     };
   }
 
@@ -387,6 +436,9 @@ export class WeatherAudioController {
     this.smoothedGains.ocean += (mix.oceanGain - this.smoothedGains.ocean) * alpha;
     this.smoothedGains.wind += (mix.windGain - this.smoothedGains.wind) * alpha;
     this.smoothedGains.rain += (mix.rainGain - this.smoothedGains.rain) * alpha;
+    const birdsTau = mix.birdsGain === 0 ? 0.25 : GAIN_TAU_WEATHER_SEC;
+    const birdsAlpha = 1 - Math.exp(-safeDt / birdsTau);
+    this.smoothedGains.birds += (mix.birdsGain - this.smoothedGains.birds) * birdsAlpha;
 
     if (this.smoothedGains.ocean < 0.0005 && mix.oceanGain === 0) {
       this.smoothedGains.ocean = 0;
@@ -397,6 +449,9 @@ export class WeatherAudioController {
     if (this.smoothedGains.rain < 0.0005 && mix.rainGain === 0) {
       this.smoothedGains.rain = 0;
     }
+    if (this.smoothedGains.birds < 0.0005 && mix.birdsGain === 0) {
+      this.smoothedGains.birds = 0;
+    }
 
     if (this.ctx.state !== 'running') return;
 
@@ -404,6 +459,7 @@ export class WeatherAudioController {
     this.applyLoopParams('ocean', mix.oceanGain, mix.oceanCutoffHz, mix.oceanRate, tau, now);
     this.applyLoopParams('wind', mix.windGain, mix.windCutoffHz, mix.windRate, tau, now);
     this.applyLoopParams('rain', mix.rainGain, mix.rainCutoffHz, mix.rainRate, tau, now);
+    this.applyLoopParams('birds', mix.birdsGain, mix.birdsCutoffHz, mix.birdsRate, birdsTau, now);
   }
 
   /**
@@ -468,6 +524,7 @@ export class WeatherAudioController {
         ocean: isRunning ? Number(this.smoothedGains.ocean.toFixed(4)) : 0,
         wind: isRunning ? Number(this.smoothedGains.wind.toFixed(4)) : 0,
         rain: isRunning ? Number(this.smoothedGains.rain.toFixed(4)) : 0,
+        birds: isRunning ? Number(this.smoothedGains.birds.toFixed(4)) : 0,
       },
       thunderCount: this.thunderCount,
     };
@@ -665,7 +722,9 @@ export class WeatherAudioController {
           ? this.currentMix.oceanRate
           : track === 'wind'
             ? this.currentMix.windRate
-            : this.currentMix.rainRate;
+            : track === 'rain'
+              ? this.currentMix.rainRate
+              : this.currentMix.birdsRate;
       const now = this.ctx.currentTime;
       src.playbackRate.setValueAtTime(rate, now);
 
@@ -686,13 +745,17 @@ export class WeatherAudioController {
             ? this.currentMix.oceanGain
             : track === 'wind'
               ? this.currentMix.windGain
-              : this.currentMix.rainGain;
+              : track === 'rain'
+                ? this.currentMix.rainGain
+                : this.currentMix.birdsGain;
         const targetCutoff =
           track === 'ocean'
             ? this.currentMix.oceanCutoffHz
             : track === 'wind'
               ? this.currentMix.windCutoffHz
-              : this.currentMix.rainCutoffHz;
+              : track === 'rain'
+                ? this.currentMix.rainCutoffHz
+                : this.currentMix.birdsCutoffHz;
         this.applyLoopParams(track, targetGain, targetCutoff, rate, GAIN_TAU_WEATHER_SEC, now);
       }
     } catch {

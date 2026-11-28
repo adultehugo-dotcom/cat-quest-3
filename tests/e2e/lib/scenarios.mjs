@@ -50,7 +50,7 @@ export function makeSave(overrides = {}) {
         shield: '',
         helmet: 'helm_dragon',
         armor: 'armor_dragon',
-        trinket: '',
+        cape: '',
       },
       inventory: {
         sword_wood: { id: 'sword_wood', level: 1 },
@@ -922,7 +922,7 @@ async function runDragonLairScenario(shared) {
         shield: '',
         helmet: 'helm_dragon',
         armor: 'armor_dragon',
-        trinket: '',
+        cape: '',
       },
       inventory: {
         blade_dragon: { id: 'blade_dragon', level: 40 },
@@ -1065,7 +1065,7 @@ async function runEndgameScenario(shared) {
         shield: '',
         helmet: '',
         armor: '',
-        trinket: '',
+        cape: '',
       },
       inventory: {
         sword_wood: { id: 'sword_wood', level: 1 },
@@ -2077,10 +2077,7 @@ async function runCapeLightingScenario(shared) {
         shield: 'shield_knight',
         helmet: 'helm_knight',
         armor: 'armor_mail',
-        boots: 'boots_iron',
-        gloves: 'gloves_iron',
         cape: 'cape_dragon',
-        trinket: 'trinket_yarn',
       },
       inventory: {
         sword_wood: { id: 'sword_wood', level: 1 },
@@ -2091,13 +2088,10 @@ async function runCapeLightingScenario(shared) {
         helm_knight: { id: 'helm_knight', level: 5 },
         armor_tunic: { id: 'armor_tunic', level: 1 },
         armor_mail: { id: 'armor_mail', level: 5 },
-        boots_iron: { id: 'boots_iron', level: 3 },
-        gloves_iron: { id: 'gloves_iron', level: 3 },
         cape_traveler: { id: 'cape_traveler', level: 1 },
         cape_knight: { id: 'cape_knight', level: 3 },
         cape_starlight: { id: 'cape_starlight', level: 5 },
         cape_dragon: { id: 'cape_dragon', level: 5 },
-        trinket_yarn: { id: 'trinket_yarn', level: 1 },
       },
     },
   });

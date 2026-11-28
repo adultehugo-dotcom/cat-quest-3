@@ -2,7 +2,9 @@ import { DUNGEONS } from '../data/dungeonsData';
 import {
   EQUIPMENT,
   MYSTERY_CHEST_WEIGHTS,
+  WEAPON_FAMILY_LABELS,
   getEquipmentDefinition,
+  getShopEquipmentList,
 } from '../data/equipmentData';
 import { QUEST_LIST } from '../data/questsData';
 import {
@@ -11,27 +13,87 @@ import {
   getSpellUpgradeCost,
 } from '../data/spellsData';
 import { OVERWORLD_DATA } from '../data/worldData';
+import { ARCHIPELAGO_MAP_BOUNDS } from '../art/mapTexture';
 import {
   ALL_NEW_ISLANDS,
   NEW_ISLANDS,
 } from '../data/worldIslands';
 import {
+  getEquipmentUpgradeCost,
+  isMaxUpgrade,
+  scaleEquipmentFraction,
+  scaleEquipmentStat,
+} from '../game/progression';
+import {
+  FORGE_UPGRADE_MULTIPLIERS,
+  MAX_FORGE_UPGRADE_LEVEL,
   MAX_SPELL_LEVEL,
   MYSTERY_CHEST_COST,
   type ActiveModal,
   type EquipSlot,
   type EquipmentDefinition,
   type EquipmentStatBonuses,
+  type ForgeUpgradeLevel,
   type GameState,
   type MysteryChestResult,
+  type OwnedEquipment,
   type QuestId,
   type Rarity,
   type SpellId,
+  type StatusEffectId,
 } from '../game/types';
 
-export type ForgeTab = 'chest' | 'spells';
+export type ForgeTab = 'chest' | 'upgrade' | 'shop' | 'spells';
 type InventoryFilter = 'all' | EquipSlot;
 type MapLabelPlacement = 'below' | 'above' | 'below-offset' | 'above-offset';
+
+export interface DragonPortraitFacialState {
+  blinking: boolean;
+  mouthOpen: number;
+}
+
+/**
+ * Contrôleur d'animation faciale procédurale du portrait de Drak-Miaou (clignement périodique + mâchoire parlante).
+ */
+export class DragonPortraitFacialController {
+  private elapsedSec = 0;
+  private speechPhase = 0;
+  private readonly blinkPeriodSec = 3.2;
+  private readonly blinkDurationSec = 0.14;
+
+  public reset(): void {
+    this.elapsedSec = 0;
+    this.speechPhase = 0;
+  }
+
+  public step(dt: number, isSpeaking: boolean): DragonPortraitFacialState {
+    const safeDt = Math.max(0, Math.min(0.25, Number.isFinite(dt) ? dt : 0));
+    this.elapsedSec += safeDt;
+
+    const cyclePos = this.elapsedSec % this.blinkPeriodSec;
+    const blinking =
+      this.elapsedSec >= this.blinkPeriodSec * 0.5 &&
+      cyclePos >= this.blinkPeriodSec - this.blinkDurationSec;
+
+    if (isSpeaking) {
+      this.speechPhase += safeDt * 13.5;
+      const raw =
+        0.5 +
+        0.34 * Math.sin(this.speechPhase) +
+        0.16 * Math.sin(this.speechPhase * 2.15 + 0.7);
+      return {
+        blinking,
+        mouthOpen: Math.max(0, Math.min(1, raw)),
+      };
+    }
+
+    this.speechPhase = 0;
+    return {
+      blinking,
+      mouthOpen: 0,
+    };
+  }
+}
 
 interface MapStaticAnchor {
   left: number;
@@ -67,6 +129,8 @@ export interface ModalsCallbacks {
   onTrackQuest: (questId: QuestId) => void;
   onBuyMysteryChest: () => MysteryChestResult | null;
   onUpgradeSpell: (spellId: SpellId) => boolean;
+  onUpgradeEquipment?: (itemId: string) => boolean;
+  onBuyEquipment?: (itemId: string) => boolean;
 }
 
 const SLOT_ORDER: Record<EquipSlot, number> = {
@@ -74,10 +138,7 @@ const SLOT_ORDER: Record<EquipSlot, number> = {
   shield: 1,
   helmet: 2,
   armor: 3,
-  boots: 4,
-  gloves: 5,
-  cape: 6,
-  trinket: 7,
+  cape: 4,
 };
 
 const SLOT_LABELS: Record<EquipSlot, string> = {
@@ -85,10 +146,17 @@ const SLOT_LABELS: Record<EquipSlot, string> = {
   shield: 'Bouclier',
   helmet: 'Casque',
   armor: 'Armure',
-  boots: 'Bottes',
-  gloves: 'Gants',
   cape: 'Cape',
-  trinket: 'Babiole',
+};
+
+const STATUS_PROC_LABELS: Readonly<Record<StatusEffectId, string>> = {
+  burn: 'Brûlure',
+  chill: 'Givre',
+  poison: 'Poison',
+  bleed: 'Saignement',
+  stun: 'Étourdissement',
+  shock: 'Choc',
+  curse: 'Malédiction',
 };
 
 const RARITY_ORDER: Record<Rarity, number> = {
@@ -130,27 +198,79 @@ interface ScaledItemStats {
 function computeScaledStats(
   base: EquipmentStatBonuses,
   level: number,
+  upgradeLevel: ForgeUpgradeLevel = 0,
 ): ScaledItemStats {
-  const mult = 1 + 0.25 * Math.max(0, level - 1);
   return {
-    atk: base.atk ? Math.round(base.atk * mult) : 0,
-    mag: base.mag ? Math.round(base.mag * mult) : 0,
-    def: base.def ? Math.round(base.def * mult) : 0,
-    hp: base.hp ? Math.round(base.hp * mult) : 0,
-    mp: base.mp ? Math.round(base.mp * mult) : 0,
-    critPct: base.critChance ? Math.round(base.critChance * 100 * mult) : 0,
+    atk: base.atk ? scaleEquipmentStat(base.atk, level, upgradeLevel) : 0,
+    mag: base.mag ? scaleEquipmentStat(base.mag, level, upgradeLevel) : 0,
+    def: base.def ? scaleEquipmentStat(base.def, level, upgradeLevel) : 0,
+    hp: base.hp ? scaleEquipmentStat(base.hp, level, upgradeLevel) : 0,
+    mp: base.mp ? scaleEquipmentStat(base.mp, level, upgradeLevel) : 0,
+    critPct: base.critChance
+      ? Math.round(scaleEquipmentFraction(base.critChance, level, upgradeLevel) * 100)
+      : 0,
   };
 }
 
-function getEquipmentSvgMarkup(def: EquipmentDefinition): string {
-  const { primaryColor, secondaryColor, accentColor } = def.visualStyle;
+export function getEquipmentSvgMarkup(def: EquipmentDefinition): string {
+  const { primaryColor, secondaryColor, accentColor, shape } = def.visualStyle;
   switch (def.slot) {
-    case 'weapon':
-      if (def.visualStyle.shape === 'arcane_staff') {
+    case 'weapon': {
+      const family = def.weaponFamily ?? 'sword';
+      if (family === 'staff' || shape === 'arcane_staff' || shape === 'ember_staff') {
         return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
-          <line x1="12" y1="38" x2="31" y2="19" stroke="${primaryColor}" stroke-width="6" stroke-linecap="round"/>
-          <line x1="12" y1="38" x2="31" y2="19" stroke="#2b1e16" stroke-width="2" stroke-linecap="round"/>
+          <line x1="11" y1="39" x2="31" y2="19" stroke="${primaryColor}" stroke-width="6" stroke-linecap="round"/>
+          <line x1="11" y1="39" x2="31" y2="19" stroke="#2b1e16" stroke-width="2" stroke-linecap="round"/>
           <polygon points="34,6 37,13 44,15 37,18 34,25 31,18 24,15 31,13" fill="${accentColor}" stroke="#2b1e16" stroke-width="2"/>
+        </svg>`;
+      }
+      if (family === 'axe_hammer') {
+        if (shape === 'frost_hammer') {
+          return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+            <line x1="10" y1="38" x2="31" y2="17" stroke="${secondaryColor}" stroke-width="5.5" stroke-linecap="round"/>
+            <rect x="24" y="7" width="16" height="12" rx="3" transform="rotate(45 32 13)" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.4"/>
+            <circle cx="32" cy="13" r="3" fill="${accentColor}"/>
+          </svg>`;
+        }
+        return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+          <line x1="10" y1="38" x2="33" y2="15" stroke="${secondaryColor}" stroke-width="5" stroke-linecap="round"/>
+          <path d="M25 10 Q38 6 41 18 Q36 27 26 21 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.4" stroke-linejoin="round"/>
+          <path d="M36 9 Q41 14 38 22" fill="none" stroke="${accentColor}" stroke-width="2.2"/>
+        </svg>`;
+      }
+      if (family === 'dagger_claws') {
+        if (shape === 'lynx_claws') {
+          return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+            <rect x="9" y="29" width="11" height="10" rx="3" transform="rotate(-45 14 34)" fill="${secondaryColor}" stroke="#2b1e16" stroke-width="2.2"/>
+            <path d="M16 26 L34 8 L22 28 Z M21 31 L40 14 L26 33 Z M25 36 L42 22 L29 37 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="1.8" stroke-linejoin="round"/>
+          </svg>`;
+        }
+        return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+          <path d="M16 32 Q27 16 40 9 Q33 23 19 35 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.2" stroke-linejoin="round"/>
+          <line x1="12" y1="27" x2="21" y2="36" stroke="${accentColor}" stroke-width="4" stroke-linecap="round"/>
+          <line x1="10" y1="38" x2="16" y2="32" stroke="${secondaryColor}" stroke-width="4.5" stroke-linecap="round"/>
+        </svg>`;
+      }
+      if (family === 'spear') {
+        return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+          <line x1="8" y1="40" x2="32" y2="16" stroke="${secondaryColor}" stroke-width="4.5" stroke-linecap="round"/>
+          <polygon points="29,13 42,6 35,19" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.3" stroke-linejoin="round"/>
+          ${shape === 'royal_halberd' ? `<path d="M26 16 Q34 25 38 19 L31 15 Z" fill="${accentColor}" stroke="#2b1e16" stroke-width="1.8"/>` : `<circle cx="30" cy="18" r="3" fill="${accentColor}" stroke="#2b1e16" stroke-width="1.8"/>`}
+        </svg>`;
+      }
+      if (family === 'bow_crossbow') {
+        if (shape === 'storm_crossbow') {
+          return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+            <line x1="11" y1="37" x2="35" y2="13" stroke="${secondaryColor}" stroke-width="5" stroke-linecap="round"/>
+            <path d="M17 11 Q34 14 37 31" fill="none" stroke="${primaryColor}" stroke-width="4.5" stroke-linecap="round"/>
+            <line x1="17" y1="11" x2="37" y2="31" stroke="${accentColor}" stroke-width="1.8"/>
+            <line x1="18" y1="30" x2="40" y2="8" stroke="${accentColor}" stroke-width="2.6" stroke-linecap="round"/>
+          </svg>`;
+        }
+        return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+          <path d="M14 10 Q38 14 38 34" fill="none" stroke="${primaryColor}" stroke-width="4.5" stroke-linecap="round"/>
+          <line x1="14" y1="10" x2="38" y2="34" stroke="#f5ecd4" stroke-width="1.8"/>
+          <line x1="14" y1="34" x2="38" y2="10" stroke="${accentColor}" stroke-width="2.8" stroke-linecap="round"/>
         </svg>`;
       }
       return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
@@ -158,15 +278,11 @@ function getEquipmentSvgMarkup(def: EquipmentDefinition): string {
         <line x1="10" y1="28" x2="20" y2="38" stroke="${secondaryColor}" stroke-width="4.5" stroke-linecap="round"/>
         <circle cx="11" cy="37" r="3.5" fill="${accentColor}" stroke="#2b1e16" stroke-width="2"/>
       </svg>`;
+    }
     case 'shield':
       return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
         <path d="M24 6 L38 12 L36 31 Q33 39 24 43 Q15 39 12 31 L10 12 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.6"/>
         <circle cx="24" cy="24" r="7" fill="${accentColor}" stroke="#2b1e16" stroke-width="2"/>
-      </svg>`;
-    case 'trinket':
-      return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
-        <circle cx="24" cy="24" r="13" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.5"/>
-        <path d="M24 11 Q31 16 24 24 Q17 32 24 37" fill="none" stroke="${accentColor}" stroke-width="3"/>
       </svg>`;
     case 'helmet':
       return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
@@ -179,22 +295,58 @@ function getEquipmentSvgMarkup(def: EquipmentDefinition): string {
         <rect x="14" y="26" width="20" height="4.5" rx="2" fill="${accentColor}" stroke="#2b1e16" stroke-width="1.6"/>
         <path d="M20 14 L24 21 L28 14" fill="${secondaryColor}" stroke="#2b1e16" stroke-width="1.8"/>
       </svg>`;
-    case 'boots':
-      return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
-        <path d="M12 8 H26 V26 L38 31 Q42 34 39 40 H9 Q6 38 9 33 L14 27 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.8" stroke-linejoin="round"/>
-        <path d="M12 33 H39" stroke="${accentColor}" stroke-width="3"/>
-      </svg>`;
-    case 'gloves':
-      return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
-        <path d="M13 25 V13 Q13 9 17 9 Q20 9 20 13 V21 V10 Q20 6 24 6 Q28 6 28 10 V21 V12 Q28 8 32 8 Q36 8 36 12 V23 L39 20 Q43 18 44 22 L40 35 Q38 41 31 42 H21 Q14 41 12 35 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.6" stroke-linejoin="round"/>
-        <path d="M15 31 H39" stroke="${accentColor}" stroke-width="3"/>
-      </svg>`;
     case 'cape':
       return `<svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
         <path d="M17 9 Q24 13 31 9 L38 17 L34 22 L37 40 Q24 36 11 40 L14 22 L10 17 Z" fill="${primaryColor}" stroke="#2b1e16" stroke-width="2.6" stroke-linejoin="round"/>
         <path d="M15 34 Q24 31 35 34" fill="none" stroke="${accentColor}" stroke-width="3"/>
       </svg>`;
   }
+}
+
+const EQUIP_ICON_PNG_IDS: ReadonlySet<string> = new Set([
+  'armor_tunic',
+  'armor_mail',
+  'armor_robe',
+  'armor_dragon',
+  'helm_bandana',
+  'helm_knight',
+  'helm_mage',
+  'helm_dragon',
+  'cape_traveler',
+  'cape_knight',
+  'cape_starlight',
+  'cape_dragon',
+  'shield_wood',
+  'shield_knight',
+  'sword_wood',
+  'sword_steel',
+  'staff_arcane',
+  'blade_dragon',
+]);
+
+const SPELL_PNG_IDS: ReadonlySet<SpellId> = new Set([
+  'flamepurr',
+  'lightnyan',
+  'freezepaw',
+  'healing_paw',
+]);
+
+export function getEquipmentIconMarkup(def: EquipmentDefinition): string {
+  if (EQUIP_ICON_PNG_IDS.has(def.id)) {
+    return `<img class="inv-slot-icon-img" src="./assets/icons/equip/${def.id}.png" alt="" loading="lazy" />`;
+  }
+  return getEquipmentSvgMarkup(def);
+}
+
+function getSpellIconMarkup(spellId: SpellId): string {
+  if (SPELL_PNG_IDS.has(spellId)) {
+    return `<img class="forge-spell-icon-img" src="./assets/icons/spells/${spellId}.png" alt="" loading="lazy" />`;
+  }
+  return getSpellIconSvg(spellId);
+}
+
+function computeStatScore(s: ScaledItemStats): number {
+  return s.atk * 2.2 + s.mag * 2.2 + s.def * 2 + s.hp * 0.35 + s.mp * 0.4 + s.critPct * 3;
 }
 
 function getSpellIconSvg(spellId: SpellId): string {
@@ -244,10 +396,7 @@ function getSpellIconSvg(spellId: SpellId): string {
 }
 
 function worldToMapPercent(x: number, z: number): { left: number; top: number } {
-  const minX = -135;
-  const minZ = -140;
-  const spanX = 270;
-  const spanZ = 220;
+  const { minX, minZ, spanX, spanZ } = ARCHIPELAGO_MAP_BOUNDS;
   const left = Math.max(2, Math.min(98, ((x - minX) / spanX) * 100));
   const top = Math.max(2, Math.min(98, ((z - minZ) / spanZ) * 100));
   return { left, top };
@@ -306,6 +455,7 @@ export class ModalsController {
   private forgeTab: ForgeTab = 'chest';
   private lastChestResult: MysteryChestResult | null = null;
   private chestResultNonce = 0;
+  private justEquippedItemId: string | null = null;
   private lastRenderSignature = '';
   private latestState: GameState | null = null;
 
@@ -460,7 +610,7 @@ export class ModalsController {
     switch (modal) {
       case 'inventory': {
         const invKey = Object.values(p.inventory)
-          .map((item) => `${item.id}:${item.level}`)
+          .map((item) => `${item.id}:${item.level}:${item.upgradeLevel ?? 0}`)
           .sort()
           .join(',');
         return [
@@ -480,10 +630,7 @@ export class ModalsController {
           p.equipped.shield,
           p.equipped.helmet,
           p.equipped.armor,
-          p.equipped.boots,
-          p.equipped.gloves,
           p.equipped.cape,
-          p.equipped.trinket,
           invKey,
         ].join('|');
       }
@@ -492,7 +639,9 @@ export class ModalsController {
           'map',
           this.mapImageVersion,
           state.zoneId,
+          state.islandId,
           p.hasRunicKey ? 1 : 0,
+          state.openedChestIds.length,
           state.trackedQuestId ?? 'none',
           state.questTarget?.zoneId ?? 'none',
           state.questTarget ? `${Math.round(state.questTarget.x)},${Math.round(state.questTarget.z)}` : '0',
@@ -506,15 +655,25 @@ export class ModalsController {
       }
       case 'forge': {
         const spKey = SPELL_LIST.map((s) => `${s.id}:${p.spellLevels[s.id]}`).join(',');
+        const invKey = Object.values(p.inventory)
+          .map((item) => `${item.id}:${item.level}:${item.upgradeLevel ?? 0}`)
+          .sort()
+          .join(',');
         return [
           'forge',
           this.forgeTab,
+          p.level,
           p.gold,
+          p.stats.atk,
           p.stats.mag,
+          p.stats.def,
           p.maxHp,
           p.equipped.weapon,
+          p.equipped.shield,
           p.equipped.helmet,
           p.equipped.armor,
+          p.equipped.cape,
+          invKey,
           spKey,
           this.chestResultNonce,
         ].join('|');
@@ -537,15 +696,21 @@ export class ModalsController {
           'Cliquez sur un objet pour l’équiper instantanément sur votre héros';
         this.renderInventory(state);
         break;
-      case 'map':
+      case 'map': {
         this.windowEl.classList.add('modal-window--map');
-        this.titleEl.textContent = 'Carte des îles';
-        this.subtitleEl.textContent =
-          state.zoneId === 'overworld'
-            ? 'Position en temps réel sur l’île de Félingard'
-            : `Actuellement dans : ${DUNGEONS[state.zoneId].name} (entrée indiquée)`;
+        this.titleEl.textContent = 'Carte de l’Archipel de Félingard';
+        const locLabel =
+          state.zoneId !== 'overworld'
+            ? `Dans : ${DUNGEONS[state.zoneId].name} (portail d’entrée indiqué)`
+            : state.ship.mode !== 'parked'
+              ? 'Navigation en cours sur la Mer des Ronrons'
+              : state.islandId === 'felingard'
+                ? 'Île de Félingard — Position en temps réel'
+                : `${NEW_ISLANDS[state.islandId].name} — Position en temps réel`;
+        this.subtitleEl.textContent = locLabel;
         this.renderWorldMap(state);
         break;
+      }
       case 'quests':
         this.windowEl.classList.add('modal-window--quests');
         this.titleEl.textContent = 'Panneau de Quêtes';
@@ -557,7 +722,7 @@ export class ModalsController {
         this.windowEl.classList.add('modal-window--forge');
         this.titleEl.textContent = 'Forge de Kit-Chat';
         this.subtitleEl.textContent =
-          'Coffres Mystère avec amélioration par doublons & Autel des Sorts';
+          'Forge +1 → +3, Armurerie, Coffre Mystère & Autel des Sorts';
         this.renderForge(state);
         break;
       default:
@@ -579,7 +744,7 @@ export class ModalsController {
     const layout = document.createElement('div');
     layout.className = 'inv-layout';
 
-    // Colonne gauche : Aperçu chat équipé + stats + 3 slots équipés
+    // Colonne gauche : Aperçu chat équipé + stats + 5 slots équipés
     const leftCol = document.createElement('div');
     leftCol.className = 'inv-hero-card';
 
@@ -618,22 +783,20 @@ export class ModalsController {
       'shield',
       'helmet',
       'armor',
-      'boots',
-      'gloves',
       'cape',
-      'trinket',
     ] as EquipSlot[]).forEach((slot) => {
       const itemId = p.equipped[slot];
       const def = getEquipmentDefinition(itemId);
       const owned = p.inventory[itemId];
       if (!def || !owned) return;
 
+      const upLv = (owned.upgradeLevel ?? 0) as ForgeUpgradeLevel;
       const slotBox = document.createElement('div');
-      slotBox.className = `inv-equipped-slot inv-equipped-slot--${def.rarity}`;
+      slotBox.className = `inv-equipped-slot inv-equipped-slot--${def.rarity}${upLv >= MAX_FORGE_UPGRADE_LEVEL ? ' is-max-upgrade' : ''}`;
       slotBox.innerHTML = `
-        <div class="inv-slot-icon">${getEquipmentSvgMarkup(def)}</div>
+        <div class="inv-slot-icon">${getEquipmentIconMarkup(def)}</div>
         <div class="inv-slot-info">
-          <div class="inv-slot-type">${SLOT_LABELS[slot]} • Niv. ${owned.level}</div>
+          <div class="inv-slot-type">${SLOT_LABELS[slot]} • Niv. ${owned.level}${upLv > 0 ? ` <span class="upgrade-badge upgrade-badge--${upLv}">+${upLv}</span>` : ''}</div>
           <div class="inv-slot-name">${def.name}</div>
         </div>
       `;
@@ -653,10 +816,7 @@ export class ModalsController {
       { id: 'shield', label: 'Boucliers' },
       { id: 'helmet', label: 'Casques' },
       { id: 'armor', label: 'Armures' },
-      { id: 'boots', label: 'Bottes' },
-      { id: 'gloves', label: 'Gants' },
       { id: 'cape', label: 'Capes' },
-      { id: 'trinket', label: 'Babioles' },
     ];
     for (const f of filters) {
       const btn = document.createElement('button');
@@ -679,7 +839,7 @@ export class ModalsController {
         return def ? { owned, def } : null;
       })
       .filter(
-        (entry): entry is { owned: { id: string; level: number }; def: EquipmentDefinition } =>
+        (entry): entry is { owned: OwnedEquipment; def: EquipmentDefinition } =>
           entry !== null &&
           (this.inventoryFilter === 'all' || entry.def.slot === this.inventoryFilter),
       )
@@ -695,7 +855,8 @@ export class ModalsController {
 
     for (const { owned, def } of ownedEntries) {
       const isEquipped = p.equipped[def.slot] === def.id;
-      const itemStats = computeScaledStats(def.baseStats, owned.level);
+      const itemUpgrade = (owned.upgradeLevel ?? 0) as ForgeUpgradeLevel;
+      const itemStats = computeScaledStats(def.baseStats, owned.level, itemUpgrade);
 
       // Stats de l'objet actuellement équipé dans ce slot pour calcul du delta +/-
       const equippedId = p.equipped[def.slot];
@@ -703,14 +864,23 @@ export class ModalsController {
       const equippedOwned = p.inventory[equippedId];
       const equippedStats =
         equippedDef && equippedOwned
-          ? computeScaledStats(equippedDef.baseStats, equippedOwned.level)
+          ? computeScaledStats(
+              equippedDef.baseStats,
+              equippedOwned.level,
+              (equippedOwned.upgradeLevel ?? 0) as ForgeUpgradeLevel,
+            )
           : { atk: 0, mag: 0, def: 0, hp: 0, mp: 0, critPct: 0 };
+
+      const isUpgradeCandidate =
+        !isEquipped && computeStatScore(itemStats) > computeStatScore(equippedStats) + 0.01;
+      const isJustEquipped = isEquipped && this.justEquippedItemId === def.id;
 
       const card = document.createElement('button');
       card.type = 'button';
-      card.className = `inv-item-card inv-item-card--${def.rarity}${isEquipped ? ' is-equipped' : ''}`;
+      card.className = `inv-item-card inv-item-card--${def.rarity}${isEquipped ? ' is-equipped' : ''}${isUpgradeCandidate ? ' has-upgrade' : ''}${isJustEquipped ? ' is-just-equipped' : ''}${itemUpgrade >= MAX_FORGE_UPGRADE_LEVEL ? ' is-max-upgrade' : ''}`;
       card.addEventListener('click', () => {
         if (!isEquipped) {
+          this.justEquippedItemId = def.id;
           this.callbacks.onEquipItem(def.id);
         }
       });
@@ -720,25 +890,36 @@ export class ModalsController {
         equippedStats,
         isEquipped,
       );
+      const familyBadge =
+        def.slot === 'weapon' && def.weaponFamily
+          ? `<span class="family-badge">${SLOT_LABELS[def.slot]} • ${WEAPON_FAMILY_LABELS[def.weaponFamily]}</span>`
+          : '';
+      const statusHint = def.statusProc
+        ? ` • Effet : ${STATUS_PROC_LABELS[def.statusProc.statusId]} (${Math.round(def.statusProc.chance * 100)} %)`
+        : '';
 
       card.innerHTML = `
         <div class="inv-item-top">
-          <div class="inv-slot-icon">${getEquipmentSvgMarkup(def)}</div>
+          <div class="inv-slot-icon">${getEquipmentIconMarkup(def)}</div>
           <div class="inv-item-title-wrap">
             <div class="inv-item-name">${def.name}</div>
             <div class="inv-badges-row">
               <span class="rarity-badge rarity-badge--${def.rarity}">${RARITY_LABELS[def.rarity]}</span>
               <span class="lvl-badge">Niv. ${owned.level}</span>
+              ${itemUpgrade > 0 ? `<span class="upgrade-badge upgrade-badge--${itemUpgrade}">+${itemUpgrade}</span>` : ''}
+              ${familyBadge}
               ${isEquipped ? '<span class="equipped-badge">Équipé</span>' : ''}
+              ${isUpgradeCandidate ? '<span class="inv-upgrade-dot" title="Meilleures statistiques">▲ Amélioration</span>' : ''}
             </div>
           </div>
         </div>
         <div class="inv-item-stats">${statsHtml}</div>
-        <div class="inv-item-desc">${def.description}</div>
+        <div class="inv-item-desc">${def.description}${statusHint}</div>
       `;
 
       grid.appendChild(card);
     }
+    this.justEquippedItemId = null;
 
     rightCol.append(filterRow, grid);
     layout.append(leftCol, rightCol);
@@ -908,6 +1089,23 @@ export class ModalsController {
       });
     }
 
+    // Coffres non ouverts sur l'Archipel (petits repères dorés discrets)
+    const openedSet = new Set(state.openedChestIds);
+    const allOverworldChests = [
+      ...OVERWORLD_DATA.chests,
+      ...ALL_NEW_ISLANDS.flatMap((id) => NEW_ISLANDS[id].chests),
+    ];
+    for (const chest of allOverworldChests) {
+      if (openedSet.has(chest.id)) continue;
+      const cPct = worldToMapPercent(chest.x, chest.z);
+      const chestPin = document.createElement('div');
+      chestPin.className = 'map-chest-pin';
+      chestPin.style.left = `${cPct.left.toFixed(2)}%`;
+      chestPin.style.top = `${cPct.top.toFixed(2)}%`;
+      chestPin.title = 'Coffre au trésor non ouvert';
+      frame.appendChild(chestPin);
+    }
+
     // Marqueur doré de Quête active (mis à jour en direct)
     const questMarker = document.createElement('div');
     questMarker.className = 'map-marker map-marker--quest';
@@ -932,7 +1130,7 @@ export class ModalsController {
     this.mapShipPinEl = shipPin;
     frame.appendChild(shipPin);
 
-    // Point joueur en direct
+    // Point joueur orienté en direct
     const playerPin = document.createElement('div');
     playerPin.className = 'map-player-pin';
     playerPin.title = 'Votre position';
@@ -946,6 +1144,7 @@ export class ModalsController {
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#3be8ff;"></span>Vous</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#e5b75a;"></span>Votre voilier</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#f5c95d;"></span>Miaou-bourg</span>
+      <span class="map-legend-item"><span class="map-legend-swatch" style="background:#ffd54a;border-radius:3px;"></span>Coffres</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#8a56d6;"></span>Grotte (Niv. 2)</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#c92a3e;"></span>Antre du Dragon (Niv. 5)</span>
       <span class="map-legend-item"><span class="map-legend-swatch" style="background:#f5b316;"></span>Objectif de quête</span>
@@ -1010,8 +1209,16 @@ export class ModalsController {
     if (this.mapPlayerPinEl) {
       const pPos = getOverworldPlayerPos(state);
       const pct = worldToMapPercent(pPos.x, pPos.z);
+      const headingDeg =
+        ((state.zoneId === 'overworld' && state.ship.mode !== 'parked'
+          ? state.ship.angle
+          : state.player.aimAngle) *
+          180) /
+          Math.PI +
+        90;
       this.mapPlayerPinEl.style.left = `${pct.left.toFixed(2)}%`;
       this.mapPlayerPinEl.style.top = `${pct.top.toFixed(2)}%`;
+      this.mapPlayerPinEl.style.setProperty('--player-heading', `${headingDeg.toFixed(1)}deg`);
     }
 
     if (this.mapShipPinEl) {
@@ -1508,20 +1715,221 @@ export class ModalsController {
     chestTabBtn.textContent = `🎁 Coffre Mystère (${MYSTERY_CHEST_COST} Or)`;
     chestTabBtn.addEventListener('click', () => this.setForgeTab('chest'));
 
+    const upgradeTabBtn = document.createElement('button');
+    upgradeTabBtn.type = 'button';
+    upgradeTabBtn.className = `tab-btn${this.forgeTab === 'upgrade' ? ' is-active' : ''}`;
+    upgradeTabBtn.textContent = '🔨 Forge (+1 → +3)';
+    upgradeTabBtn.addEventListener('click', () => this.setForgeTab('upgrade'));
+
+    const shopTabBtn = document.createElement('button');
+    shopTabBtn.type = 'button';
+    shopTabBtn.className = `tab-btn${this.forgeTab === 'shop' ? ' is-active' : ''}`;
+    shopTabBtn.textContent = '⚔️ Armurerie';
+    shopTabBtn.addEventListener('click', () => this.setForgeTab('shop'));
+
     const spellsTabBtn = document.createElement('button');
     spellsTabBtn.type = 'button';
     spellsTabBtn.className = `tab-btn${this.forgeTab === 'spells' ? ' is-active' : ''}`;
     spellsTabBtn.textContent = '✨ Autel des Sorts (Niv. 1 → 5)';
     spellsTabBtn.addEventListener('click', () => this.setForgeTab('spells'));
 
-    tabs.append(chestTabBtn, spellsTabBtn);
+    tabs.append(chestTabBtn, upgradeTabBtn, shopTabBtn, spellsTabBtn);
     this.bodyEl.appendChild(tabs);
 
     if (this.forgeTab === 'chest') {
       this.renderForgeMysteryChest(state);
+    } else if (this.forgeTab === 'upgrade') {
+      this.renderForgeEquipmentUpgrade(state);
+    } else if (this.forgeTab === 'shop') {
+      this.renderForgeWeaponShop(state);
     } else {
       this.renderForgeSpellAltar(state);
     }
+  }
+
+  private renderForgeEquipmentUpgrade(state: GameState): void {
+    const p = state.player;
+    const grid = document.createElement('div');
+    grid.className = 'forge-equip-grid';
+
+    const entries = Object.values(p.inventory)
+      .map((owned) => {
+        const def = getEquipmentDefinition(owned.id);
+        return def ? { owned, def } : null;
+      })
+      .filter(
+        (entry): entry is { owned: OwnedEquipment; def: EquipmentDefinition } =>
+          entry !== null,
+      )
+      .sort((a, b) => {
+        const aEq = p.equipped[a.def.slot] === a.def.id ? 0 : 1;
+        const bEq = p.equipped[b.def.slot] === b.def.id ? 0 : 1;
+        if (aEq !== bEq) return aEq - bEq;
+        if (SLOT_ORDER[a.def.slot] !== SLOT_ORDER[b.def.slot]) {
+          return SLOT_ORDER[a.def.slot] - SLOT_ORDER[b.def.slot];
+        }
+        if (RARITY_ORDER[a.def.rarity] !== RARITY_ORDER[b.def.rarity]) {
+          return RARITY_ORDER[a.def.rarity] - RARITY_ORDER[b.def.rarity];
+        }
+        return (b.owned.upgradeLevel ?? 0) - (a.owned.upgradeLevel ?? 0);
+      });
+
+    for (const { owned, def } of entries) {
+      const upLv = (owned.upgradeLevel ?? 0) as ForgeUpgradeLevel;
+      const maxed = isMaxUpgrade(upLv);
+      const nextLv = (maxed ? MAX_FORGE_UPGRADE_LEVEL : upLv + 1) as ForgeUpgradeLevel;
+      const cost = getEquipmentUpgradeCost(def.id, upLv);
+      const canAfford = !maxed && p.gold >= cost;
+      const isEquipped = p.equipped[def.slot] === def.id;
+
+      const curStats = computeScaledStats(def.baseStats, owned.level, upLv);
+      const nextStats = computeScaledStats(def.baseStats, owned.level, nextLv);
+      const nextPct = Math.round((FORGE_UPGRADE_MULTIPLIERS[nextLv] - 1) * 100);
+
+      const statKeys: Array<{ key: keyof ScaledItemStats; label: string; suffix?: string }> = [
+        { key: 'atk', label: 'ATK' },
+        { key: 'mag', label: 'MAG' },
+        { key: 'def', label: 'DEF' },
+        { key: 'hp', label: 'PV' },
+        { key: 'mp', label: 'PM' },
+        { key: 'critPct', label: 'Crit', suffix: '%' },
+      ];
+      const previewPills: string[] = [];
+      for (const { key, label, suffix = '' } of statKeys) {
+        const curVal = curStats[key];
+        const nextVal = nextStats[key];
+        if (curVal === 0 && nextVal === 0) continue;
+        if (maxed) {
+          previewPills.push(`<span class="stat-pill">+${curVal}${suffix} ${label}</span>`);
+        } else {
+          const delta = nextVal - curVal;
+          previewPills.push(
+            `<span class="stat-pill">+${curVal}${suffix} → <strong>+${nextVal}${suffix}</strong> ${label}${delta > 0 ? ` <span class="stat-diff-pos">(+${delta}${suffix})</span>` : ''}</span>`,
+          );
+        }
+      }
+
+      const card = document.createElement('div');
+      card.className = `forge-equip-card forge-equip-card--${def.rarity}${maxed ? ' is-max-upgrade' : ''}`;
+      card.innerHTML = `
+        <div class="forge-spell-head">
+          <div class="inv-slot-icon">${getEquipmentIconMarkup(def)}</div>
+          <div style="flex:1; min-width:0;">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:6px; flex-wrap:wrap;">
+              <strong style="font-family:var(--font-title); font-size:15px;">${def.name}</strong>
+              <span class="upgrade-badge upgrade-badge--${upLv}">${maxed ? '+3 MAX ★' : `+${upLv} / +3`}</span>
+            </div>
+            <div class="inv-badges-row" style="margin-top:3px;">
+              <span class="rarity-badge rarity-badge--${def.rarity}">${RARITY_LABELS[def.rarity]}</span>
+              <span class="lvl-badge">${SLOT_LABELS[def.slot]} • Niv. ${owned.level}</span>
+              ${isEquipped ? '<span class="equipped-badge">Équipé</span>' : ''}
+            </div>
+          </div>
+        </div>
+        <div class="forge-tier-preview">${previewPills.join('')}</div>
+      `;
+
+      const footer = document.createElement('div');
+      footer.className = 'forge-spell-footer';
+
+      const hint = document.createElement('span');
+      hint.style.fontSize = '12px';
+      hint.style.fontWeight = '700';
+      hint.style.color = 'var(--ink-soft)';
+      hint.textContent = maxed
+        ? 'Amélioration maximale (+55 %) ★'
+        : `Palier +${nextLv} (+${nextPct} % stats)`;
+
+      const upBtn = document.createElement('button');
+      upBtn.type = 'button';
+      upBtn.className = `wood-btn wood-btn--small${canAfford ? ' wood-btn--gold' : ''}`;
+      upBtn.disabled = maxed || !canAfford;
+      upBtn.textContent = maxed
+        ? 'Amélioration MAX (+3) ★'
+        : `Forger +${nextLv} — ${cost} Or`;
+      upBtn.addEventListener('click', () => {
+        if (this.callbacks.onUpgradeEquipment?.(def.id)) {
+          this.forceRerender();
+        }
+      });
+
+      footer.append(hint, upBtn);
+      card.appendChild(footer);
+      grid.appendChild(card);
+    }
+
+    this.bodyEl.appendChild(grid);
+  }
+
+  private renderForgeWeaponShop(state: GameState): void {
+    const p = state.player;
+    const grid = document.createElement('div');
+    grid.className = 'forge-equip-grid';
+
+    const shopWeapons = getShopEquipmentList();
+    for (const def of shopWeapons) {
+      const price = def.shopPrice ?? 0;
+      const owned = p.inventory[def.id];
+      const canAfford = p.gold >= price;
+      const isEquipped = p.equipped[def.slot] === def.id;
+      const stats = computeScaledStats(def.baseStats, 1, 0);
+      const statPills = this.buildItemComparisonHtml(stats, stats, true);
+      const familyLabel = def.weaponFamily
+        ? `${SLOT_LABELS[def.slot]} • ${WEAPON_FAMILY_LABELS[def.weaponFamily]}`
+        : SLOT_LABELS[def.slot];
+      const statusText = def.statusProc
+        ? `Effet : ${STATUS_PROC_LABELS[def.statusProc.statusId]} (${Math.round(def.statusProc.chance * 100)} %)`
+        : '';
+
+      const card = document.createElement('div');
+      card.className = `forge-equip-card forge-equip-card--${def.rarity}`;
+      card.innerHTML = `
+        <div class="forge-spell-head">
+          <div class="inv-slot-icon">${getEquipmentIconMarkup(def)}</div>
+          <div style="flex:1; min-width:0;">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:6px; flex-wrap:wrap;">
+              <strong style="font-family:var(--font-title); font-size:15px;">${def.name}</strong>
+              ${owned ? `<span class="lvl-badge">Possédé Niv. ${owned.level}</span>` : ''}
+            </div>
+            <div class="inv-badges-row" style="margin-top:3px;">
+              <span class="rarity-badge rarity-badge--${def.rarity}">${RARITY_LABELS[def.rarity]}</span>
+              <span class="family-badge">${familyLabel}</span>
+              ${isEquipped ? '<span class="equipped-badge">Équipé</span>' : ''}
+            </div>
+          </div>
+        </div>
+        <div class="forge-spell-stats">${statPills}</div>
+        <div class="inv-item-desc">${def.description}${statusText ? ` <strong>${statusText}</strong>` : ''}</div>
+      `;
+
+      const footer = document.createElement('div');
+      footer.className = 'forge-spell-footer';
+
+      const hint = document.createElement('span');
+      hint.style.fontSize = '12px';
+      hint.style.fontWeight = '700';
+      hint.style.color = 'var(--ink-soft)';
+      hint.textContent = owned ? 'Doublon : +1 Niveau' : 'Nouvelle arme';
+
+      const buyBtn = document.createElement('button');
+      buyBtn.type = 'button';
+      buyBtn.className = `wood-btn wood-btn--small${canAfford ? ' wood-btn--gold' : ''}`;
+      buyBtn.disabled = !canAfford;
+      buyBtn.textContent = owned
+        ? `Renforcer (+1 Niv.) — ${price} Or`
+        : `Acheter — ${price} Or`;
+      buyBtn.addEventListener('click', () => {
+        if (this.callbacks.onBuyEquipment?.(def.id)) {
+          this.forceRerender();
+        }
+      });
+
+      footer.append(hint, buyBtn);
+      card.appendChild(footer);
+      grid.appendChild(card);
+    }
+
+    this.bodyEl.appendChild(grid);
   }
 
   private renderForgeMysteryChest(state: GameState): void {
@@ -1590,7 +1998,7 @@ export class ModalsController {
           }
         </div>
         <div style="display:flex; align-items:center; gap:10px;">
-          ${def ? `<div class="inv-slot-icon">${getEquipmentSvgMarkup(def)}</div>` : ''}
+          ${def ? `<div class="inv-slot-icon">${getEquipmentIconMarkup(def)}</div>` : ''}
           <div style="text-align:left;">
             <div style="font-family:var(--font-title); font-size:16px; font-weight:700;">${res.itemName}</div>
             <div class="inv-badges-row">
@@ -1651,7 +2059,7 @@ export class ModalsController {
       card.className = 'forge-spell-card';
       card.innerHTML = `
         <div class="forge-spell-head">
-          <div class="forge-spell-icon-box">${getSpellIconSvg(def.id)}</div>
+          <div class="forge-spell-icon-box">${getSpellIconMarkup(def.id)}</div>
           <div style="flex:1;">
             <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
               <strong style="font-family:var(--font-title); font-size:15.5px;">${def.name}</strong>

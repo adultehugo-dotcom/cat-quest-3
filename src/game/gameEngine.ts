@@ -11,7 +11,7 @@ import {
   getDungeonDefinition,
 } from '../data/dungeonsData';
 import { getEnemyDefinition } from '../data/enemiesData';
-import { SPELL_ORDER } from '../data/spellsData';
+import { SPELLS, SPELL_ORDER } from '../data/spellsData';
 import {
   BOSS_DRAGON_PHASE2_DIALOGUE,
   INN_REST_MESSAGE,
@@ -24,21 +24,31 @@ import {
   OVERWORLD_DATA,
   VILLAGE_SAFE_ZONE,
   clampToIsland,
+  getBiomeAt,
+  isInsideIsland,
   isInsideVillage,
 } from '../data/worldData';
 import {
   NEW_ISLANDS,
   clampToNewIsland,
+  getBiomeAtNewIsland,
   getNewIslandRadiusAtAngle,
 } from '../data/worldIslands';
 import {
   DODGE_SPEED,
   HITSTOP_MAJOR_DURATION,
+  PERFECT_DODGE_BUFF_DURATION,
+  PERFECT_DODGE_MP_PCT,
+  PERFECT_DODGE_SLOW_DURATION,
+  PERFECT_DODGE_TIMESCALE,
+  PERFECT_DODGE_WINDOW_SEC,
   PLAYER_MOVE_SPEED,
   PLAYER_RADIUS,
+  applyStarfallWaveDamage,
   castSpell,
   executeDodgeRoll,
   executeMeleeAttack,
+  updatePlayerProjectiles,
   updatePlayerRegen,
   updatePlayerShield,
 } from './combat';
@@ -46,18 +56,34 @@ import {
   OVERWORLD_RESPAWN_TIME,
   createEnemyInstance,
   updateEnemies,
+  updateEnemyProjectiles,
+  updateHazardZones,
   updateTelegraphs,
   updateTraps,
 } from './enemyAI';
 import {
   angleBetween,
+  circleIntersectsAABB,
+  circlesOverlap,
   clamp,
   dist,
+  isPointInCircle,
+  isPointInCone,
+  isPointInLine,
+  isTargetInTelegraph,
+  normalize,
   resolveCircleAABB,
   resolveCircleCircle,
 } from './math';
 import {
+  getChillSlowFactor,
+  isEntityStunned,
+  updateEnemyStatuses,
+  updatePlayerStatuses,
+} from './statusEffects';
+import {
   addEquipment,
+  buyEquipment as progressionBuyEquipment,
   buyMysteryChest as progressionBuyMysteryChest,
   createInitialPlayerState,
   equipItem as progressionEquipItem,
@@ -66,7 +92,10 @@ import {
   recalculatePlayerStats,
   rollEquipmentByWeights,
   unequipSlot as progressionUnequipSlot,
+  upgradeEquipment as progressionUpgradeEquipment,
   upgradeSpell as progressionUpgradeSpell,
+  type EquipmentPurchaseResult,
+  type EquipmentUpgradeResult,
   type SpellUpgradeResult,
 } from './progression';
 import {
@@ -79,6 +108,7 @@ import {
   pickTrackedQuestId,
 } from './quests';
 import {
+  DEFAULT_GAME_OPTIONS,
   hasSaveData,
   loadGame,
   saveGame,
@@ -105,10 +135,16 @@ import {
   getDefaultBoatSpawnOnFelingard,
   getIslandName,
   resolveShipCoastCollision,
+  sampleShorelineField,
 } from './shorelineNavigation';
 import type {
   ActiveModal,
+  AttackMetadata,
   ChestInstance,
+  CinematicKind,
+  CinematicState,
+  CompanionReactionKind,
+  DecorMaterialKind,
   DialogueAction,
   DialogueLine,
   EnemyInstance,
@@ -118,14 +154,19 @@ import type {
   InputState,
   Interactable,
   IslandId,
+  LootDrop,
+  LootDropKind,
   MusicTrackId,
   MysteryChestResult,
+  PropKind,
   QuestId,
   ShipDisembarkStatus,
   ShipSlot,
   ShipState,
   SpellId,
+  TerrainSurfaceId,
   Vec2,
+  WildlifeDensity,
   ZoneId,
 } from './types';
 import { STARTING_EQUIPMENT } from './types';
@@ -142,6 +183,64 @@ const BOARDING_ARC_HEIGHT = 1.95;
 const DISEMBARKING_DURATION = 0.42;
 const DISEMBARKING_ARC_HEIGHT = 1.85;
 const SHIP_REFUSAL_COOLDOWN = 1.4;
+export const CHEST_OPEN_DURATION = 1.35;
+export const PORTAL_ENTER_DURATION = 1.40;
+export const PORTAL_EXIT_DURATION = 0.40;
+export const PORTAL_MAX_DURATION = 2.40;
+export const HERO_DEATH_DURATION = 2.0;
+const INTERACT_CLOSE_DIST = 1.68;
+const INTERACT_APPROACH_EXTRA = 2.4;
+const COMBAT_MUSIC_HOLD_SEC = 4.5;
+export const FOOTSTEP_STRIDE_DIST = 1.8;
+export const LOW_HP_ALERT_THRESHOLD = 0.2;
+export const LOW_HP_ALERT_COOLDOWN_SEC = 6.5;
+
+let nextLootDropId = 1;
+let nextCinematicId = 1;
+
+function splitRewardAmounts(total: number, count: number): number[] {
+  const safeTotal = Math.max(0, Math.round(total));
+  if (safeTotal <= 0) return [];
+  const pieces = Math.max(1, Math.min(safeTotal, Math.floor(count)));
+  const base = Math.floor(safeTotal / pieces);
+  let rem = safeTotal % pieces;
+  const result: number[] = [];
+  for (let i = 0; i < pieces; i++) {
+    const extra = rem > 0 ? 1 : 0;
+    if (rem > 0) rem -= 1;
+    result.push(base + extra);
+  }
+  return result;
+}
+
+/**
+ * Résout la surface sonore de pas au sol à partir de la zone, de l'île,
+ * des coordonnées monde et de la présence sur le pont du Patte-au-Vent.
+ */
+export function resolveFootstepSurface(
+  zoneId: ZoneId,
+  islandId: IslandId,
+  x: number,
+  z: number,
+  onShipDeck: boolean,
+): TerrainSurfaceId {
+  if (onShipDeck) return 'wood_deck';
+  if (zoneId !== 'overworld') return 'dungeon_tiles';
+
+  const shore = sampleShorelineField(x, z);
+  const biome =
+    islandId === 'felingard'
+      ? getBiomeAt(x, z)
+      : getBiomeAtNewIsland(islandId, x, z);
+
+  if (biome === 'tropical') return 'sand';
+  if (biome === 'frost' || biome === 'mountain') return 'snow_ice';
+  if (biome === 'village' || biome === 'mystic') return 'rock';
+  if (shore.signedDistance >= -4.2) {
+    return shore.coastKind === 'beach' ? 'sand' : 'rock';
+  }
+  return 'grass';
+}
 
 function createEmptyDisembarkStatus(): ShipDisembarkStatus {
   return {
@@ -208,6 +307,15 @@ export class GameEngine {
   private dodgeGhostAccum = 0;
   private shipRefusalCooldown = 0;
   private disembarkChangedIsland = false;
+  private footstepDistanceAccum = 0;
+  private lowHpAlertCooldown = 0;
+  private wasLowHp = false;
+  private activeHazardSlowFactor = 0;
+  private pendingCinematicDialogue: { lines: DialogueLine[]; action: DialogueAction } | null = null;
+  private companionChimeCooldown = 0;
+  private companionReactionCooldown = 0;
+  private lastCompanionGuideTargetId = '';
+  private readonly decorHitCooldowns = new Map<string, number>();
 
   constructor(options?: GameEngineOptions) {
     this.storage = options?.storage;
@@ -235,6 +343,12 @@ export class GameEngine {
         bobPhase: 0,
         y: 0,
         onShipDeck: false,
+        mode: 'follow',
+        guideKind: null,
+        guidePulse: 0,
+        reactionKind: null,
+        reactionTimer: 0,
+        reactionDuration: 0,
       },
       ship: createInitialShipState(),
       enemies: [],
@@ -266,6 +380,24 @@ export class GameEngine {
       activeBossId: null,
       victoryShown: false,
       inVillage: true,
+      pendingInteraction: null,
+      openingChest: null,
+      portalTransition: null,
+      deathSequence: null,
+      inCombat: false,
+      combatMusicTimer: 0,
+      timeScale: 1,
+      perfectDodgeTimer: 0,
+      lowHpActive: false,
+      lowHpIntensity: 0,
+      lastAttackMeta: null,
+      playerProjectiles: [],
+      lootDrops: [],
+      enemyProjectiles: [],
+      hazardZones: [],
+      cinematic: null,
+      playedBossIntros: [],
+      options: { ...DEFAULT_GAME_OPTIONS },
     };
 
     // Peuple immédiatement l'overworld pour le survol animé de l'écran titre
@@ -291,6 +423,9 @@ export class GameEngine {
     this.state.ship = createInitialShipState();
     this.shipRefusalCooldown = 0;
     this.disembarkChangedIsland = false;
+    this.footstepDistanceAccum = 0;
+    this.lowHpAlertCooldown = 0;
+    this.wasLowHp = false;
     this.state.quests = createInitialQuests();
     this.state.trackedQuestId = 'main_dragon_blood';
     this.state.openedChestIds = [];
@@ -305,6 +440,42 @@ export class GameEngine {
     this.state.screenShake = 0;
     this.state.victoryShown = false;
     this.state.activeModal = 'none';
+    this.state.pendingInteraction = null;
+    this.state.openingChest = null;
+    this.state.portalTransition = null;
+    this.state.deathSequence = null;
+    this.state.inCombat = false;
+    this.state.combatMusicTimer = 0;
+    this.state.timeScale = 1;
+    this.state.perfectDodgeTimer = 0;
+    this.state.lowHpActive = false;
+    this.state.lowHpIntensity = 0;
+    this.state.lastAttackMeta = null;
+    this.state.playerProjectiles = [];
+    this.state.lootDrops = [];
+    this.state.enemyProjectiles = [];
+    this.state.hazardZones = [];
+    this.state.cinematic = null;
+    this.state.playedBossIntros = [];
+    this.activeHazardSlowFactor = 0;
+    this.pendingCinematicDialogue = null;
+    this.companionChimeCooldown = 0;
+    this.companionReactionCooldown = 0;
+    this.lastCompanionGuideTargetId = '';
+    this.decorHitCooldowns.clear();
+    this.state.companion = {
+      x: freshPlayer.x - 1.4,
+      z: freshPlayer.z - 0.8,
+      bobPhase: 0,
+      y: 0,
+      onShipDeck: false,
+      mode: 'follow',
+      guideKind: null,
+      guidePulse: 0,
+      reactionKind: null,
+      reactionTimer: 0,
+      reactionDuration: 0,
+    };
     this.state.screen = 'playing';
 
     this.loadZone('overworld', { ...OVERWORLD_DATA.playerStart }, true);
@@ -323,7 +494,11 @@ export class GameEngine {
     p.equipped = { ...STARTING_EQUIPMENT, ...saved.player.equipped };
     p.inventory = {};
     for (const [id, item] of Object.entries(saved.player.inventory)) {
-      p.inventory[id] = { id: item.id, level: item.level };
+      p.inventory[id] = {
+        id: item.id,
+        level: item.level,
+        upgradeLevel: item.upgradeLevel ?? 0,
+      };
     }
     p.spellLevels = { ...saved.player.spellLevels };
     p.hasRunicKey = saved.player.hasRunicKey;
@@ -361,9 +536,47 @@ export class GameEngine {
       onCompleteAction: 'none',
     };
     this.state.activeModal = 'none';
+    this.state.timeScale = 1;
+    this.state.perfectDodgeTimer = 0;
+    this.state.lowHpActive = false;
+    this.state.lowHpIntensity = 0;
+    this.state.lastAttackMeta = null;
+    this.state.playerProjectiles = [];
+    this.state.lootDrops = [];
+    this.state.enemyProjectiles = [];
+    this.state.hazardZones = [];
+    this.state.cinematic = null;
+    this.state.playedBossIntros = [];
+    this.activeHazardSlowFactor = 0;
+    this.pendingCinematicDialogue = null;
+    this.companionChimeCooldown = 0;
+    this.companionReactionCooldown = 0;
+    this.lastCompanionGuideTargetId = '';
+    this.decorHitCooldowns.clear();
+    this.state.companion = {
+      x: p.x - 1.4,
+      z: p.z - 0.8,
+      bobPhase: 0,
+      y: 0,
+      onShipDeck: false,
+      mode: 'follow',
+      guideKind: null,
+      guidePulse: 0,
+      reactionKind: null,
+      reactionTimer: 0,
+      reactionDuration: 0,
+    };
+    if (saved.options?.wildlifeDensity) {
+      this.state.options = { wildlifeDensity: saved.options.wildlifeDensity };
+    } else if (!this.state.options) {
+      this.state.options = { ...DEFAULT_GAME_OPTIONS };
+    }
     this.state.screen = 'playing';
     this.shipRefusalCooldown = 0;
     this.disembarkChangedIsland = false;
+    this.footstepDistanceAccum = 0;
+    this.lowHpAlertCooldown = 0;
+    this.wasLowHp = false;
 
     // Restauration / migration du bateau (v2 avec ship ou v1 sans ship)
     const ship = createInitialShipState();
@@ -442,8 +655,22 @@ export class GameEngine {
     return saveGame(snapshot, this.storage);
   }
 
+  public setWildlifeDensity(density: WildlifeDensity): void {
+    this.state.options.wildlifeDensity = density;
+    if (this.state.screen === 'playing') {
+      this.saveCurrentGame();
+    }
+  }
+
   public returnToTitle(): void {
     this.state.activeModal = 'none';
+    this.state.cinematic = null;
+    this.state.portalTransition = null;
+    this.state.timeScale = 1;
+    this.state.enemyProjectiles = [];
+    this.state.hazardZones = [];
+    this.activeHazardSlowFactor = 0;
+    this.pendingCinematicDialogue = null;
     this.state.dialogue = {
       active: false,
       lines: [],
@@ -459,6 +686,7 @@ export class GameEngine {
     this.state.ship = createInitialShipState();
     this.state.player.elevationY = 0;
     this.state.player.onShipDeck = false;
+    this.footstepDistanceAccum = 0;
     this.state.companion.y = 0;
     this.state.companion.onShipDeck = false;
     this.shipRefusalCooldown = 0;
@@ -496,6 +724,8 @@ export class GameEngine {
     p.shieldHp = 0;
     p.shieldMaxHp = 0;
     p.shieldTimer = 0;
+    p.activeStatuses = [];
+    p.perfectDodgeBuffTimer = 0;
     for (const sid of SPELL_ORDER) {
       p.spellCooldowns[sid] = 0;
     }
@@ -504,6 +734,24 @@ export class GameEngine {
     this.state.companion.onShipDeck = false;
 
     this.state.activeModal = 'none';
+    this.state.pendingInteraction = null;
+    this.state.openingChest = null;
+    this.state.portalTransition = null;
+    this.state.deathSequence = null;
+    this.state.inCombat = false;
+    this.state.combatMusicTimer = 0;
+    this.state.timeScale = 1;
+    this.state.perfectDodgeTimer = 0;
+    this.state.lowHpActive = false;
+    this.state.lowHpIntensity = 0;
+    this.state.lastAttackMeta = null;
+    this.state.playerProjectiles = [];
+    this.state.lootDrops = [];
+    this.state.enemyProjectiles = [];
+    this.state.hazardZones = [];
+    this.state.cinematic = null;
+    this.activeHazardSlowFactor = 0;
+    this.pendingCinematicDialogue = null;
     this.state.dialogue = {
       active: false,
       lines: [],
@@ -513,6 +761,9 @@ export class GameEngine {
     this.state.screen = 'playing';
     this.shipRefusalCooldown = 0;
     this.disembarkChangedIsland = false;
+    this.footstepDistanceAccum = 0;
+    this.lowHpAlertCooldown = 0;
+    this.wasLowHp = false;
 
     // Évite tout soft-lock : si le navire était en mer ou sur une autre île,
     // on le rapatrie au mouillage côtier par défaut de Félingard.
@@ -583,13 +834,46 @@ export class GameEngine {
   }
 
   public getCurrentMusicTrack(): MusicTrackId {
+    if (this.state.screen === 'title') {
+      return 'menu';
+    }
+    if (this.state.screen === 'victory') {
+      return 'victory';
+    }
+    if (
+      this.state.cinematic?.kind === 'boss_death' &&
+      this.state.cinematic.bossTypeId === 'boss_dragon_claw'
+    ) {
+      return 'victory';
+    }
     if (this.state.zoneId === 'dungeon_dragon_lair') {
+      const activeBoss = this.getActiveBoss();
+      if (activeBoss?.typeId === 'boss_dragon_claw' && activeBoss.phase === 2) {
+        return 'boss_phase2';
+      }
+      if (this.state.defeatedBossIds.includes('boss_dragon_claw') && !activeBoss) {
+        return 'dungeon';
+      }
       return 'boss';
     }
+    const isCombatActive =
+      Boolean(this.state.inCombat) || (this.state.combatMusicTimer ?? 0) > 0;
     if (this.state.zoneId === 'dungeon_ghost_cave') {
       const activeBoss = this.getActiveBoss();
       if (activeBoss) return 'boss';
+      if (isCombatActive) return 'combat';
       return 'dungeon';
+    }
+    if (
+      this.state.ship.mode === 'sailing' ||
+      this.state.ship.mode === 'boarding' ||
+      this.state.ship.mode === 'docking' ||
+      this.state.ship.mode === 'disembarking'
+    ) {
+      return 'maritime';
+    }
+    if (isCombatActive) {
+      return 'combat';
     }
     return 'overworld';
   }
@@ -600,18 +884,18 @@ export class GameEngine {
 
   public step(rawDt: number, input: InputState): void {
     // Clamp obligatoire du delta-time (max 50 ms)
-    const dt = Math.min(Math.max(rawDt, 0), 0.05);
+    const clampedRawDt = Math.min(Math.max(rawDt, 0), 0.05);
 
     // Décroissance des transitions visuelles et du screen shake (même en hitstop)
     if (this.state.transitionTimer > 0) {
-      this.state.transitionTimer = Math.max(0, this.state.transitionTimer - dt);
-      this.state.transitionFade = clamp(this.state.transitionTimer / 0.45, 0, 1);
-    } else {
+      this.state.transitionTimer = Math.max(0, this.state.transitionTimer - clampedRawDt);
+      this.state.transitionFade = clamp(this.state.transitionTimer / PORTAL_EXIT_DURATION, 0, 1);
+    } else if (!this.state.portalTransition) {
       this.state.transitionFade = 0;
     }
 
     if (this.state.screenShake > 0) {
-      this.state.screenShake = Math.max(0, this.state.screenShake - dt * 2.4);
+      this.state.screenShake = Math.max(0, this.state.screenShake - clampedRawDt * 2.4);
     }
 
     // Écran Titre / Défaite / Victoire : horloge ambiante + douce flottaison du bateau
@@ -620,18 +904,22 @@ export class GameEngine {
       this.state.screen === 'defeat' ||
       this.state.screen === 'victory'
     ) {
-      this.state.time += dt;
+      this.state.timeScale = 1;
+      this.state.perfectDodgeTimer = 0;
+      this.state.time += clampedRawDt;
       if (this.state.zoneId === 'overworld' && this.state.ship.mode === 'parked') {
-        updateShipIdleBobbing(this.state.ship, dt);
+        updateShipIdleBobbing(this.state.ship, clampedRawDt);
       }
       return;
     }
 
     // Dialogue actif : bloque le combat jusqu'à validation
     if (this.state.dialogue.active) {
-      this.state.time += dt;
+      this.state.timeScale = 1;
+      this.state.perfectDodgeTimer = 0;
+      this.state.time += clampedRawDt;
       if (this.state.zoneId === 'overworld' && this.state.ship.mode === 'parked') {
-        updateShipIdleBobbing(this.state.ship, dt);
+        updateShipIdleBobbing(this.state.ship, clampedRawDt);
       }
       if (
         input.confirmPressed ||
@@ -671,18 +959,44 @@ export class GameEngine {
 
     // Hitstop : fige la simulation quelques dizaines de ms sur impacts majeurs
     if (this.state.hitstopTimer > 0) {
-      this.state.hitstopTimer = Math.max(0, this.state.hitstopTimer - dt);
+      this.state.hitstopTimer = Math.max(0, this.state.hitstopTimer - clampedRawDt);
       return;
     }
 
+    // Cinématique de Boss (Intro / Mort) : invulnérabilité joueur, verrouillage contrôles & watchdog anti-blocage
+    if (this.state.cinematic) {
+      this.updateCinematic(clampedRawDt);
+      return;
+    }
+
+    // Ralenti micro-temporel d'esquive parfaite (décrémenté en temps réel non ralenti)
+    if (this.state.perfectDodgeTimer > 0) {
+      this.state.perfectDodgeTimer = Math.max(
+        0,
+        this.state.perfectDodgeTimer - clampedRawDt,
+      );
+      this.state.timeScale =
+        this.state.perfectDodgeTimer > 0 ? PERFECT_DODGE_TIMESCALE : 1.0;
+    } else {
+      this.state.timeScale = 1.0;
+    }
+
+    const dt = clampedRawDt * this.state.timeScale;
+
     // Avance les horloges de jeu
     this.state.time += dt;
-    this.state.runStats.playTimeSec += dt;
+    this.state.runStats.playTimeSec += clampedRawDt;
     if (this.shipRefusalCooldown > 0) {
-      this.shipRefusalCooldown = Math.max(0, this.shipRefusalCooldown - dt);
+      this.shipRefusalCooldown = Math.max(0, this.shipRefusalCooldown - clampedRawDt);
     }
 
     const player = this.state.player;
+    if ((player.perfectDodgeBuffTimer ?? 0) > 0) {
+      player.perfectDodgeBuffTimer = Math.max(
+        0,
+        (player.perfectDodgeBuffTimer ?? 0) - clampedRawDt,
+      );
+    }
 
     // --- 1. Mise à jour des timers joueur, régénération et VFX transitoires ---
     // (Actifs y compris pendant les transitions/navigation pour ne jamais figer les VFX)
@@ -717,11 +1031,32 @@ export class GameEngine {
     updatePlayerRegen(player, dt, this.state.events);
     updatePlayerShield(player, dt);
 
-    // Effets visuels temporaires
+    const eventStartIdx = this.state.events.length;
+
+    // Effets visuels temporaires (inclut les vagues de Chute d'Étoiles)
     this.updateTransientVisuals(dt);
+
+    // --- Séquence animée de mort du héros (~2.0 s avant l'écran Défaite) ---
+    if (this.state.deathSequence) {
+      this.updateDeathSequence(dt);
+      return;
+    }
+
+    // --- Séquence animée d'entrée / sortie de portail (non ralentie par timeScale) ---
+    if (this.state.portalTransition) {
+      this.updatePortalTransition(clampedRawDt);
+      return;
+    }
+
+    // --- Séquence animée d'ouverture lente de coffre (~1.35 s, loot strictement à la fin) ---
+    if (this.state.openingChest) {
+      this.updateOpeningChest(dt, input);
+      return;
+    }
 
     // --- Machine à états maritime (boarding | sailing | docking | disembarking) ---
     if (this.state.ship.mode !== 'parked') {
+      this.state.pendingInteraction = null;
       this.stepMaritimeState(dt, input);
       return;
     }
@@ -732,33 +1067,42 @@ export class GameEngine {
     }
 
     // --- 2. Orientation & Visée ---
+    const playerStunned = isEntityStunned(player);
     const moveMag = Math.hypot(input.moveX, input.moveZ);
-    if (input.usingPointerAim && input.aimWorldPos) {
-      player.aimAngle = angleBetween(
-        player.x,
-        player.z,
-        input.aimWorldPos.x,
-        input.aimWorldPos.z,
-      );
-      const aimCos = Math.cos(player.aimAngle);
-      if (Math.abs(aimCos) > 0.1 && (input.attackPressed || moveMag < 0.05)) {
-        player.facingX = aimCos >= 0 ? 1 : -1;
+    if (!playerStunned) {
+      if (input.usingPointerAim && input.aimWorldPos) {
+        player.aimAngle = angleBetween(
+          player.x,
+          player.z,
+          input.aimWorldPos.x,
+          input.aimWorldPos.z,
+        );
+        const aimCos = Math.cos(player.aimAngle);
+        if (Math.abs(aimCos) > 0.1 && (input.attackPressed || moveMag < 0.05)) {
+          player.facingX = aimCos >= 0 ? 1 : -1;
+        }
+      } else if (moveMag > 0.05) {
+        player.aimAngle = Math.atan2(input.moveZ, input.moveX);
       }
-    } else if (moveMag > 0.05) {
-      player.aimAngle = Math.atan2(input.moveZ, input.moveX);
-    }
 
-    if (Math.abs(input.moveX) > 0.05 && player.dodgeTimer <= 0) {
-      player.facingX = input.moveX >= 0 ? 1 : -1;
+      if (Math.abs(input.moveX) > 0.05 && player.dodgeTimer <= 0) {
+        player.facingX = input.moveX >= 0 ? 1 : -1;
+      }
     }
 
     // --- 3. Interaction contextuelle ([E] prioritaire sur Sort 2) ---
     this.updateNearestInteractable();
     let interactedThisTick = false;
-    if (input.interactPressed && this.state.nearestInteractable) {
-      this.interactWith(this.state.nearestInteractable);
+    if (!playerStunned && input.interactPressed && this.state.nearestInteractable) {
+      this.initiateInteractionOrApproach(this.state.nearestInteractable, false);
       interactedThisTick = true;
-      if (this.state.ship.mode !== 'parked') return;
+      if (
+        this.state.ship.mode !== 'parked' ||
+        this.state.portalTransition ||
+        this.state.openingChest
+      ) {
+        return;
+      }
       if (
         this.state.dialogue.active ||
         this.state.activeModal !== 'none' ||
@@ -768,8 +1112,19 @@ export class GameEngine {
       }
     }
 
-    // --- 4. Roulade d'esquive (dodge-cancel prioritaire sur mêlée) ---
-    if (input.dodgePressed) {
+    // Annulation propre de l'approche automatique si le joueur reprend la main
+    if (
+      this.state.pendingInteraction &&
+      (moveMag > 0.12 ||
+        input.dodgePressed ||
+        input.attackPressed ||
+        SPELL_ORDER.some((sid) => !(sid === 'lightnyan' && interactedThisTick) && input.spellPressed[sid]))
+    ) {
+      this.state.pendingInteraction = null;
+    }
+
+    // --- 4. Roulade d'esquive (dodge-cancel prioritaire sur mêlée + détection Esquive Parfaite) ---
+    if (!playerStunned && input.dodgePressed) {
       const dodged = executeDodgeRoll(
         player,
         input.moveX,
@@ -779,11 +1134,28 @@ export class GameEngine {
       );
       if (dodged) {
         this.dodgeGhostAccum = 0;
+        this.checkPerfectDodge();
       }
     }
 
-    // --- 5. Déplacement du joueur ---
-    if (player.dodgeTimer > 0) {
+    // --- 5. Déplacement du joueur (ou approche automatique vers un interactable) ---
+    const preMoveX = player.x;
+    const preMoveZ = player.z;
+    if (this.state.pendingInteraction && player.dodgeTimer <= 0 && !playerStunned) {
+      this.stepPendingInteraction(dt);
+      const movedPending = Math.hypot(player.x - preMoveX, player.z - preMoveZ);
+      this.accumulateFootstep(movedPending);
+      if (
+        this.state.ship.mode !== 'parked' ||
+        this.state.portalTransition ||
+        this.state.openingChest ||
+        this.state.dialogue.active ||
+        this.state.activeModal !== 'none' ||
+        this.state.screen !== 'playing'
+      ) {
+        return;
+      }
+    } else if (player.dodgeTimer > 0) {
       const dx = (player.dodgeDirX ?? Math.cos(player.aimAngle)) * DODGE_SPEED;
       const dz = (player.dodgeDirZ ?? Math.sin(player.aimAngle)) * DODGE_SPEED;
       player.vx = dx;
@@ -811,13 +1183,18 @@ export class GameEngine {
         });
       }
     } else {
-      let mx = input.moveX;
-      let mz = input.moveZ;
+      let mx = playerStunned ? 0 : input.moveX;
+      let mz = playerStunned ? 0 : input.moveZ;
       if (moveMag > 1) {
         mx /= moveMag;
         mz /= moveMag;
       }
-      const speedScale = player.attackAnimTimer > 0 ? 0.55 : 1.0;
+      const totalSlow = Math.min(
+        0.65,
+        Math.max(getChillSlowFactor(player), this.activeHazardSlowFactor),
+      );
+      const speedScale =
+        (player.attackAnimTimer > 0 ? 0.55 : 1.0) * (1 - totalSlow);
       let vx = mx * PLAYER_MOVE_SPEED * speedScale;
       let vz = mz * PLAYER_MOVE_SPEED * speedScale;
 
@@ -846,6 +1223,8 @@ export class GameEngine {
         player.x = resolved.x;
         player.z = resolved.z;
       }
+      const movedOnFoot = Math.hypot(player.x - preMoveX, player.z - preMoveZ);
+      this.accumulateFootstep(movedOnFoot);
     }
 
     this.state.inVillage =
@@ -853,8 +1232,20 @@ export class GameEngine {
       this.state.islandId === 'felingard' &&
       isInsideVillage(player.x, player.z);
 
-    // --- 6. Attaque Mêlée (Combo 3 coups + auto-aim doux hors visée souris explicite) ---
+    // Décroissance des cooldowns de réaction du décor interactif
+    if (this.decorHitCooldowns.size > 0) {
+      for (const [key, cd] of this.decorHitCooldowns.entries()) {
+        if (cd <= dt) {
+          this.decorHitCooldowns.delete(key);
+        } else {
+          this.decorHitCooldowns.set(key, cd - dt);
+        }
+      }
+    }
+
+    // --- 6. Attaque Mêlée / Distance (combatProfile) ---
     if (
+      !playerStunned &&
       (input.attackPressed || (input.attackHeld && player.attackCooldown <= 0)) &&
       player.dodgeTimer <= 0
     ) {
@@ -867,6 +1258,8 @@ export class GameEngine {
         {
           rng: this.rng,
           autoAim: !hasExplicitPointerAim,
+          projectiles: this.state.playerProjectiles,
+          telegraphs: this.state.telegraphs,
           applyDash: (dx, dz) => {
             const next = this.resolvePositionInCurrentZone(
               player.x + dx,
@@ -881,6 +1274,13 @@ export class GameEngine {
       );
 
       if (meleeRes.executed) {
+        this.state.lastAttackMeta = meleeRes.attackMeta ?? null;
+        if (meleeRes.attackMeta && meleeRes.attackMeta.attackShape !== 'projectile') {
+          this.triggerDecorHitsForMelee(meleeRes.attackMeta, player.x, player.z);
+        }
+        if (meleeRes.hitEnemies.length > 0) {
+          this.markCombatActivity();
+        }
         this.state.screenShake = Math.max(
           this.state.screenShake,
           meleeRes.shakeAmount,
@@ -888,7 +1288,7 @@ export class GameEngine {
         if (meleeRes.triggeredHitstop) {
           this.state.hitstopTimer = Math.max(
             this.state.hitstopTimer,
-            HITSTOP_MAJOR_DURATION,
+            meleeRes.hitstopSec > 0 ? meleeRes.hitstopSec : HITSTOP_MAJOR_DURATION,
           );
         }
         for (const killed of meleeRes.killedEnemies) {
@@ -897,23 +1297,62 @@ export class GameEngine {
       }
     }
 
-    // --- 7. Sorts (1-4 / Q E R F — E ignoré si interaction exécutée ce tick) ---
-    for (const sid of SPELL_ORDER) {
-      if (sid === 'lightnyan' && interactedThisTick) continue;
-      if (input.spellPressed[sid]) {
-        this.castSpellById(sid);
+    // --- 7. Sorts (1-7 — E ignoré si interaction exécutée ce tick) ---
+    if (!playerStunned) {
+      for (const sid of SPELL_ORDER) {
+        if (sid === 'lightnyan' && interactedThisTick) continue;
+        if (input.spellPressed[sid]) {
+          this.castSpellById(
+            sid,
+            input.usingPointerAim ? input.aimWorldPos : null,
+          );
+        }
       }
     }
 
-    // --- 8. Compagnon Miaou-sprit ---
-    const targetCompX = player.x - player.facingX * 1.4;
-    const targetCompZ = player.z - 0.8;
-    const followAlpha = 1 - Math.exp(-6 * dt);
-    this.state.companion.x += (targetCompX - this.state.companion.x) * followAlpha;
-    this.state.companion.z += (targetCompZ - this.state.companion.z) * followAlpha;
-    this.state.companion.bobPhase += dt * 4;
+    // --- 7b. Mise à jour des projectiles du joueur (Bâtons & Arcs/Arbalètes) ---
+    this.triggerDecorHitsForProjectiles(dt);
+    const projRes = updatePlayerProjectiles(
+      this.state.playerProjectiles,
+      this.state.enemies,
+      player,
+      this.state.events,
+      {
+        dt,
+        rng: this.rng,
+        telegraphs: this.state.telegraphs,
+        isObstacleHit: (px, pz, pr) => this.isProjectileBlocked(px, pz, pr),
+      },
+    );
+    if (projRes.hitEnemies.length > 0) {
+      this.markCombatActivity();
+    }
+    if (projRes.shakeAmount > 0) {
+      this.state.screenShake = Math.max(this.state.screenShake, projRes.shakeAmount);
+    }
+    if (projRes.triggeredHitstop) {
+      this.state.hitstopTimer = Math.max(
+        this.state.hitstopTimer,
+        projRes.hitstopSec > 0 ? projRes.hitstopSec : HITSTOP_MAJOR_DURATION,
+      );
+    }
+    for (const killed of projRes.killedEnemies) {
+      this.handleEnemyKilled(killed);
+    }
 
-    // --- 9. Pièges, IA Ennemis & Télégraphes ---
+    // Réaction visuelle du Miaou-sprit sur coup critique joueur (mêlée, projectile ou sort)
+    for (let ei = eventStartIdx; ei < this.state.events.length; ei++) {
+      const ev = this.state.events[ei];
+      if (ev.type === 'hit_enemy' && ev.isCrit) {
+        this.triggerCompanionReaction('crit');
+        break;
+      }
+    }
+
+    // --- 8. Compagnon Miaou-sprit actif ---
+    this.updateCompanion(dt);
+
+    // --- 9. Pièges, IA Ennemis, Télégraphes & Statuts ---
     updateTraps(this.state.traps, player, this.state.telegraphs, dt);
 
     const enemyRes = updateEnemies(
@@ -944,23 +1383,153 @@ export class GameEngine {
       player,
       dt,
       this.state.events,
+      {
+        rng: this.rng,
+        enemyProjectiles: this.state.enemyProjectiles,
+        hazardZones: this.state.hazardZones,
+      },
     );
 
-    if (tgRes.maxShake > 0) {
-      this.state.screenShake = Math.max(this.state.screenShake, tgRes.maxShake);
+    const eProjRes = updateEnemyProjectiles(
+      this.state.enemyProjectiles,
+      this.state.enemies,
+      player,
+      dt,
+      this.state.events,
+      {
+        rng: this.rng,
+        isObstacleHit: (px, pz, pr) => this.isProjectileBlocked(px, pz, pr),
+      },
+    );
+
+    const hazRes = updateHazardZones(
+      this.state.hazardZones,
+      player,
+      dt,
+      this.state.events,
+      { rng: this.rng },
+    );
+    this.activeHazardSlowFactor = hazRes.slowFactor;
+
+    if (tgRes.playerHit || eProjRes.playerHit || hazRes.playerHit) {
+      this.markCombatActivity();
     }
 
-    if (tgRes.playerDied || player.hp <= 0) {
-      this.state.screen = 'defeat';
-      this.state.activeModal = 'none';
-      this.state.telegraphs = [];
+    const combinedShake = Math.max(tgRes.maxShake, eProjRes.maxShake);
+    if (combinedShake > 0) {
+      this.state.screenShake = Math.max(this.state.screenShake, combinedShake);
+    }
+
+    const playerStatusRes = updatePlayerStatuses(player, dt, this.state.events);
+    const statusKilledEnemies = updateEnemyStatuses(
+      this.state.enemies,
+      dt,
+      this.state.events,
+    );
+    for (const killed of statusKilledEnemies) {
+      this.handleEnemyKilled(killed);
+    }
+
+    if (
+      tgRes.playerDied ||
+      eProjRes.playerDied ||
+      hazRes.playerDied ||
+      playerStatusRes.died ||
+      player.hp <= 0
+    ) {
+      this.state.lowHpActive = false;
+      this.state.lowHpIntensity = 0;
+      this.startHeroDeathSequence();
       return;
     }
 
-    // --- 10. Boss actif, interactable le plus proche & flèche dorée ---
+    // --- 10. Butin physique magnétique, musique, boss actif, intro boss, interactable, flèche dorée & PV bas ---
+    this.updateLootDrops(dt);
+    this.updateCombatMusicState(dt);
     this.updateActiveBoss();
+    this.maybeTriggerBossIntro();
     this.updateNearestInteractable();
     this.refreshQuestTarget();
+    this.updateLowHpAlert(clampedRawDt);
+  }
+
+  private accumulateFootstep(movedDist: number): void {
+    if (
+      movedDist <= 1e-5 ||
+      this.state.screen !== 'playing' ||
+      this.state.ship.mode !== 'parked' ||
+      this.state.player.dodgeTimer > 0 ||
+      this.state.deathSequence ||
+      this.state.dialogue.active ||
+      this.state.activeModal !== 'none'
+    ) {
+      return;
+    }
+    this.footstepDistanceAccum += movedDist;
+    while (this.footstepDistanceAccum >= FOOTSTEP_STRIDE_DIST) {
+      this.footstepDistanceAccum -= FOOTSTEP_STRIDE_DIST;
+      const p = this.state.player;
+      const terrain = resolveFootstepSurface(
+        this.state.zoneId,
+        this.state.islandId,
+        p.x,
+        p.z,
+        Boolean(p.onShipDeck),
+      );
+      this.state.events.push({
+        type: 'footstep',
+        x: p.x,
+        z: p.z,
+        terrain,
+      });
+      if (this.state.zoneId === 'overworld' && !p.onShipDeck) {
+        const shore = sampleShorelineField(p.x, p.z);
+        if (
+          shore.coastKind === 'beach' &&
+          shore.signedDistance >= -3.6 &&
+          shore.signedDistance <= 0.9
+        ) {
+          this.state.events.push({
+            type: 'shore_splash',
+            x: p.x,
+            z: p.z,
+          });
+        }
+      }
+    }
+  }
+
+  private updateLowHpAlert(dt: number): void {
+    const p = this.state.player;
+    const ratio = p.hp / Math.max(1, p.maxHp);
+    const isLow = p.hp > 0 && ratio < LOW_HP_ALERT_THRESHOLD;
+    this.state.lowHpActive = isLow;
+    this.state.lowHpIntensity = isLow
+      ? clamp((LOW_HP_ALERT_THRESHOLD - ratio) / LOW_HP_ALERT_THRESHOLD, 0.18, 1)
+      : 0;
+
+    if (
+      this.state.screen !== 'playing' ||
+      this.state.deathSequence ||
+      this.state.dialogue.active ||
+      this.state.activeModal !== 'none' ||
+      p.hp <= 0
+    ) {
+      return;
+    }
+    if (this.lowHpAlertCooldown > 0) {
+      this.lowHpAlertCooldown = Math.max(0, this.lowHpAlertCooldown - dt);
+    }
+    if (isLow && (!this.wasLowHp || this.lowHpAlertCooldown <= 0)) {
+      this.state.events.push({
+        type: 'low_hp_alert',
+        x: p.x,
+        z: p.z,
+        value: Math.round(ratio * 100),
+      });
+      this.lowHpAlertCooldown = LOW_HP_ALERT_COOLDOWN_SEC;
+    }
+    this.wasLowHp = isLow;
   }
 
   // ==========================================================================
@@ -968,6 +1537,23 @@ export class GameEngine {
   // ==========================================================================
 
   public loadZone(zoneId: ZoneId, spawnPos: Vec2, emitEvent = true): void {
+    // Récupère proprement le butin physique restant avant de changer de zone (si vivant)
+    if (this.state.player.hp > 0 && this.state.lootDrops.length > 0) {
+      for (const drop of this.state.lootDrops) {
+        this.collectLootDrop(drop);
+      }
+    }
+    this.state.lootDrops = [];
+    this.state.playerProjectiles = [];
+    this.state.enemyProjectiles = [];
+    this.state.hazardZones = [];
+    this.state.cinematic = null;
+    this.activeHazardSlowFactor = 0;
+    this.pendingCinematicDialogue = null;
+    this.state.timeScale = 1;
+    this.state.perfectDodgeTimer = 0;
+    this.state.lastAttackMeta = null;
+
     this.state.zoneId = zoneId;
     this.state.player.x = spawnPos.x;
     this.state.player.z = spawnPos.z;
@@ -978,15 +1564,24 @@ export class GameEngine {
     this.state.player.knockbackVz = 0;
     this.state.player.elevationY = 0;
     this.state.player.onShipDeck = false;
+    this.footstepDistanceAccum = 0;
 
     this.state.companion.x = spawnPos.x - this.state.player.facingX * 1.4;
     this.state.companion.z = spawnPos.z - 0.8;
     this.state.companion.y = 0;
     this.state.companion.onShipDeck = false;
+    this.state.companion.mode = 'follow';
+    this.state.companion.guideKind = null;
+    this.state.companion.guideTargetX = undefined;
+    this.state.companion.guideTargetZ = undefined;
+    this.lastCompanionGuideTargetId = '';
+    this.decorHitCooldowns.clear();
 
     this.state.telegraphs = [];
     this.state.activeSpellEffects = [];
     this.state.dodgeGhosts = [];
+    this.state.pendingInteraction = null;
+    this.state.openingChest = null;
     this.state.hitstopTimer = 0;
     this.state.screenShake = 0;
     this.state.enemies = [];
@@ -1037,13 +1632,14 @@ export class GameEngine {
     this.updateActiveBoss();
     this.refreshQuestTarget();
 
-    this.state.transitionTimer = 0.45;
+    this.state.transitionTimer = PORTAL_EXIT_DURATION;
     this.state.transitionFade = 1;
 
     if (emitEvent) {
       this.state.events.push({
         type: 'zone_transition',
         zoneId,
+        islandId: this.state.islandId,
         x: spawnPos.x,
         z: spawnPos.z,
       });
@@ -1060,12 +1656,17 @@ export class GameEngine {
       this.updateNearestInteractable();
       return this.tryInitiateDocking();
     }
-    if (this.state.ship.mode !== 'parked') {
+    if (
+      this.state.ship.mode !== 'parked' ||
+      this.state.openingChest ||
+      this.state.portalTransition ||
+      this.state.deathSequence
+    ) {
       return false;
     }
     this.updateNearestInteractable();
     if (!this.state.nearestInteractable) return false;
-    this.interactWith(this.state.nearestInteractable);
+    this.interactWith(this.state.nearestInteractable, true);
     return true;
   }
 
@@ -1074,6 +1675,8 @@ export class GameEngine {
     if (!chest || chest.opened || chest.locked) return false;
 
     chest.opened = true;
+    chest.opening = false;
+    chest.openingProgress = 1;
     if (!this.state.openedChestIds.includes(chest.id)) {
       this.state.openedChestIds.push(chest.id);
     }
@@ -1083,6 +1686,12 @@ export class GameEngine {
     const gold = chest.loot.gold;
     if (gold > 0) {
       p.gold += gold;
+      this.state.events.push({
+        type: 'gold_pickup',
+        x: chest.x,
+        z: chest.z,
+        value: gold,
+      });
     }
 
     if (chest.loot.grantsRunicKey) {
@@ -1281,6 +1890,30 @@ export class GameEngine {
     return result;
   }
 
+  public upgradeEquipment(itemId: string): EquipmentUpgradeResult {
+    const result = progressionUpgradeEquipment(
+      this.state.player,
+      itemId,
+      this.state.events,
+    );
+    if (result.success) {
+      this.saveCurrentGame();
+    }
+    return result;
+  }
+
+  public buyEquipment(itemId: string): EquipmentPurchaseResult {
+    const result = progressionBuyEquipment(
+      this.state.player,
+      itemId,
+      this.state.events,
+    );
+    if (result.success) {
+      this.saveCurrentGame();
+    }
+    return result;
+  }
+
   public acceptQuest(questId: QuestId): boolean {
     const res = questsAcceptQuest(
       this.state.quests,
@@ -1316,12 +1949,15 @@ export class GameEngine {
     return true;
   }
 
-  public castSpellById(spellId: SpellId): boolean {
+  public castSpellById(spellId: SpellId, aimWorldPos?: Vec2 | null): boolean {
     if (
       this.state.screen !== 'playing' ||
       this.state.activeModal !== 'none' ||
       this.state.dialogue.active ||
-      this.state.ship.mode !== 'parked'
+      this.state.ship.mode !== 'parked' ||
+      this.state.deathSequence ||
+      this.state.portalTransition ||
+      this.state.openingChest
     ) {
       return false;
     }
@@ -1337,11 +1973,19 @@ export class GameEngine {
         resolveDashPosition: (x, z) =>
           this.resolvePositionInCurrentZone(x, z, PLAYER_RADIUS, false),
         clampTargetPoint: (x, z) => this.clampPointToCurrentZone(x, z),
+        aimWorldPos: aimWorldPos ?? null,
         rng: this.rng,
+        telegraphs: this.state.telegraphs,
       },
     );
 
     if (!res.cast) return false;
+
+    this.triggerDecorHitsForSpell(spellId, aimWorldPos ?? null);
+
+    if (res.hitEnemies.length > 0) {
+      this.markCombatActivity();
+    }
 
     this.state.screenShake = Math.max(this.state.screenShake, res.shakeAmount);
     if (res.triggeredHitstop) {
@@ -1361,7 +2005,483 @@ export class GameEngine {
   // Méthodes internes de simulation & collisions
   // ==========================================================================
 
-  private interactWith(interactable: Interactable): void {
+  private initiateInteractionOrApproach(
+    interactable: Interactable,
+    directApi: boolean,
+  ): void {
+    const player = this.state.player;
+    const dx = interactable.x - player.x;
+    const dz = interactable.z - player.z;
+    const distance = Math.hypot(dx, dz);
+
+    // Embarquement navire ou déjà tout près : exécution immédiate (oriente le héros vers la cible)
+    if (
+      directApi ||
+      interactable.type === 'ship_board' ||
+      interactable.type === 'ship_disembark' ||
+      distance <= INTERACT_CLOSE_DIST
+    ) {
+      if (Math.abs(dx) > 0.05) {
+        player.facingX = dx >= 0 ? 1 : -1;
+      }
+      if (distance > 0.05) {
+        player.aimAngle = Math.atan2(dz, dx);
+      }
+      this.interactWith(interactable, directApi);
+      return;
+    }
+
+    // Calcule un point d'arrêt marchable juste devant la cible
+    const dirX = dx / Math.max(distance, 1e-4);
+    const dirZ = dz / Math.max(distance, 1e-4);
+    const standOffset =
+      interactable.type === 'dungeon_entrance' || interactable.type === 'dungeon_exit'
+        ? 0.55
+        : 1.15;
+    const rawStandX = interactable.x - dirX * standOffset;
+    const rawStandZ = interactable.z - dirZ * standOffset;
+    const safeStand = this.resolvePositionInCurrentZone(
+      rawStandX,
+      rawStandZ,
+      PLAYER_RADIUS,
+      false,
+    );
+
+    this.state.pendingInteraction = {
+      interactableId: interactable.id,
+      targetX: interactable.x,
+      targetZ: interactable.z,
+      standX: safeStand.x,
+      standZ: safeStand.z,
+      elapsed: 0,
+      maxDuration: 1.85,
+    };
+  }
+
+  private stepPendingInteraction(dt: number): void {
+    const pending = this.state.pendingInteraction;
+    if (!pending) return;
+
+    const interactable = this.state.interactables.find(
+      (item) => item.id === pending.interactableId && !item.disabled,
+    );
+    if (!interactable) {
+      this.state.pendingInteraction = null;
+      return;
+    }
+
+    pending.elapsed += dt;
+    const player = this.state.player;
+    const toStandX = pending.standX - player.x;
+    const toStandZ = pending.standZ - player.z;
+    const distToStand = Math.hypot(toStandX, toStandZ);
+    const distToTarget = dist(player.x, player.z, interactable.x, interactable.z);
+
+    if (distToStand <= 0.35 || distToTarget <= INTERACT_CLOSE_DIST) {
+      this.state.pendingInteraction = null;
+      player.vx = 0;
+      player.vz = 0;
+      const faceDx = interactable.x - player.x;
+      const faceDz = interactable.z - player.z;
+      if (Math.abs(faceDx) > 0.04) {
+        player.facingX = faceDx >= 0 ? 1 : -1;
+      }
+      if (Math.hypot(faceDx, faceDz) > 0.04) {
+        player.aimAngle = Math.atan2(faceDz, faceDx);
+      }
+      this.interactWith(interactable, false);
+      return;
+    }
+
+    if (pending.elapsed >= pending.maxDuration) {
+      this.state.pendingInteraction = null;
+      player.vx = 0;
+      player.vz = 0;
+      return;
+    }
+
+    const walkSpeed = PLAYER_MOVE_SPEED * 0.88 * (1 - getChillSlowFactor(player));
+    const dirX = toStandX / Math.max(distToStand, 1e-4);
+    const dirZ = toStandZ / Math.max(distToStand, 1e-4);
+    const stepLen = Math.min(distToStand, walkSpeed * dt);
+    const prevX = player.x;
+    const prevZ = player.z;
+    const resolved = this.resolvePositionInCurrentZone(
+      player.x + dirX * stepLen,
+      player.z + dirZ * stepLen,
+      PLAYER_RADIUS,
+      false,
+    );
+    player.x = resolved.x;
+    player.z = resolved.z;
+    player.vx = dirX * walkSpeed;
+    player.vz = dirZ * walkSpeed;
+    if (Math.abs(dirX) > 0.05) {
+      player.facingX = dirX >= 0 ? 1 : -1;
+    }
+    player.aimAngle = Math.atan2(dirZ, dirX);
+
+    // Sécurité anti-blocage : si le héros ne progresse plus contre un obstacle
+    const moved = Math.hypot(player.x - prevX, player.z - prevZ);
+    if (moved < stepLen * 0.12 && pending.elapsed > 0.22) {
+      this.state.pendingInteraction = null;
+      player.vx = 0;
+      player.vz = 0;
+      if (distToTarget <= interactable.radius + 0.35) {
+        this.interactWith(interactable, false);
+      }
+    }
+  }
+
+  private startOpeningChest(chestId: string): boolean {
+    if (this.state.openingChest) return false;
+    const chest = this.state.chests.find((c) => c.id === chestId);
+    if (!chest || chest.opened || chest.locked || chest.opening) return false;
+
+    chest.opening = true;
+    chest.openingProgress = 0;
+    const p = this.state.player;
+    p.vx = 0;
+    p.vz = 0;
+    if (Math.abs(chest.x - p.x) > 0.04) {
+      p.facingX = chest.x >= p.x ? 1 : -1;
+    }
+
+    this.state.openingChest = {
+      chestId: chest.id,
+      elapsed: 0,
+      duration: CHEST_OPEN_DURATION,
+      x: chest.x,
+      z: chest.z,
+    };
+    this.state.events.push({
+      type: 'chest_opening_start',
+      x: chest.x,
+      z: chest.z,
+    });
+    return true;
+  }
+
+  private updateOpeningChest(dt: number, input: InputState): void {
+    const oc = this.state.openingChest;
+    if (!oc) return;
+
+    const chest = this.state.chests.find((c) => c.id === oc.chestId);
+    if (!chest || chest.opened) {
+      this.state.openingChest = null;
+      return;
+    }
+
+    // Permet d'esquiver en urgence (annule l'ouverture sans jamais accorder le butin)
+    if (input.dodgePressed) {
+      chest.opening = false;
+      chest.openingProgress = 0;
+      this.state.openingChest = null;
+      const dodged = executeDodgeRoll(
+        this.state.player,
+        input.moveX,
+        input.moveZ,
+        this.state.events,
+        this.state.dodgeGhosts,
+      );
+      if (dodged) {
+        this.dodgeGhostAccum = 0;
+        this.checkPerfectDodge();
+      }
+      return;
+    }
+
+    this.state.player.vx = 0;
+    this.state.player.vz = 0;
+    oc.elapsed += dt;
+    chest.openingProgress = clamp(oc.elapsed / Math.max(oc.duration, 1e-4), 0, 1);
+
+    if (oc.elapsed >= oc.duration) {
+      this.state.openingChest = null;
+      chest.opening = false;
+      chest.openingProgress = 1;
+      // Récompense accordée STRICTEMENT à la fin de l'animation
+      this.openChest(chest.id);
+    }
+  }
+
+  private startPortalTransition(
+    portalX: number,
+    portalZ: number,
+    targetZoneId: ZoneId,
+    targetSpawn: Vec2,
+  ): void {
+    if (this.state.portalTransition) return;
+    const p = this.state.player;
+    p.vx = 0;
+    p.vz = 0;
+    p.dodgeTimer = 0;
+    p.attackAnimTimer = 0;
+    p.invulnTimer = Math.max(p.invulnTimer, 0.5);
+    this.state.pendingInteraction = null;
+    this.state.telegraphs = [];
+    this.state.transitionTimer = 0;
+    this.state.transitionFade = 0;
+
+    const exitTarget = {
+      x: targetSpawn.x,
+      z: targetSpawn.z + (targetZoneId === 'overworld' ? 1.85 : -1.65),
+    };
+
+    this.state.portalTransition = {
+      phase: 'entering',
+      elapsed: 0,
+      duration: PORTAL_ENTER_DURATION,
+      maxDuration: PORTAL_MAX_DURATION,
+      vortexEmitted: false,
+      portalX,
+      portalZ,
+      exitTargetX: exitTarget.x,
+      exitTargetZ: exitTarget.z,
+      targetZoneId,
+      targetSpawn: { ...targetSpawn },
+    };
+    this.state.events.push({
+      type: 'portal_enter',
+      x: portalX,
+      z: portalZ,
+      zoneId: targetZoneId,
+    });
+  }
+
+  private updatePortalTransition(dt: number): void {
+    const pt = this.state.portalTransition;
+    if (!pt) return;
+    const player = this.state.player;
+    player.invulnTimer = Math.max(player.invulnTimer, 0.25);
+
+    pt.elapsed += dt;
+
+    if (pt.phase === 'entering') {
+      // 0.0 - 0.9 s : marche automatique douce vers le centre du portail
+      if (pt.elapsed < 0.9) {
+        const dx = pt.portalX - player.x;
+        const dz = pt.portalZ - player.z;
+        const d = Math.hypot(dx, dz);
+        const speed = PLAYER_MOVE_SPEED * 0.72;
+        if (d > 0.15) {
+          const stepLen = Math.min(d, speed * dt);
+          player.x += (dx / d) * stepLen;
+          player.z += (dz / d) * stepLen;
+          player.vx = (dx / d) * speed;
+          player.vz = (dz / d) * speed;
+          if (Math.abs(dx) > 0.04) player.facingX = dx >= 0 ? 1 : -1;
+        } else {
+          player.vx = 0;
+          player.vz = 0;
+        }
+      } else {
+        player.vx = 0;
+        player.vz = 0;
+      }
+
+      // 0.3 - 1.4 s : déclenchement du vortex lumineux & audio
+      if (pt.elapsed >= 0.3 && !pt.vortexEmitted) {
+        pt.vortexEmitted = true;
+        this.state.events.push({
+          type: 'portal_vortex',
+          x: pt.portalX,
+          z: pt.portalZ,
+          zoneId: pt.targetZoneId,
+        });
+      }
+
+      // 1.1 - 1.4 s : fondu au noir progressif avant le chargement de zone
+      if (pt.elapsed >= 1.1) {
+        const fadeT = clamp((pt.elapsed - 1.1) / Math.max(0.01, pt.duration - 1.1), 0, 1);
+        this.state.transitionFade = Math.max(this.state.transitionFade, fadeT);
+      } else {
+        this.state.transitionFade = 0;
+      }
+
+      const maxEnter = pt.maxDuration ?? PORTAL_MAX_DURATION;
+      if (pt.elapsed >= pt.duration || pt.elapsed >= maxEnter) {
+        const destZone = pt.targetZoneId;
+        const destSpawn = { ...pt.targetSpawn };
+        this.loadZone(destZone, destSpawn, true);
+        const safeExit = this.resolvePositionInCurrentZone(
+          pt.exitTargetX,
+          pt.exitTargetZ,
+          PLAYER_RADIUS,
+          false,
+        );
+        this.state.portalTransition = {
+          phase: 'exiting',
+          elapsed: 0,
+          duration: PORTAL_EXIT_DURATION,
+          maxDuration: 1.0,
+          vortexEmitted: true,
+          portalX: destSpawn.x,
+          portalZ: destSpawn.z,
+          exitTargetX: safeExit.x,
+          exitTargetZ: safeExit.z,
+          targetZoneId: destZone,
+          targetSpawn: destSpawn,
+        };
+        this.state.events.push({
+          type: 'portal_exit',
+          x: destSpawn.x,
+          z: destSpawn.z,
+          zoneId: destZone,
+        });
+      }
+      return;
+    }
+
+    // Phase 'exiting' (1.4 - 1.8 s) : le héros ressort du portail pendant le fondu entrant
+    const dx = pt.exitTargetX - player.x;
+    const dz = pt.exitTargetZ - player.z;
+    const d = Math.hypot(dx, dz);
+    const speed = PLAYER_MOVE_SPEED * 0.65;
+    if (d > 0.15) {
+      const stepLen = Math.min(d, speed * dt);
+      const resolved = this.resolvePositionInCurrentZone(
+        player.x + (dx / d) * stepLen,
+        player.z + (dz / d) * stepLen,
+        PLAYER_RADIUS,
+        false,
+      );
+      player.x = resolved.x;
+      player.z = resolved.z;
+      player.vx = (dx / d) * speed;
+      player.vz = (dz / d) * speed;
+      if (Math.abs(dx) > 0.04) player.facingX = dx >= 0 ? 1 : -1;
+    } else {
+      player.vx = 0;
+      player.vz = 0;
+    }
+
+    // Compagnon suit doucement la sortie
+    this.state.companion.x += (player.x - player.facingX * 1.4 - this.state.companion.x) * Math.min(1, dt * 6);
+    this.state.companion.z += (player.z - 0.8 - this.state.companion.z) * Math.min(1, dt * 6);
+
+    const maxExit = pt.maxDuration ?? 1.0;
+    if (pt.elapsed >= pt.duration || pt.elapsed >= maxExit) {
+      this.forceCompletePortalTransition();
+    }
+  }
+
+  public forceCompletePortalTransition(): void {
+    const pt = this.state.portalTransition;
+    if (!pt) return;
+    const p = this.state.player;
+    if (pt.phase === 'entering') {
+      const destZone = pt.targetZoneId;
+      const destSpawn = { ...pt.targetSpawn };
+      this.loadZone(destZone, destSpawn, true);
+      const safeExit = this.resolvePositionInCurrentZone(
+        pt.exitTargetX,
+        pt.exitTargetZ,
+        PLAYER_RADIUS,
+        false,
+      );
+      p.x = safeExit.x;
+      p.z = safeExit.z;
+      this.state.events.push({
+        type: 'portal_exit',
+        x: destSpawn.x,
+        z: destSpawn.z,
+        zoneId: destZone,
+      });
+    }
+    p.vx = 0;
+    p.vz = 0;
+    p.invulnTimer = Math.max(p.invulnTimer, 0.6);
+    this.state.portalTransition = null;
+    this.state.transitionTimer = 0;
+    this.state.transitionFade = 0;
+    this.updateNearestInteractable();
+  }
+
+  private startHeroDeathSequence(): void {
+    if (this.state.deathSequence) return;
+    const p = this.state.player;
+    p.hp = 0;
+    p.vx = 0;
+    p.vz = 0;
+    p.dodgeTimer = 0;
+    p.attackAnimTimer = 0;
+    this.state.pendingInteraction = null;
+    this.state.openingChest = null;
+    this.state.portalTransition = null;
+    this.state.activeModal = 'none';
+    this.state.telegraphs = [];
+    this.state.screenShake = Math.max(this.state.screenShake, 0.55);
+    this.state.deathSequence = {
+      elapsed: 0,
+      duration: HERO_DEATH_DURATION,
+      x: p.x,
+      z: p.z,
+      completed: false,
+    };
+    this.state.events.push({
+      type: 'hero_death_start',
+      x: p.x,
+      z: p.z,
+    });
+  }
+
+  private updateDeathSequence(dt: number): void {
+    const ds = this.state.deathSequence;
+    if (!ds) return;
+    ds.elapsed += dt;
+    this.state.player.vx = 0;
+    this.state.player.vz = 0;
+    const ratio = clamp(ds.elapsed / Math.max(ds.duration, 1e-4), 0, 1);
+    if (ratio > 0.65) {
+      this.state.transitionFade = clamp(((ratio - 0.65) / 0.35) * 0.72, 0, 0.72);
+    }
+    if (ds.elapsed >= ds.duration && !ds.completed) {
+      ds.completed = true;
+      this.state.screen = 'defeat';
+      this.state.activeModal = 'none';
+      this.state.telegraphs = [];
+      this.state.transitionFade = 0;
+    }
+  }
+
+  private markCombatActivity(): void {
+    this.state.inCombat = true;
+    this.state.combatMusicTimer = COMBAT_MUSIC_HOLD_SEC;
+  }
+
+  private updateCombatMusicState(dt: number): void {
+    let aggroEnemyNearby = false;
+    const px = this.state.player.x;
+    const pz = this.state.player.z;
+    for (const enemy of this.state.enemies) {
+      if (enemy.state === 'dead' || enemy.hp <= 0) continue;
+      if (enemy.aggroed && dist(px, pz, enemy.x, enemy.z) <= 15) {
+        aggroEnemyNearby = true;
+        break;
+      }
+    }
+    if (aggroEnemyNearby && !this.state.inVillage) {
+      this.state.inCombat = true;
+      this.state.combatMusicTimer = Math.max(
+        this.state.combatMusicTimer ?? 0,
+        2.5,
+      );
+    } else if ((this.state.combatMusicTimer ?? 0) > 0) {
+      this.state.combatMusicTimer = Math.max(
+        0,
+        (this.state.combatMusicTimer ?? 0) - dt,
+      );
+      if (this.state.combatMusicTimer <= 0 || this.state.inVillage) {
+        this.state.inCombat = false;
+        this.state.combatMusicTimer = 0;
+      }
+    } else {
+      this.state.inCombat = false;
+    }
+  }
+
+  private interactWith(interactable: Interactable, directApi = false): void {
     switch (interactable.type) {
       case 'inn': {
         const p = this.state.player;
@@ -1411,7 +2531,11 @@ export class GameEngine {
 
       case 'chest':
         if (interactable.chestId) {
-          this.openChest(interactable.chestId);
+          if (directApi) {
+            this.openChest(interactable.chestId);
+          } else {
+            this.startOpeningChest(interactable.chestId);
+          }
         }
         break;
 
@@ -1421,14 +2545,32 @@ export class GameEngine {
           return;
         }
         if (interactable.targetZoneId && interactable.targetSpawn) {
-          this.loadZone(interactable.targetZoneId, { ...interactable.targetSpawn }, true);
+          if (directApi) {
+            this.loadZone(interactable.targetZoneId, { ...interactable.targetSpawn }, true);
+          } else {
+            this.startPortalTransition(
+              interactable.x,
+              interactable.z,
+              interactable.targetZoneId,
+              interactable.targetSpawn,
+            );
+          }
         }
         break;
       }
 
       case 'dungeon_exit': {
         if (interactable.targetZoneId && interactable.targetSpawn) {
-          this.loadZone(interactable.targetZoneId, { ...interactable.targetSpawn }, true);
+          if (directApi) {
+            this.loadZone(interactable.targetZoneId, { ...interactable.targetSpawn }, true);
+          } else {
+            this.startPortalTransition(
+              interactable.x,
+              interactable.z,
+              interactable.targetZoneId,
+              interactable.targetSpawn,
+            );
+          }
         }
         break;
       }
@@ -1478,32 +2620,51 @@ export class GameEngine {
     enemy.hp = 0;
     enemy.vx = 0;
     enemy.vz = 0;
+    enemy.activeSweepDuration = undefined;
+    enemy.activeSweepElapsed = undefined;
     enemy.respawnTimer =
       this.state.zoneId === 'overworld' && !enemy.isBoss
         ? OVERWORLD_RESPAWN_TIME
         : 0;
 
+    if (!enemy.isBoss) {
+      enemy.deathTimer = 0.35;
+      enemy.deathDuration = 0.35;
+      this.state.hitstopTimer = Math.max(this.state.hitstopTimer, 0.04);
+    } else {
+      const bossDeathDur = enemy.typeId === 'boss_dragon_claw' ? 3.4 : 2.6;
+      enemy.deathTimer = bossDeathDur;
+      enemy.deathDuration = bossDeathDur;
+    }
+
     this.state.runStats.enemiesDefeated += 1;
 
     const def = getEnemyDefinition(enemy.typeId);
     const p = this.state.player;
-    p.gold += def.goldReward;
 
     this.state.events.push({
       type: 'enemy_died',
       x: enemy.x,
       z: enemy.z,
+      radius: enemy.radius,
       enemyId: enemy.id,
       enemyTypeId: enemy.typeId,
+      enemyMaterial: def.materialSound,
+      color: def.primaryColor,
+      accentColor: def.accentColor,
+      knockbackVx: enemy.knockbackVx ?? 0,
+      knockbackVz: enemy.knockbackVz ?? 0,
       value: def.xpReward,
       text: `+${def.xpReward} XP  +${def.goldReward} Or`,
     });
 
-    grantXp(p, def.xpReward, this.state.events);
+    // Butin physique parabolique & magnétique (Or + XP)
+    this.spawnLootDropsForEnemy(enemy, def.goldReward, def.xpReward);
 
     let shouldSave = false;
 
     if (enemy.isBoss) {
+      this.triggerCompanionReaction('boss_victory');
       if (!this.state.defeatedBossIds.includes(enemy.typeId)) {
         this.state.defeatedBossIds.push(enemy.typeId);
       }
@@ -1532,7 +2693,19 @@ export class GameEngine {
     this.refreshQuestTarget();
 
     if (enemy.typeId === 'boss_dragon_claw' && !this.state.victoryShown) {
-      this.startDialogue(VICTORY_DIALOGUE, 'trigger_victory');
+      this.pendingCinematicDialogue = {
+        lines: VICTORY_DIALOGUE,
+        action: 'trigger_victory',
+      };
+      this.startBossCinematic(enemy, 'boss_death');
+    } else if (enemy.typeId === 'boss_rat_king') {
+      if (qRes.dialogues.length > 0) {
+        this.pendingCinematicDialogue = {
+          lines: qRes.dialogues[0],
+          action: 'none',
+        };
+      }
+      this.startBossCinematic(enemy, 'boss_death');
     } else if (qRes.dialogues.length > 0) {
       this.startDialogue(qRes.dialogues[0], 'none');
     }
@@ -1695,7 +2868,11 @@ export class GameEngine {
         item.z = ship.position.z;
       }
       const d = dist(px, pz, item.x, item.z);
-      if (d <= item.radius && d < bestDist) {
+      const effectiveRadius =
+        item.type === 'ship_board'
+          ? item.radius
+          : item.radius + INTERACT_APPROACH_EXTRA;
+      if (d <= effectiveRadius && d < bestDist) {
         best = item;
         bestDist = d;
       }
@@ -1736,10 +2913,44 @@ export class GameEngine {
   }
 
   private updateTransientVisuals(dt: number): void {
-    // Active spell effects
+    // Active spell effects (avec salves multi-vagues verrouillées pour Chute d'Étoiles)
     for (let i = this.state.activeSpellEffects.length - 1; i >= 0; i--) {
       const fx = this.state.activeSpellEffects[i];
       fx.elapsed += dt;
+
+      if (
+        fx.spellId === 'meteor_paw' &&
+        fx.waveCount &&
+        fx.waveInterval &&
+        (fx.wavesTriggered ?? 1) < fx.waveCount
+      ) {
+        const nextWaveThreshold = (fx.wavesTriggered ?? 1) * fx.waveInterval;
+        if (fx.elapsed >= nextWaveThreshold) {
+          fx.wavesTriggered = (fx.wavesTriggered ?? 1) + 1;
+          const waveRes = applyStarfallWaveDamage(
+            fx,
+            this.state.enemies,
+            this.state.events,
+            0.46,
+            this.rng,
+            this.state.telegraphs,
+          );
+          if (waveRes.hitEnemies.length > 0) {
+            this.markCombatActivity();
+          }
+          this.state.screenShake = Math.max(this.state.screenShake, 0.34);
+          if (waveRes.triggeredHitstop) {
+            this.state.hitstopTimer = Math.max(
+              this.state.hitstopTimer,
+              HITSTOP_MAJOR_DURATION * 0.75,
+            );
+          }
+          for (const killed of waveRes.killedEnemies) {
+            this.handleEnemyKilled(killed);
+          }
+        }
+      }
+
       if (fx.elapsed >= fx.duration) {
         this.state.activeSpellEffects.splice(i, 1);
       }
@@ -1928,6 +3139,13 @@ export class GameEngine {
     if (this.state.zoneId !== 'overworld') return;
 
     if (this.state.islandId !== targetIslandId) {
+      if (this.state.player.hp > 0 && this.state.lootDrops.length > 0) {
+        for (const drop of this.state.lootDrops) {
+          this.collectLootDrop(drop);
+        }
+      }
+      this.state.lootDrops = [];
+      this.state.playerProjectiles = [];
       this.state.islandId = targetIslandId;
       this.state.telegraphs = [];
       this.state.activeBossId = null;
@@ -2017,6 +3235,7 @@ export class GameEngine {
     player.knockbackVz = 0;
     player.onShipDeck = false;
     player.elevationY = 0;
+    this.footstepDistanceAccum = 0;
 
     companion.onShipDeck = false;
     companion.y = companion.y ?? 0;
@@ -2523,6 +3742,916 @@ export class GameEngine {
           ? { text: `Bienvenue sur ${getIslandName(targetIslandId)} !` }
           : {}),
       });
+    }
+  }
+
+  private checkPerfectDodge(): boolean {
+    const player = this.state.player;
+    let triggered = false;
+
+    for (const tz of this.state.telegraphs) {
+      if (tz.resolved || tz.perfectDodged || (tz.delaySec ?? 0) > 0) continue;
+      const timeRemaining = tz.duration - tz.elapsed;
+      if (timeRemaining <= 0 || timeRemaining > PERFECT_DODGE_WINDOW_SEC) continue;
+      if (isTargetInTelegraph(tz, player.x, player.z, PLAYER_RADIUS * 0.5)) {
+        tz.perfectDodged = true;
+        triggered = true;
+      }
+    }
+
+    // Support esquive parfaite à l'approche immédiate d'un projectile ennemi (< 0.18s d'impact)
+    if (!triggered) {
+      for (const ep of this.state.enemyProjectiles) {
+        const d = dist(ep.x, ep.z, player.x, player.z);
+        const hitDist = ep.radius + PLAYER_RADIUS + ep.speed * PERFECT_DODGE_WINDOW_SEC;
+        if (d <= hitDist) {
+          triggered = true;
+          break;
+        }
+      }
+    }
+
+    if (!triggered) return false;
+
+    this.state.timeScale = PERFECT_DODGE_TIMESCALE;
+    this.state.perfectDodgeTimer = PERFECT_DODGE_SLOW_DURATION;
+    player.perfectDodgeBuffTimer = PERFECT_DODGE_BUFF_DURATION;
+
+    const mpBonus = Math.max(1, Math.round(player.maxMp * PERFECT_DODGE_MP_PCT));
+    const prevMp = player.mp;
+    player.mp = Math.min(player.maxMp, player.mp + mpBonus);
+    const actualMp = player.mp - prevMp;
+
+    this.state.events.push({
+      type: 'perfect_dodge',
+      x: player.x,
+      z: player.z,
+      value: actualMp,
+      text: 'ESQUIVE PARFAITE !',
+    });
+    this.triggerCompanionReaction('perfect_dodge');
+
+    if (actualMp > 0) {
+      this.state.events.push({
+        type: 'mp_gain',
+        x: player.x,
+        z: player.z,
+        value: actualMp,
+        text: `+${actualMp} PM`,
+      });
+    }
+
+    return true;
+  }
+
+  private isProjectileBlocked(x: number, z: number, radius: number): boolean {
+    if (this.state.zoneId === 'overworld') {
+      if (this.state.islandId !== 'felingard') {
+        const def = NEW_ISLANDS[this.state.islandId];
+        const dx = x - def.centerX;
+        const dz = z - def.centerZ;
+        const maxR = Math.max(
+          0,
+          getNewIslandRadiusAtAngle(this.state.islandId, Math.atan2(dz, dx)) - 0.5,
+        );
+        if (Math.hypot(dx, dz) > maxR) return true;
+        for (const prop of def.props) {
+          if (!prop.collidable || !prop.colliderRadius) continue;
+          if (circlesOverlap(x, z, radius, prop.x, prop.z, prop.colliderRadius * 0.85)) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      if (!isInsideIsland(x, z, 0.5)) return true;
+      for (const b of OVERWORLD_DATA.buildings) {
+        if (circlesOverlap(x, z, radius, b.x, b.z, b.colliderRadius * 0.9)) {
+          return true;
+        }
+      }
+      for (const prop of OVERWORLD_DATA.props) {
+        if (!prop.collidable || !prop.colliderRadius) continue;
+        if (circlesOverlap(x, z, radius, prop.x, prop.z, prop.colliderRadius * 0.85)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    const def = getDungeonDefinition(this.state.zoneId);
+    const halfW = def.width * 0.5 - radius;
+    const halfD = def.depth * 0.5 - radius;
+    if (x < -halfW || x > halfW || z < -halfD || z > halfD) {
+      return true;
+    }
+    for (const wall of def.walls) {
+      if (circleIntersectsAABB(x, z, radius, wall)) {
+        return true;
+      }
+    }
+    for (const pillar of def.pillars) {
+      if (circlesOverlap(x, z, radius, pillar.x, pillar.z, DUNGEON_PILLAR_RADIUS)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private spawnLootDropsForEnemy(
+    enemy: EnemyInstance,
+    goldReward: number,
+    xpReward: number,
+  ): void {
+    const goldCount = enemy.isBoss ? 5 : goldReward >= 40 ? 3 : 2;
+    const xpCount = enemy.isBoss ? 4 : xpReward >= 60 ? 3 : 2;
+    const goldPieces = splitRewardAmounts(goldReward, goldCount);
+    const xpPieces = splitRewardAmounts(xpReward, xpCount);
+
+    const totalDrops = goldPieces.length + xpPieces.length;
+    if (totalDrops === 0) return;
+
+    const magnetRange = enemy.isBoss ? 8.5 : 5.5;
+    const baseAngle = this.rng() * Math.PI * 2;
+    let idx = 0;
+
+    const pushPiece = (kind: LootDropKind, amount: number): void => {
+      const angle = baseAngle + (idx / totalDrops) * Math.PI * 2 + (this.rng() - 0.5) * 0.45;
+      idx += 1;
+      const launchSpeed = 2.4 + this.rng() * 2.1;
+      const drop: LootDrop = {
+        id: `loot_${nextLootDropId++}`,
+        kind,
+        amount,
+        x: enemy.x,
+        y: 0.45,
+        z: enemy.z,
+        vx: Math.cos(angle) * launchSpeed,
+        vy: 4.5 + this.rng() * 1.6,
+        vz: Math.sin(angle) * launchSpeed,
+        age: 0,
+        collectDelay: 0.48,
+        bounces: 0,
+        magnetRange,
+        magnetized: false,
+      };
+      this.state.lootDrops.push(drop);
+    };
+
+    for (const amt of goldPieces) pushPiece('gold', amt);
+    for (const amt of xpPieces) pushPiece('xp', amt);
+
+    this.state.events.push({
+      type: 'loot_spawned',
+      x: enemy.x,
+      z: enemy.z,
+      value: totalDrops,
+    });
+  }
+
+  private collectLootDrop(drop: LootDrop): void {
+    const p = this.state.player;
+    if (drop.kind === 'gold') {
+      p.gold += drop.amount;
+      this.state.events.push({
+        type: 'gold_pickup',
+        x: p.x,
+        z: p.z,
+        value: drop.amount,
+        lootKind: 'gold',
+      });
+    } else {
+      grantXp(p, drop.amount, this.state.events);
+    }
+  }
+
+  private updateLootDrops(dt: number): void {
+    const drops = this.state.lootDrops;
+    if (drops.length === 0 || dt <= 0) return;
+
+    const p = this.state.player;
+    const canMagnet = p.hp > 0 && this.state.ship.mode === 'parked';
+    const groundY = 0.15;
+
+    for (let i = drops.length - 1; i >= 0; i--) {
+      const d = drops[i];
+      d.age += dt;
+
+      // Balistique parabolique + rebonds au sol
+      d.x += d.vx * dt;
+      d.z += d.vz * dt;
+      d.y += d.vy * dt;
+      d.vy -= 24.0 * dt;
+
+      if (d.y <= groundY) {
+        d.y = groundY;
+        if (d.bounces < 2 && Math.abs(d.vy) > 1.8) {
+          d.vy = -d.vy * 0.46;
+          d.vx *= 0.72;
+          d.vz *= 0.72;
+          d.bounces += 1;
+          this.state.events.push({
+            type: 'loot_bounce',
+            x: d.x,
+            z: d.z,
+            lootKind: d.kind,
+          });
+        } else {
+          d.vy = 0;
+          const damp = Math.exp(-8 * dt);
+          d.vx *= damp;
+          d.vz *= damp;
+        }
+      }
+
+      const readyToMagnetize = (d.bounces >= 1 && d.age >= d.collectDelay) || d.age >= 0.75;
+      if (!canMagnet || !readyToMagnetize) {
+        continue;
+      }
+
+      const distToPlayer = dist(d.x, d.z, p.x, p.z);
+      if (distToPlayer <= 0.9) {
+        this.collectLootDrop(d);
+        drops.splice(i, 1);
+        continue;
+      }
+
+      if (d.magnetized || distToPlayer <= d.magnetRange) {
+        d.magnetized = true;
+        const dir = normalize(p.x - d.x, p.z - d.z);
+        const pullSpeed = 13.5 + Math.min(14, d.age * 7.5);
+        d.vx = dir.x * pullSpeed;
+        d.vz = dir.z * pullSpeed;
+        d.y = Math.max(groundY, d.y + (0.55 - d.y) * Math.min(1, dt * 8));
+      }
+    }
+  }
+
+  // ==========================================================================
+  // Cinématiques d'Intro & de Mort des Boss (Roi Rat-Spectre & Drak-Miaou)
+  // ==========================================================================
+
+  private maybeTriggerBossIntro(): void {
+    if (
+      this.state.screen !== 'playing' ||
+      this.state.cinematic ||
+      this.state.dialogue.active ||
+      this.state.deathSequence ||
+      this.state.portalTransition ||
+      this.state.openingChest
+    ) {
+      return;
+    }
+
+    const p = this.state.player;
+    for (const enemy of this.state.enemies) {
+      if (!enemy.isBoss || enemy.state === 'dead' || enemy.hp <= 0) continue;
+      if (enemy.introPlayed || this.state.playedBossIntros.includes(enemy.typeId)) continue;
+
+      const def = getEnemyDefinition(enemy.typeId);
+      const d = dist(p.x, p.z, enemy.x, enemy.z);
+      const enteredArena =
+        (this.state.zoneId === 'dungeon_ghost_cave' && p.z <= -8.5) ||
+        (this.state.zoneId === 'dungeon_dragon_lair' && p.z <= 6.0);
+
+      if (enemy.aggroed || enteredArena || d <= def.aggroRange) {
+        this.startBossCinematic(enemy, 'boss_intro');
+        break;
+      }
+    }
+  }
+
+  private startBossCinematic(boss: EnemyInstance, kind: CinematicKind): void {
+    if (this.state.cinematic) {
+      this.forceCompleteCinematic();
+    }
+
+    const isDragon = boss.typeId === 'boss_dragon_claw';
+    const isIntro = kind === 'boss_intro';
+
+    if (isIntro) {
+      boss.introPlayed = true;
+      boss.aggroed = true;
+      if (!this.state.playedBossIntros.includes(boss.typeId)) {
+        this.state.playedBossIntros.push(boss.typeId);
+      }
+    } else {
+      // Sur mort de boss : purge immédiatement les menaces actives pour garantir la sécurité
+      this.state.telegraphs = [];
+      this.state.enemyProjectiles = [];
+      this.state.hazardZones = [];
+    }
+
+    const p = this.state.player;
+    p.vx = 0;
+    p.vz = 0;
+    p.dodgeTimer = 0;
+    p.attackAnimTimer = 0;
+    p.invulnTimer = Math.max(p.invulnTimer, 0.5);
+    this.state.pendingInteraction = null;
+    this.state.perfectDodgeTimer = 0;
+
+    const duration = isIntro ? (isDragon ? 2.4 : 2.2) : isDragon ? 3.4 : 2.6;
+    const maxDuration = isIntro ? (isDragon ? 3.4 : 3.2) : isDragon ? 4.8 : 3.8;
+    const initialStage = isIntro
+      ? isDragon
+        ? 'aerial_descent'
+        : 'throne_arrival'
+      : isDragon
+        ? 'cracks'
+        : 'slowmo_collapse';
+
+    if (!isIntro && !isDragon) {
+      this.state.timeScale = 0.38;
+    }
+
+    const cin: CinematicState = {
+      id: `cin_${nextCinematicId++}`,
+      kind,
+      bossId: boss.id,
+      bossTypeId: boss.typeId,
+      stage: initialStage,
+      stageIndex: 0,
+      elapsed: 0,
+      duration,
+      maxDuration,
+      focusX: boss.x,
+      focusZ: boss.z,
+      targetZoom: isDragon ? 1.05 : 0.92,
+      heatDistortion: isDragon ? (isIntro ? 0.65 : 0.75) : 0,
+      lairBrighten: 0,
+      completed: false,
+    };
+
+    this.state.cinematic = cin;
+    this.updateActiveBoss();
+    this.state.events.push({
+      type: 'boss_cinematic_start',
+      x: boss.x,
+      z: boss.z,
+      enemyId: boss.id,
+      enemyTypeId: boss.typeId,
+      cinematicKind: kind,
+      cinematicStage: initialStage,
+    });
+  }
+
+  private updateCinematic(unscaledDt: number): void {
+    const c = this.state.cinematic;
+    if (!c) return;
+
+    const p = this.state.player;
+    p.vx = 0;
+    p.vz = 0;
+    p.dodgeTimer = 0;
+    p.attackAnimTimer = 0;
+    p.invulnTimer = Math.max(p.invulnTimer, 0.25);
+
+    const boss = this.state.enemies.find((e) => e.id === c.bossId);
+    if (!boss && c.kind === 'boss_intro') {
+      this.forceCompleteCinematic();
+      return;
+    }
+
+    if (boss) {
+      c.focusX = boss.x;
+      c.focusZ = boss.z;
+    }
+
+    c.elapsed += unscaledDt;
+    const t = clamp(c.elapsed / Math.max(c.duration, 1e-4), 0, 1);
+
+    let nextStage = c.stage;
+    let nextStageIndex = c.stageIndex;
+
+    if (c.kind === 'boss_intro') {
+      if (c.bossTypeId === 'boss_dragon_claw') {
+        if (t < 0.54) {
+          nextStage = 'aerial_descent';
+          nextStageIndex = 0;
+          c.heatDistortion = 0.55 + t * 0.65;
+        } else {
+          nextStage = 'inferno_roar';
+          nextStageIndex = 1;
+          c.heatDistortion = 1.0;
+          this.state.screenShake = Math.max(this.state.screenShake, 0.28);
+        }
+      } else {
+        if (t < 0.5) {
+          nextStage = 'throne_arrival';
+          nextStageIndex = 0;
+        } else {
+          nextStage = 'king_challenge';
+          nextStageIndex = 1;
+        }
+      }
+    } else if (c.bossTypeId === 'boss_dragon_claw') {
+      if (t < 0.25) {
+        nextStage = 'cracks';
+        nextStageIndex = 0;
+        c.heatDistortion = 0.75;
+        c.lairBrighten = t * 0.2;
+      } else if (t < 0.5) {
+        nextStage = 'double_shockwave';
+        nextStageIndex = 1;
+        c.heatDistortion = 0.55;
+        c.lairBrighten = 0.1 + (t - 0.25) * 1.2;
+        this.state.screenShake = Math.max(this.state.screenShake, 0.48);
+      } else if (t < 0.75) {
+        nextStage = 'ascending_embers';
+        nextStageIndex = 2;
+        c.heatDistortion = Math.max(0, 0.45 * (1 - (t - 0.5) / 0.25));
+        c.lairBrighten = 0.4 + ((t - 0.5) / 0.25) * 0.35;
+      } else {
+        nextStage = 'lair_brighten';
+        nextStageIndex = 3;
+        c.heatDistortion = 0;
+        c.lairBrighten = clamp(0.75 + ((t - 0.75) / 0.25) * 0.25, 0, 1);
+      }
+    } else {
+      // Mort Roi Rat-Spectre : ralenti puis fermeture faille abyssale
+      if (t < 0.46) {
+        nextStage = 'slowmo_collapse';
+        nextStageIndex = 0;
+        this.state.timeScale = clamp(0.35 + (t / 0.46) * 0.35, 0.35, 0.7);
+      } else {
+        nextStage = 'rift_close';
+        nextStageIndex = 1;
+        this.state.timeScale = clamp(0.7 + ((t - 0.46) / 0.54) * 0.3, 0.7, 1.0);
+      }
+    }
+
+    if (nextStageIndex !== c.stageIndex || nextStage !== c.stage) {
+      c.stage = nextStage;
+      c.stageIndex = nextStageIndex;
+      this.state.events.push({
+        type: 'boss_cinematic_stage',
+        x: c.focusX,
+        z: c.focusZ,
+        enemyId: c.bossId,
+        enemyTypeId: c.bossTypeId,
+        cinematicKind: c.kind,
+        cinematicStage: nextStage,
+      });
+    }
+
+    this.state.time += unscaledDt * (this.state.timeScale ?? 1);
+    this.updateTransientVisuals(unscaledDt);
+    this.updateLootDrops(unscaledDt);
+    this.updateCompanion(unscaledDt);
+    this.updateActiveBoss();
+
+    if (c.elapsed >= c.duration || c.elapsed >= c.maxDuration) {
+      this.completeCinematic();
+    }
+  }
+
+  private completeCinematic(): void {
+    const c = this.state.cinematic;
+    if (!c || c.completed) {
+      this.state.cinematic = null;
+      this.state.timeScale = 1;
+      this.state.perfectDodgeTimer = 0;
+      return;
+    }
+
+    c.completed = true;
+    const finished = c;
+    this.state.cinematic = null;
+    this.state.timeScale = 1;
+    this.state.perfectDodgeTimer = 0;
+    this.state.player.invulnTimer = Math.max(this.state.player.invulnTimer, 0.6);
+
+    if (finished.kind === 'boss_death') {
+      const deadBoss = this.state.enemies.find((e) => e.id === finished.bossId);
+      if (deadBoss) {
+        deadBoss.deathTimer = 0;
+        deadBoss.deathDuration = 0;
+      }
+    }
+
+    this.state.events.push({
+      type: 'boss_cinematic_end',
+      x: finished.focusX,
+      z: finished.focusZ,
+      enemyId: finished.bossId,
+      enemyTypeId: finished.bossTypeId,
+      cinematicKind: finished.kind,
+      cinematicStage: finished.stage,
+    });
+
+    if (this.pendingCinematicDialogue) {
+      const dlg = this.pendingCinematicDialogue;
+      this.pendingCinematicDialogue = null;
+      this.startDialogue(dlg.lines, dlg.action);
+    }
+  }
+
+  public forceCompleteCinematic(): void {
+    if (!this.state.cinematic) {
+      this.state.timeScale = 1;
+      return;
+    }
+    this.completeCinematic();
+  }
+
+  // ==========================================================================
+  // Compagnon Miaou-sprit actif (Guidage coffres/quêtes & réactions)
+  // ==========================================================================
+
+  private triggerCompanionReaction(kind: CompanionReactionKind): void {
+    const comp = this.state.companion;
+    if (kind === 'crit') {
+      if (this.companionReactionCooldown > 0) return;
+      if (comp.reactionKind === 'boss_victory' || comp.reactionKind === 'perfect_dodge') {
+        if ((comp.reactionTimer ?? 0) > 0) return;
+      }
+      comp.reactionKind = 'crit';
+      comp.reactionDuration = 0.55;
+      comp.reactionTimer = 0.55;
+      this.companionReactionCooldown = 0.6;
+      return;
+    }
+    if (kind === 'perfect_dodge') {
+      if (comp.reactionKind === 'boss_victory' && (comp.reactionTimer ?? 0) > 0) return;
+      comp.reactionKind = 'perfect_dodge';
+      comp.reactionDuration = 0.75;
+      comp.reactionTimer = 0.75;
+      return;
+    }
+    comp.reactionKind = 'boss_victory';
+    comp.reactionDuration = 1.65;
+    comp.reactionTimer = 1.65;
+  }
+
+  private updateCompanion(dt: number): void {
+    const comp = this.state.companion;
+    const player = this.state.player;
+    comp.bobPhase += dt * 4;
+
+    if (this.companionChimeCooldown > 0) {
+      this.companionChimeCooldown = Math.max(0, this.companionChimeCooldown - dt);
+    }
+    if (this.companionReactionCooldown > 0) {
+      this.companionReactionCooldown = Math.max(0, this.companionReactionCooldown - dt);
+    }
+
+    if ((comp.reactionTimer ?? 0) > 0) {
+      comp.reactionTimer = Math.max(0, (comp.reactionTimer ?? 0) - dt);
+      if (comp.reactionTimer <= 0) {
+        comp.reactionKind = null;
+        comp.reactionDuration = 0;
+      }
+    }
+
+    let targetCompX = player.x - player.facingX * 1.4;
+    let targetCompZ = player.z - 0.8;
+    let guideKind: 'chest' | 'quest' | null = null;
+    let guideTargetX: number | undefined;
+    let guideTargetZ: number | undefined;
+
+    if (
+      this.state.ship.mode === 'parked' &&
+      !this.state.cinematic &&
+      !this.state.portalTransition &&
+      !this.state.deathSequence
+    ) {
+      const chestRadius = this.state.zoneId === 'overworld' ? 18 : 14;
+      let nearestChest: ChestInstance | null = null;
+      let nearestChestDist = chestRadius;
+
+      for (const chest of this.state.chests) {
+        if (chest.opened || chest.locked) continue;
+        const d = dist(player.x, player.z, chest.x, chest.z);
+        if (d <= nearestChestDist) {
+          nearestChestDist = d;
+          nearestChest = chest;
+        }
+      }
+
+      if (nearestChest && (!this.state.inCombat || nearestChestDist <= 10)) {
+        guideKind = 'chest';
+        guideTargetX = nearestChest.x;
+        guideTargetZ = nearestChest.z;
+        const dir = normalize(nearestChest.x - player.x, nearestChest.z - player.z);
+        const leadDist = clamp(nearestChestDist * 0.45, 2.0, 4.2);
+        const clamped = this.clampPointToCurrentZone(
+          player.x + dir.x * leadDist,
+          player.z + dir.z * leadDist,
+        );
+        targetCompX = clamped.x;
+        targetCompZ = clamped.z;
+
+        if (
+          this.state.screen === 'playing' &&
+          (this.companionChimeCooldown <= 0 || this.lastCompanionGuideTargetId !== nearestChest.id)
+        ) {
+          this.companionChimeCooldown = 9.0;
+          this.lastCompanionGuideTargetId = nearestChest.id;
+          this.state.events.push({
+            type: 'companion_chime',
+            x: comp.x,
+            z: comp.z,
+            targetX: nearestChest.x,
+            targetZ: nearestChest.z,
+            companionTargetKind: 'chest',
+          });
+        }
+      } else if (
+        this.state.questTarget &&
+        this.state.questTarget.zoneId === this.state.zoneId &&
+        !this.state.inCombat
+      ) {
+        const qt = this.state.questTarget;
+        const qDist = dist(player.x, player.z, qt.x, qt.z);
+        if (qDist > 5.0) {
+          guideKind = 'quest';
+          guideTargetX = qt.x;
+          guideTargetZ = qt.z;
+          const dir = normalize(qt.x - player.x, qt.z - player.z);
+          const clamped = this.clampPointToCurrentZone(
+            player.x + dir.x * 2.4 - dir.z * 0.65,
+            player.z + dir.z * 2.4 + dir.x * 0.65,
+          );
+          targetCompX = clamped.x;
+          targetCompZ = clamped.z;
+
+          const qKey = `quest_${qt.questId}`;
+          if (
+            this.state.screen === 'playing' &&
+            (this.companionChimeCooldown <= 0 || this.lastCompanionGuideTargetId !== qKey)
+          ) {
+            this.companionChimeCooldown = 14.0;
+            this.lastCompanionGuideTargetId = qKey;
+            this.state.events.push({
+              type: 'companion_chime',
+              x: comp.x,
+              z: comp.z,
+              targetX: qt.x,
+              targetZ: qt.z,
+              companionTargetKind: 'quest',
+            });
+          }
+        }
+      }
+    }
+
+    comp.guideKind = guideKind;
+    comp.guideTargetX = guideTargetX;
+    comp.guideTargetZ = guideTargetZ;
+    comp.guidePulse = guideKind ? (Math.sin(this.state.time * 4.2) + 1) * 0.5 : 0;
+
+    if (comp.reactionKind === 'crit') {
+      comp.mode = 'react_crit';
+    } else if (comp.reactionKind === 'perfect_dodge') {
+      comp.mode = 'react_dodge';
+    } else if (comp.reactionKind === 'boss_victory') {
+      comp.mode = 'react_victory';
+    } else if (guideKind === 'chest') {
+      comp.mode = 'guide_chest';
+    } else if (guideKind === 'quest') {
+      comp.mode = 'guide_quest';
+    } else {
+      comp.mode = 'follow';
+    }
+
+    const followAlpha = 1 - Math.exp(-6 * dt);
+    comp.x += (targetCompX - comp.x) * followAlpha;
+    comp.z += (targetCompZ - comp.z) * followAlpha;
+  }
+
+  // ==========================================================================
+  // Décor Interactif (réactions non-bloquantes sur attaques/projectiles/sorts)
+  // ==========================================================================
+
+  private resolveDecorMaterial(kind: PropKind): DecorMaterialKind {
+    switch (kind) {
+      case 'rock':
+      case 'snow_rock':
+        return 'stone';
+      case 'barrel':
+      case 'fence':
+      case 'signpost':
+        return 'wood';
+      case 'oak_tree':
+      case 'twisted_tree':
+      case 'snow_pine':
+      case 'bush':
+      case 'flower_patch':
+      case 'mushroom':
+      default:
+        return 'foliage';
+    }
+  }
+
+  private emitDecorHit(
+    id: string,
+    x: number,
+    z: number,
+    decorMaterial: DecorMaterialKind,
+    angle: number,
+    propKind?: PropKind,
+  ): void {
+    if (this.decorHitCooldowns.has(id)) return;
+    this.decorHitCooldowns.set(id, 0.18);
+    this.state.events.push({
+      type: 'decor_hit',
+      x,
+      z,
+      angle,
+      propId: id,
+      propKind,
+      decorMaterial,
+    });
+  }
+
+  private triggerDecorHitsForMelee(meta: AttackMetadata, ox: number, oz: number): void {
+    const centerAngle = (meta.startAngle + meta.endAngle) * 0.5;
+    const arcSpan = Math.max(0.65, Math.abs(meta.endAngle - meta.startAngle));
+    const checkShape = (tx: number, tz: number, tr: number): boolean => {
+      if (meta.attackShape === 'thrust_line') {
+        return isPointInLine(tx, tz, ox, oz, centerAngle, meta.range, 1.3, tr);
+      }
+      if (meta.attackShape === 'cleave') {
+        return isPointInCone(tx, tz, ox, oz, centerAngle, meta.range, Math.max(arcSpan, 2.2), tr);
+      }
+      return isPointInCone(tx, tz, ox, oz, centerAngle, meta.range, arcSpan, tr);
+    };
+
+    if (this.state.zoneId === 'overworld') {
+      const props =
+        this.state.islandId === 'felingard'
+          ? OVERWORLD_DATA.props
+          : NEW_ISLANDS[this.state.islandId].props;
+      for (const prop of props) {
+        if (prop.kind === 'house_cat') continue;
+        const r = prop.colliderRadius ?? (prop.kind === 'flower_patch' || prop.kind === 'bush' ? 0.9 : 0.65);
+        if (checkShape(prop.x, prop.z, r)) {
+          this.emitDecorHit(
+            prop.id,
+            prop.x,
+            prop.z,
+            this.resolveDecorMaterial(prop.kind),
+            centerAngle,
+            prop.kind,
+          );
+        }
+      }
+      return;
+    }
+
+    const dungeonDef = getDungeonDefinition(this.state.zoneId);
+    for (const prop of dungeonDef.props ?? []) {
+      const r = prop.colliderRadius ?? 0.7;
+      if (checkShape(prop.x, prop.z, r)) {
+        this.emitDecorHit(
+          prop.id,
+          prop.x,
+          prop.z,
+          this.resolveDecorMaterial(prop.kind),
+          centerAngle,
+          prop.kind,
+        );
+      }
+    }
+    for (const crystal of this.state.healingCrystals) {
+      if (checkShape(crystal.x, crystal.z, 0.9)) {
+        this.emitDecorHit(crystal.id, crystal.x, crystal.z, 'crystal', centerAngle);
+      }
+    }
+  }
+
+  private triggerDecorHitsForSpell(spellId: SpellId, aimWorldPos: Vec2 | null): void {
+    const spell = SPELLS[spellId];
+    if (!spell) return;
+    if (spell.geometry === 'self_heal' || spell.geometry === 'self_shield') return;
+
+    const p = this.state.player;
+    let cx = p.x;
+    let cz = p.z;
+    const radius = spell.radius;
+    const isLine = spell.geometry === 'line_pierce';
+
+    if (spell.geometry === 'target_meteor_aoe') {
+      if (aimWorldPos) {
+        const clamped = this.clampPointToCurrentZone(aimWorldPos.x, aimWorldPos.z);
+        cx = clamped.x;
+        cz = clamped.z;
+      } else {
+        const castR = spell.castRange ?? 5.5;
+        cx = p.x + Math.cos(p.aimAngle) * castR;
+        cz = p.z + Math.sin(p.aimAngle) * castR;
+      }
+    }
+
+    const checkSpellHit = (tx: number, tz: number, tr: number): boolean =>
+      isLine
+        ? isPointInLine(tx, tz, p.x, p.z, p.aimAngle, spell.radius, 1.4, tr)
+        : isPointInCircle(tx, tz, cx, cz, radius, tr);
+
+    if (this.state.zoneId === 'overworld') {
+      const props =
+        this.state.islandId === 'felingard'
+          ? OVERWORLD_DATA.props
+          : NEW_ISLANDS[this.state.islandId].props;
+      for (const prop of props) {
+        if (prop.kind === 'house_cat') continue;
+        const r = prop.colliderRadius ?? 0.8;
+        if (checkSpellHit(prop.x, prop.z, r)) {
+          this.emitDecorHit(
+            prop.id,
+            prop.x,
+            prop.z,
+            this.resolveDecorMaterial(prop.kind),
+            angleBetween(p.x, p.z, prop.x, prop.z),
+            prop.kind,
+          );
+        }
+      }
+      return;
+    }
+
+    const dungeonDef = getDungeonDefinition(this.state.zoneId);
+    for (const prop of dungeonDef.props ?? []) {
+      const r = prop.colliderRadius ?? 0.7;
+      if (checkSpellHit(prop.x, prop.z, r)) {
+        this.emitDecorHit(
+          prop.id,
+          prop.x,
+          prop.z,
+          this.resolveDecorMaterial(prop.kind),
+          angleBetween(p.x, p.z, prop.x, prop.z),
+          prop.kind,
+        );
+      }
+    }
+    for (const crystal of this.state.healingCrystals) {
+      if (checkSpellHit(crystal.x, crystal.z, 0.9)) {
+        this.emitDecorHit(
+          crystal.id,
+          crystal.x,
+          crystal.z,
+          'crystal',
+          angleBetween(p.x, p.z, crystal.x, crystal.z),
+        );
+      }
+    }
+  }
+
+  private triggerDecorHitsForProjectiles(dt: number): void {
+    const projs = this.state.playerProjectiles;
+    if (projs.length === 0 || dt <= 0) return;
+
+    if (this.state.zoneId === 'overworld') {
+      const props =
+        this.state.islandId === 'felingard'
+          ? OVERWORLD_DATA.props
+          : NEW_ISLANDS[this.state.islandId].props;
+      for (const proj of projs) {
+        const nx = proj.x + proj.vx * dt;
+        const nz = proj.z + proj.vz * dt;
+        const ang = Math.atan2(proj.vz, proj.vx);
+        for (const prop of props) {
+          if (prop.kind === 'house_cat') continue;
+          const r = prop.colliderRadius ?? 0.8;
+          if (circlesOverlap(nx, nz, proj.radius + 0.15, prop.x, prop.z, r)) {
+            this.emitDecorHit(
+              prop.id,
+              prop.x,
+              prop.z,
+              this.resolveDecorMaterial(prop.kind),
+              ang,
+              prop.kind,
+            );
+          }
+        }
+      }
+      return;
+    }
+
+    const dungeonDef = getDungeonDefinition(this.state.zoneId);
+    for (const proj of projs) {
+      const nx = proj.x + proj.vx * dt;
+      const nz = proj.z + proj.vz * dt;
+      const ang = Math.atan2(proj.vz, proj.vx);
+      for (const prop of dungeonDef.props ?? []) {
+        const r = prop.colliderRadius ?? 0.7;
+        if (circlesOverlap(nx, nz, proj.radius + 0.15, prop.x, prop.z, r)) {
+          this.emitDecorHit(
+            prop.id,
+            prop.x,
+            prop.z,
+            this.resolveDecorMaterial(prop.kind),
+            ang,
+            prop.kind,
+          );
+        }
+      }
+      for (const crystal of this.state.healingCrystals) {
+        if (circlesOverlap(nx, nz, proj.radius + 0.15, crystal.x, crystal.z, 0.9)) {
+          this.emitDecorHit(crystal.id, crystal.x, crystal.z, 'crystal', ang);
+        }
+      }
     }
   }
 }

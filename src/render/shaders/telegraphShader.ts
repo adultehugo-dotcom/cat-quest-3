@@ -1,12 +1,47 @@
 import * as THREE from 'three';
-import type { TelegraphShape } from '../../game/types';
+import type { TelegraphElement, TelegraphShape } from '../../game/types';
 
 // ============================================================================
-// Shader GLSL Télégraphes Ennemis en Hologramme Runique
+// Shader GLSL Télégraphes Ennemis Double-Couche (Bordure Runique + Remplissage)
 // Compatible circle (0), cone (1), line (2), ring (3) sur un mesh unique
-// -> ZÉRO z-fighting, bordure runique ornée pulsante, damier énergétique
-//    interne qui se gorge de lumière de 0 % à 100 % jusqu'au flash d'impact !
+// -> ZÉRO z-fighting, codage couleur par élément (physique/glace/feu/poison/spectral)
 // ============================================================================
+
+export interface TelegraphPalette {
+  color: string;
+  brightColor: string;
+}
+
+export function resolveTelegraphPalette(
+  elementOrColor?: TelegraphElement | string,
+): TelegraphPalette {
+  const key = (elementOrColor ?? 'physical').toLowerCase();
+  if (key === 'frost' || key === 'ice' || key === '#38bdf8' || key === '#4ecbff') {
+    return { color: '#2998e6', brightColor: '#9ae6ff' };
+  }
+  if (key === 'fire' || key === 'flame' || key === '#ff6b1a' || key === '#ff7a1f' || key === '#ff4d1a') {
+    return { color: '#ff5e14', brightColor: '#ffd166' };
+  }
+  if (key === 'poison' || key === '#4ade80' || key === '#7ce84b' || key === '#5ce645') {
+    return { color: '#38c754', brightColor: '#b9ff8a' };
+  }
+  if (key === 'spectral' || key === 'curse' || key === '#a855f7' || key === '#a96eff') {
+    return { color: '#9333ea', brightColor: '#e9b8ff' };
+  }
+  if (
+    key === 'physical' ||
+    key === '#ff3b30' ||
+    key === '#ff453a' ||
+    key === '#ff2a00' ||
+    key === '#ff3b1f'
+  ) {
+    return { color: '#ff3b30', brightColor: '#ff8f70' };
+  }
+  if (key.startsWith('#')) {
+    return { color: elementOrColor!, brightColor: '#fff0a8' };
+  }
+  return { color: '#ff3b30', brightColor: '#ff8f70' };
+}
 
 export interface TelegraphShaderOptions {
   /** Rayon (circle/cone/ring) ou longueur (line). */
@@ -17,6 +52,8 @@ export interface TelegraphShaderOptions {
   width?: number;
   /** Angle d'ouverture en radians pour la forme 'cone'. */
   arcAngle?: number;
+  /** Élément optionnel pour résoudre automatiquement la palette double-couche. */
+  element?: TelegraphElement;
   /** Couleur principale de l'hologramme (par défaut rouge cramoisi Cat Quest). */
   color?: THREE.ColorRepresentation;
   /** Couleur vive de la bordure runique et du front de charge. */
@@ -139,14 +176,15 @@ void main() {
 
   float prog = clamp(uProgress, 0.01, 1.0);
 
-  // 1. Bordure runique ornée pulsante (liseré extérieur + filet intérieur + glyphes défilants)
-  float borderPulse = 0.82 + 0.18 * sin(uTime * 8.0);
-  float outerRim = smoothstep(0.13, 0.015, edgeDist);
-  float innerFiligree = smoothstep(0.045, 0.008, abs(edgeDist - 0.33));
+  // 1. Couche externe : Bordure double-contour nette & glyphes runiques
+  float borderPulse = 0.85 + 0.15 * sin(uTime * 8.0);
+  float outerRim = smoothstep(0.14, 0.015, edgeDist);
+  float innerFiligree = smoothstep(0.05, 0.008, abs(edgeDist - 0.31));
 
   float runeScroll = perimeterU * 1.65 + uTime * (1.2 + prog * 1.4);
-  float inRuneBand = smoothstep(0.06, 0.11, edgeDist) * (1.0 - smoothstep(0.28, 0.33, edgeDist));
+  float inRuneBand = smoothstep(0.07, 0.12, edgeDist) * (1.0 - smoothstep(0.26, 0.31, edgeDist));
   float runes = runicGlyphBand(runeScroll, bandV) * inRuneBand;
+  float outerLayerMask = clamp(outerRim + innerFiligree * 0.8 + runes * 0.92, 0.0, 1.0);
 
   // 2. Motif interne en damier / losanges énergétiques animés (style hologramme arcanique)
   vec2 gridPos = vLocalPos * 1.65;
@@ -191,7 +229,7 @@ void main() {
 
   vec3 color = mix(baseDark, filledCol, filledMask);
   color += frontCol * waveFront * 0.95;
-  color = mix(color, borderCol, clamp(outerRim + innerFiligree * 0.75 + runes * 0.92, 0.0, 1.0));
+  color = mix(color, borderCol, outerLayerMask);
 
   // 5. Transparence lisible sur neige claire comme sur donjon sombre
   float baseAlpha = 0.16 + latticeLine * 0.10 + radialSpokes * 0.08;
@@ -210,8 +248,11 @@ export function createTelegraphMaterial(
   shape: TelegraphShape,
   options: TelegraphShaderOptions,
 ): THREE.ShaderMaterial {
-  const baseColor = new THREE.Color(options.color ?? '#ff3b30');
-  const brightColor = new THREE.Color(options.brightColor ?? '#ff8866');
+  const palette = resolveTelegraphPalette(
+    options.element ?? (typeof options.color === 'string' ? options.color : undefined),
+  );
+  const baseColor = new THREE.Color(options.color ?? palette.color);
+  const brightColor = new THREE.Color(options.brightColor ?? palette.brightColor);
 
   return new THREE.ShaderMaterial({
     name: `TelegraphRuneShader_${shape}`,

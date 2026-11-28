@@ -147,6 +147,10 @@ export const DUNGEON_GHOST_CAVE: DungeonDefinition = {
     },
   ],
   healingCrystals: [],
+  props: [
+    { id: 'gc_barrel_1', kind: 'barrel', x: -13.5, z: 21.5, scale: 1.0, collidable: false },
+    { id: 'gc_barrel_2', kind: 'barrel', x: 13.5, z: 21.5, scale: 1.0, collidable: false },
+  ],
   bossTypeId: 'boss_rat_king',
   bossArenaCenter: { x: 0, z: -17 },
   musicTrack: 'dungeon',
@@ -264,6 +268,10 @@ export const DUNGEON_DRAGON_LAIR: DungeonDefinition = {
       z: 12,
       label: 'Toucher le Cristal de Soin (100 % PV & PM)',
     },
+  ],
+  props: [
+    { id: 'dl_barrel_1', kind: 'barrel', x: -8.2, z: 22.0, scale: 1.0, collidable: false },
+    { id: 'dl_barrel_2', kind: 'barrel', x: 8.2, z: 22.0, scale: 1.0, collidable: false },
   ],
   bossTypeId: 'boss_dragon_claw',
   bossArenaCenter: { x: 0, z: -10 },

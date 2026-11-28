@@ -293,16 +293,98 @@ describe('SaveSystem — Persistance, Validation & Résilience JSON', () => {
     expect(validateSaveData(snapDisembark)).not.toBeNull();
   });
 
-  it('persiste et valide les préférences audio sous felingard_audio_prefs_v1', () => {
+  it('persiste, valide et migre les préférences audio 4 bus sous felingard_audio_prefs_v1', () => {
     const storage = createMemoryStorage();
 
-    // Par défaut
+    // Par défaut (6 champs + master/volume unifié à 0.85)
     expect(loadAudioPrefs(storage)).toEqual(DEFAULT_AUDIO_PREFS);
+    expect(DEFAULT_AUDIO_PREFS.master).toBe(0.85);
+    expect(DEFAULT_AUDIO_PREFS.volume).toBe(0.85);
 
-    // Sauvegarde + clamp volume [0, 1]
-    expect(saveAudioPrefs({ muted: true, volume: 1.5 }, storage)).toBe(true);
+    // Sauvegarde + clamp volumes [0, 1] & synchronisation master/volume
+    expect(
+      saveAudioPrefs(
+        {
+          muted: true,
+          volume: 1.5,
+          master: 1.5,
+          music: 0.45,
+          sfx: 1.2,
+          ambience: -0.1,
+        },
+        storage,
+      ),
+    ).toBe(true);
     expect(storage.getItem(AUDIO_PREFS_STORAGE_KEY)).not.toBeNull();
-    expect(loadAudioPrefs(storage)).toEqual({ muted: true, volume: 1 });
+    expect(loadAudioPrefs(storage)).toEqual({
+      muted: true,
+      volume: 1,
+      master: 1,
+      music: 0.45,
+      sfx: 1,
+      ambience: 0,
+    });
+
+    // Migration silencieuse de l'ancien format { muted, volume }
+    storage.setItem(
+      AUDIO_PREFS_STORAGE_KEY,
+      JSON.stringify({ muted: false, volume: 0.5 }),
+    );
+    expect(loadAudioPrefs(storage)).toEqual({
+      muted: false,
+      volume: 0.5,
+      master: 0.5,
+      music: 1,
+      sfx: 1,
+      ambience: 1,
+    });
+
+    // Préserve les bus valides même si master/volume sont null ou absents
+    storage.setItem(
+      AUDIO_PREFS_STORAGE_KEY,
+      JSON.stringify({
+        muted: false,
+        master: null,
+        music: 0.3,
+        sfx: 0.4,
+        ambience: 0.5,
+      }),
+    );
+    expect(loadAudioPrefs(storage)).toEqual({
+      muted: false,
+      volume: 0.85,
+      master: 0.85,
+      music: 0.3,
+      sfx: 0.4,
+      ambience: 0.5,
+    });
+
+    storage.setItem(
+      AUDIO_PREFS_STORAGE_KEY,
+      JSON.stringify({
+        muted: true,
+        music: 0.2,
+        sfx: 0.6,
+        ambience: 0.1,
+      }),
+    );
+    expect(loadAudioPrefs(storage)).toEqual({
+      muted: true,
+      volume: 0.85,
+      master: 0.85,
+      music: 0.2,
+      sfx: 0.6,
+      ambience: 0.1,
+    });
+
+    // Rejette les payloads sans booléen muted ou non-objets
+    storage.setItem(
+      AUDIO_PREFS_STORAGE_KEY,
+      JSON.stringify({ music: 0.3, sfx: 0.4 }),
+    );
+    expect(loadAudioPrefs(storage)).toEqual(DEFAULT_AUDIO_PREFS);
+    storage.setItem(AUDIO_PREFS_STORAGE_KEY, '[1, 2, 3]');
+    expect(loadAudioPrefs(storage)).toEqual(DEFAULT_AUDIO_PREFS);
 
     // Résilience JSON corrompu
     storage.setItem(AUDIO_PREFS_STORAGE_KEY, 'not-json');

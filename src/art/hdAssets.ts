@@ -56,15 +56,6 @@ export type HdEquipmentKey =
   | 'blade_dragon'
   | 'shield_wood'
   | 'shield_knight'
-  | 'trinket_yarn'
-  | 'boots_leather'
-  | 'boots_iron'
-  | 'boots_arcane'
-  | 'boots_dragon'
-  | 'gloves_leather'
-  | 'gloves_iron'
-  | 'gloves_arcane'
-  | 'gloves_dragon'
   | 'cape_traveler'
   | 'cape_knight'
   | 'cape_starlight'
@@ -263,7 +254,6 @@ export const HERO_ANIM_CLIPS: Readonly<Record<HeroAnimState, SpriteAnimClipDescr
     loop: true,
     targetGrid: { cols: 6, rows: 5, frameCount: 30, cellWidth: 512, cellHeight: 512 },
     legacyGrid: { cols: 1, rows: 1, frameCount: 1, cellWidth: 512, cellHeight: 512 },
-    frameSequenceKeys: ['hero_base_walk1', 'hero_base_walk2'],
     pivot: HERO_PIVOT,
     lateralFlipOnly: true,
   },
@@ -593,7 +583,7 @@ export const HD_ENEMY_PHASE2_SHEET_FILES: Partial<Record<HdEnemySheetKey, string
 /** Textures planes de tissu de cape dédiées au maillage Verlet 3D (vide par défaut -> zéro 404) */
 export const HD_CAPE_FABRIC_FILES: Partial<Record<HdCapeKey, string>> = {};
 
-/** Pièces d'équipement modulaires externes séparées (8 emplacements actifs, aucune arme secondaire) */
+/** Pièces d'équipement modulaires externes séparées (5 emplacements actifs, aucune arme secondaire) */
 export const HD_EQUIPMENT_FILES: Record<HdEquipmentKey, string> = {
   armor_tunic: 'assets/equipment/armor_tunic.png',
   armor_mail: 'assets/equipment/armor_mail.png',
@@ -609,15 +599,6 @@ export const HD_EQUIPMENT_FILES: Record<HdEquipmentKey, string> = {
   blade_dragon: 'assets/equipment/blade_dragon.png',
   shield_wood: 'assets/equipment/shield_wood.png',
   shield_knight: 'assets/equipment/shield_knight.png',
-  trinket_yarn: 'assets/equipment/trinket_yarn.png',
-  boots_leather: 'assets/equipment/boots_leather.png',
-  boots_iron: 'assets/equipment/boots_iron.png',
-  boots_arcane: 'assets/equipment/boots_arcane.png',
-  boots_dragon: 'assets/equipment/boots_dragon.png',
-  gloves_leather: 'assets/equipment/gloves_leather.png',
-  gloves_iron: 'assets/equipment/gloves_iron.png',
-  gloves_arcane: 'assets/equipment/gloves_arcane.png',
-  gloves_dragon: 'assets/equipment/gloves_dragon.png',
   cape_traveler: 'assets/equipment/cape_traveler.png',
   cape_knight: 'assets/equipment/cape_knight.png',
   cape_starlight: 'assets/equipment/cape_starlight.png',
@@ -870,7 +851,7 @@ export function resolveEnemyAtlasStateGrid(
   }
 
   // Atlas 90 cellules empaqueté (30f idle + 30f move + 15f windup + 15f attack, ex: 10×9 ou 15×6)
-  for (const candidateCell of [512, 256, 192, 128, 64]) {
+  for (const candidateCell of [512, 384, 256, 192, 128, 64]) {
     if (imageWidth % candidateCell === 0 && imageHeight % candidateCell === 0) {
       const cols = imageWidth / candidateCell;
       const rows = imageHeight / candidateCell;
@@ -1106,6 +1087,25 @@ export function configureDioramaTexture(
   return tex;
 }
 
+/**
+ * Configure une spritesheet multi-cellules sans aucun débordement inter-cellules
+ * (`SRGBColorSpace`, `LinearFilter`, mipmaps désactivés, `ClampToEdgeWrapping`).
+ */
+export function configureSpritesheetTexture(
+  tex: THREE.Texture,
+  anisotropy = 1,
+): THREE.Texture {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.generateMipmaps = false;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = Math.max(1, anisotropy);
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 export function extractHtmlImage(
   tex: THREE.Texture | undefined,
 ): HTMLImageElement | undefined {
@@ -1133,3 +1133,465 @@ export async function loadTextureSafe(
     return null;
   }
 }
+
+// ============================================================================
+// Pipeline 2.5D/3D 30 FPS — Accumulateur à pas fixe, 16 grilles canoniques,
+// découpage 6 états × 15 frames (90 frames) & Manifeste JSON
+// ============================================================================
+
+export const FIXED_ANIM_STEP_SEC = 1 / TARGET_ANIMATION_FPS;
+
+export interface FixedStepAnimClock {
+  accumulator: number;
+  tickCount: number;
+  alpha: number;
+}
+
+export function createFixedStepAnimClock(): FixedStepAnimClock {
+  return {
+    accumulator: 0,
+    tickCount: 0,
+    alpha: 0,
+  };
+}
+
+/**
+ * Fait progresser un accumulateur à pas fixe calibré exactement à 30 FPS (`1/30` s),
+ * totalement découplé du framerate de rendu WebGL (60/120/144 Hz ou variable).
+ * Retourne le nombre de ticks entiers 30 FPS consommés durant ce frame.
+ */
+export function stepFixed30FpsClock(
+  clock: FixedStepAnimClock,
+  dt: number,
+  maxStepsPerFrame = 6,
+): number {
+  const safeDt = Number.isFinite(dt) && dt > 0 ? Math.min(dt, 0.25) : 0;
+  clock.accumulator += safeDt;
+  let steps = 0;
+  while (clock.accumulator + 1e-7 >= FIXED_ANIM_STEP_SEC && steps < maxStepsPerFrame) {
+    clock.accumulator = Math.max(0, clock.accumulator - FIXED_ANIM_STEP_SEC);
+    clock.tickCount += 1;
+    steps += 1;
+  }
+  clock.alpha = Math.max(0, Math.min(1, clock.accumulator / FIXED_ANIM_STEP_SEC));
+  return steps;
+}
+
+export type CanonicalSheetId =
+  | 'hero_base_idle'
+  | 'hero_base_walk'
+  | 'hero_base_attack'
+  | 'hero_base_roll'
+  | 'miaou_sprit'
+  | 'mayor_moustache'
+  | 'slime_yarn'
+  | 'mouse_goblin'
+  | 'thorn_wolf'
+  | 'fishbone_skeleton'
+  | 'frost_golem'
+  | 'boss_rat_king'
+  | 'boss_dragon_claw'
+  | 'boss_dragon_claw_p2'
+  | 'portal_exit'
+  | 'prop_torch';
+
+export interface SpritePivot {
+  x: number;
+  y: number;
+}
+
+export interface CanonicalSheetSpec {
+  readonly id: CanonicalSheetId;
+  readonly category: 'hero' | 'npc' | 'enemy' | 'boss' | 'prop';
+  readonly file: string;
+  readonly cols: number;
+  readonly rows: number;
+  readonly cellWidth: number;
+  readonly cellHeight: number;
+  readonly frameCount: number;
+  readonly fps: number;
+  readonly loop: boolean;
+  readonly phase: 1 | 2;
+  readonly pivot: Readonly<SpritePivot>;
+}
+
+/**
+ * Tableau canonique exact des 16 spritesheets 30 FPS du pipeline Paper-Cutout 3D.
+ */
+export const CANONICAL_16_SPRITESHEETS: Readonly<Record<CanonicalSheetId, CanonicalSheetSpec>> = {
+  hero_base_idle: {
+    id: 'hero_base_idle',
+    category: 'hero',
+    file: 'assets/characters/hero_base_idle_sheet.png',
+    cols: 6,
+    rows: 5,
+    cellWidth: 512,
+    cellHeight: 512,
+    frameCount: 30,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  hero_base_walk: {
+    id: 'hero_base_walk',
+    category: 'hero',
+    file: 'assets/characters/hero_base_walk_sheet.png',
+    cols: 6,
+    rows: 5,
+    cellWidth: 512,
+    cellHeight: 512,
+    frameCount: 30,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  hero_base_attack: {
+    id: 'hero_base_attack',
+    category: 'hero',
+    file: 'assets/characters/hero_base_attack_sheet.png',
+    cols: 5,
+    rows: 3,
+    cellWidth: 512,
+    cellHeight: 512,
+    frameCount: 15,
+    fps: 30,
+    loop: false,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  hero_base_roll: {
+    id: 'hero_base_roll',
+    category: 'hero',
+    file: 'assets/characters/hero_base_roll_sheet.png',
+    cols: 5,
+    rows: 3,
+    cellWidth: 512,
+    cellHeight: 512,
+    frameCount: 15,
+    fps: 30,
+    loop: false,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  miaou_sprit: {
+    id: 'miaou_sprit',
+    category: 'npc',
+    file: 'assets/characters/miaou_sprit_sheet.png',
+    cols: 6,
+    rows: 5,
+    cellWidth: 512,
+    cellHeight: 512,
+    frameCount: 30,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.08 },
+  },
+  mayor_moustache: {
+    id: 'mayor_moustache',
+    category: 'npc',
+    file: 'assets/characters/mayor_moustache_sheet.png',
+    cols: 9,
+    rows: 5,
+    cellWidth: 384,
+    cellHeight: 384,
+    frameCount: 45,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  slime_yarn: {
+    id: 'slime_yarn',
+    category: 'enemy',
+    file: 'assets/characters/slime_yarn_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 256,
+    cellHeight: 256,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  mouse_goblin: {
+    id: 'mouse_goblin',
+    category: 'enemy',
+    file: 'assets/characters/mouse_goblin_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 256,
+    cellHeight: 256,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  thorn_wolf: {
+    id: 'thorn_wolf',
+    category: 'enemy',
+    file: 'assets/characters/thorn_wolf_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 256,
+    cellHeight: 256,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  fishbone_skeleton: {
+    id: 'fishbone_skeleton',
+    category: 'enemy',
+    file: 'assets/characters/fishbone_skeleton_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 256,
+    cellHeight: 256,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  frost_golem: {
+    id: 'frost_golem',
+    category: 'enemy',
+    file: 'assets/characters/frost_golem_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 384,
+    cellHeight: 384,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  boss_rat_king: {
+    id: 'boss_rat_king',
+    category: 'boss',
+    file: 'assets/characters/boss_rat_king_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 384,
+    cellHeight: 384,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  boss_dragon_claw: {
+    id: 'boss_dragon_claw',
+    category: 'boss',
+    file: 'assets/characters/boss_dragon_claw_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 384,
+    cellHeight: 384,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  boss_dragon_claw_p2: {
+    id: 'boss_dragon_claw_p2',
+    category: 'boss',
+    file: 'assets/characters/boss_dragon_claw_p2_sheet.png',
+    cols: 10,
+    rows: 9,
+    cellWidth: 384,
+    cellHeight: 384,
+    frameCount: 90,
+    fps: 30,
+    loop: true,
+    phase: 2,
+    pivot: { x: 0.5, y: 0.06 },
+  },
+  portal_exit: {
+    id: 'portal_exit',
+    category: 'prop',
+    file: 'assets/props/portal_exit_sheet.png',
+    cols: 6,
+    rows: 5,
+    cellWidth: 256,
+    cellHeight: 256,
+    frameCount: 30,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.05 },
+  },
+  prop_torch: {
+    id: 'prop_torch',
+    category: 'prop',
+    file: 'assets/props/prop_torch_sheet.png',
+    cols: 5,
+    rows: 3,
+    cellWidth: 256,
+    cellHeight: 256,
+    frameCount: 15,
+    fps: 30,
+    loop: true,
+    phase: 1,
+    pivot: { x: 0.5, y: 0.05 },
+  },
+};
+
+export const ENEMY_SIX_STATE_ORDER: readonly EnemyAnimState[] = [
+  'idle',
+  'move',
+  'windup',
+  'attack',
+  'hurt',
+  'death',
+];
+
+/**
+ * Découpe une spritesheet ennemie/boss 90 frames (10×9) en **6 états complets
+ * de 15 frames chacun** (0..14 idle, 15..29 move, 30..44 windup, 45..59 attack,
+ * 60..74 hurt, 75..89 death). Zéro repli legacy 4×1.
+ */
+export function resolveEnemySixStateGrid(
+  enemyKey: HdEnemySheetKey,
+  state: EnemyAnimState,
+  imageWidth: number,
+  imageHeight: number,
+): SpriteGridSpec {
+  const canonical = CANONICAL_16_SPRITESHEETS[enemyKey];
+  const stateIdx = ENEMY_SIX_STATE_ORDER.indexOf(state);
+  const safeStateIdx = stateIdx >= 0 ? stateIdx : 0;
+
+  if (imageWidth > 0 && imageHeight > 0) {
+    const isExact10x9 =
+      (imageWidth === canonical.cols * canonical.cellWidth &&
+        imageHeight === canonical.rows * canonical.cellHeight) ||
+      (imageWidth === 10 * 256 && imageHeight === 9 * 256) ||
+      (imageWidth === 10 * 384 && imageHeight === 9 * 384);
+
+    if (isExact10x9) {
+      const cellW = Math.round(imageWidth / 10);
+      const cellH = Math.round(imageHeight / 9);
+      return {
+        cols: 10,
+        rows: 9,
+        frameCount: 15,
+        startFrame: safeStateIdx * 15,
+        cellWidth: cellW,
+        cellHeight: cellH,
+      };
+    }
+  }
+
+  return {
+    cols: 1,
+    rows: 1,
+    frameCount: 1,
+    startFrame: 0,
+    cellWidth: Math.max(1, imageWidth || canonical.cellWidth),
+    cellHeight: Math.max(1, imageHeight || canonical.cellHeight),
+  };
+}
+
+/**
+ * Découpe la feuille 45 frames (9×5, 384×384) du Maire Moustache en 3 états :
+ * `idle` (0..14), `talk` (15..29), `greet` (30..44).
+ */
+export function resolveMayorMoustacheGrid(
+  state: 'idle' | 'talk' | 'greet',
+  imageWidth: number,
+  imageHeight: number,
+): SpriteGridSpec {
+  if (imageWidth === 9 * 384 && imageHeight === 5 * 384) {
+    const startFrame = state === 'idle' ? 0 : state === 'talk' ? 15 : 30;
+    return {
+      cols: 9,
+      rows: 5,
+      frameCount: 15,
+      startFrame,
+      cellWidth: 384,
+      cellHeight: 384,
+    };
+  }
+  return { cols: 1, rows: 1, frameCount: 1, startFrame: 0 };
+}
+
+export interface ManifestSocketTransform {
+  x: number;
+  y: number;
+  z: number;
+  rot: number;
+  sx?: number;
+  sy?: number;
+}
+
+export interface AnimationManifestSheetEntry {
+  id: CanonicalSheetId;
+  category: 'hero' | 'npc' | 'enemy' | 'boss' | 'prop';
+  file: string;
+  sourceFile: string;
+  baked: boolean;
+  fps: number;
+  cols: number;
+  rows: number;
+  cellWidth: number;
+  cellHeight: number;
+  atlasWidth: number;
+  atlasHeight: number;
+  frameCount: number;
+  pivot: SpritePivot;
+  loop: boolean;
+  phase: 1 | 2;
+  zLayerStep: number;
+  states: Record<string, { startFrame: number; frameCount: number; loop: boolean }>;
+  sockets?: Array<Record<string, ManifestSocketTransform>>;
+}
+
+export interface ChestOpeningSheetManifestEntry {
+  id: 'chest_opening';
+  file: string;
+  baked: boolean;
+  fps: number;
+  cols: number;
+  rows: number;
+  cellWidth: number;
+  cellHeight: number;
+  atlasWidth: number;
+  atlasHeight: number;
+  frameCount: number;
+  loop: boolean;
+}
+
+export interface AnimationManifest {
+  version: number;
+  pipeline: string;
+  fps: number;
+  fixedStepSec: number;
+  zLayerOffset: number;
+  paperFlipOvershootDeg: number;
+  sheetCount: number;
+  socketIds: string[];
+  sheets: Record<CanonicalSheetId, AnimationManifestSheetEntry>;
+  chestOpeningSheet?: ChestOpeningSheetManifestEntry;
+}
+
+export async function loadAnimationManifestSafe(): Promise<AnimationManifest | null> {
+  if (typeof fetch !== 'function') return null;
+  try {
+    const resp = await fetch(resolveAssetUrl('assets/animations_manifest.json'));
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as AnimationManifest;
+    if (!data || typeof data !== 'object' || !data.sheets) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+

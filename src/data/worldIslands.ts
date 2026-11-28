@@ -77,7 +77,12 @@ function createIslandCamp(
   };
 }
 
-function createIslandChest(islandId: IslandId, x: number, z: number): ChestDef {
+function createIslandChest(
+  islandId: IslandId,
+  x: number,
+  z: number,
+  guaranteedItemId?: string,
+): ChestDef {
   return {
     id: `chest_${islandId}_shore`,
     zoneId: 'overworld',
@@ -85,7 +90,11 @@ function createIslandChest(islandId: IslandId, x: number, z: number): ChestDef {
     z,
     tier: 'rare',
     label: 'Ouvrir le coffre de l’île',
-    loot: { gold: 90, rarityWeights: { common: 0.35, rare: 0.55, epic: 0.1 } },
+    loot: {
+      gold: 90,
+      ...(guaranteedItemId ? { guaranteedItemId } : {}),
+      rarityWeights: { common: 0.35, rare: 0.55, epic: 0.1 },
+    },
   };
 }
 
@@ -101,9 +110,13 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     description: 'Un paradis tropical aux eaux cristallines et au sable fin.',
     radiusOffset: -1.6,
     macroCount: 600,
-    props: createIslandProps('tropical', 92, 48, ['oak_tree', 'flower_patch', 'rock']),
+    props: [
+      ...createIslandProps('tropical', 92, 48, ['oak_tree', 'flower_patch', 'rock']),
+      { id: 'tropical_bush_1', kind: 'bush', x: 86, z: 54, scale: 1.05, collidable: false },
+      { id: 'tropical_barrel_1', kind: 'barrel', x: 83, z: 46, scale: 0.95, collidable: false },
+    ],
     camps: [createIslandCamp('tropical', 'tropical', 92, 48, ['slime_yarn', 'mouse_goblin'])],
-    chests: [createIslandChest('tropical', 82, 43)],
+    chests: [createIslandChest('tropical', 82, 43, 'claws_lynx')],
   },
   mountain: {
     id: 'mountain',
@@ -117,7 +130,7 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     macroCount: 500,
     props: createIslandProps('mountain', 75, -85, ['snow_pine', 'snow_rock', 'flower_patch']),
     camps: [createIslandCamp('mountain', 'mountain', 75, -85, ['fishbone_skeleton', 'frost_golem'])],
-    chests: [createIslandChest('mountain', 65, -80)],
+    chests: [createIslandChest('mountain', 65, -80, 'hammer_frost')],
   },
   mystic: {
     id: 'mystic',
@@ -131,7 +144,7 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     macroCount: 550,
     props: createIslandProps('mystic', -80, 60, ['twisted_tree', 'mushroom', 'rock']),
     camps: [createIslandCamp('mystic', 'mystic', -80, 60, ['mouse_goblin', 'fishbone_skeleton'])],
-    chests: [createIslandChest('mystic', -70, 55)],
+    chests: [createIslandChest('mystic', -70, 55, 'staff_ember')],
   },
   wild: {
     id: 'wild',
@@ -143,9 +156,12 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     description: 'Une jungle dense et inexplorée où la nature règne en maître.',
     radiusOffset: -1.6,
     macroCount: 700,
-    props: createIslandProps('wild', -95, -75, ['twisted_tree', 'oak_tree', 'mushroom']),
+    props: [
+      ...createIslandProps('wild', -95, -75, ['twisted_tree', 'oak_tree', 'mushroom']),
+      { id: 'wild_bush_1', kind: 'bush', x: -89, z: -69, scale: 1.1, collidable: false },
+    ],
     camps: [createIslandCamp('wild', 'wild', -95, -75, ['thorn_wolf', 'thorn_wolf', 'mouse_goblin'])],
-    chests: [createIslandChest('wild', -85, -70)],
+    chests: [createIslandChest('wild', -85, -70, 'bow_hunter')],
   },
   archipelago: {
     id: 'archipelago',
@@ -159,7 +175,7 @@ export const NEW_ISLANDS: Record<NewIslandId, IslandDef> = {
     macroCount: 400,
     props: createIslandProps('archipelago', 18, -108, ['oak_tree', 'flower_patch', 'rock']),
     camps: [createIslandCamp('archipelago', 'wild', 18, -108, ['slime_yarn', 'mouse_goblin'])],
-    chests: [createIslandChest('archipelago', 11, -103)],
+    chests: [createIslandChest('archipelago', 11, -103, 'spear_fishbone')],
   },
 };
 

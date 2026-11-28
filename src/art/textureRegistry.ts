@@ -23,6 +23,8 @@ import {
   HD_SURFACE_FILES,
   HERO_ANIM_CLIPS,
   NPC_ANIM_CLIPS,
+  type AnimationManifest,
+  type CanonicalSheetId,
   type EnemyAnimState,
   type HdCapeKey,
   type HdCharacterKey,
@@ -40,12 +42,16 @@ import {
   type SpriteAnimClipDescriptor,
   type SpriteGridSpec,
   configureDioramaTexture,
+  configureSpritesheetTexture,
   extractHtmlImage,
   getTextureDimensions,
+  loadAnimationManifestSafe,
   loadTextureSafe,
   normalizeSpriteGridSpec,
   resolveActiveSpriteGrid,
   resolveEnemyAtlasStateGrid,
+  resolveEnemySixStateGrid,
+  resolveMayorMoustacheGrid,
 } from './hdAssets';
 import {
   OCEAN_PALETTE,
@@ -54,13 +60,28 @@ import {
   drawStar,
 } from './palette';
 import {
+  type ArmorFitTransform,
   type HeroAnimFrame,
   type HeroModularImages,
+  computeIdealArmorFit,
+  createFittedArmorCanvas,
   drawHeroCanvas,
   drawHeroFullPreviewDataUrl,
+  drawHeroLanternCanvas,
   drawHeroPortraitDataUrl,
+  drawProceduralWeaponCanvas,
   getHeroBodyTextureKey,
+  measureArmorImageMetrics,
 } from './spriteHero';
+import {
+  type EquipmentCalibrationEntry,
+  type NormalizedEquipmentFit,
+  computeNormalizedEquipmentFit,
+  createNormalizedEquipmentCanvas,
+  getEquipmentCalibration,
+} from './equipmentRig';
+import { getEquipmentDefinition } from '../data/equipmentData';
+import { VFX_ASSETS, type VfxAssetId } from './vfxManifest';
 import {
   type HdPortraitImages,
   drawBossDragonPhase2HdCanvas,
@@ -74,11 +95,13 @@ import {
   drawBuildingCanvas,
   drawChestCanvas,
   drawChestHdCanvas,
+  drawChestOpeningFrameCanvas,
   drawDungeonEntranceCanvas,
   drawDungeonEntranceHdCanvas,
   drawDungeonExitPortalCanvas,
   drawHealingCrystalCanvas,
   drawHealingCrystalHdCanvas,
+  drawLamppostCanvas,
   drawPillarCanvas,
   drawPillarHdCanvas,
   drawPropCanvas,
@@ -91,6 +114,7 @@ import {
   generateDungeonPbrCanvases,
   generateDungeonWallPbrCanvases,
   generateOverworldPbrCanvases,
+  getArchipelagoMapCanvas,
   getOverworldMiniMapDataUrl,
 } from './mapTexture';
 
@@ -235,12 +259,28 @@ export class TextureRegistry {
   private readonly hdNpcFrameSequences = new Map<string, readonly THREE.Texture[]>();
 
   private readonly hdEquipment = new Map<HdEquipmentKey, THREE.Texture>();
+  private readonly fittedArmorCache = new Map<
+    string,
+    { texture: THREE.Texture; ownsTexture: boolean; fit: ArmorFitTransform }
+  >();
+  private readonly normalizedEquipmentCache = new Map<
+    string,
+    {
+      texture: THREE.Texture;
+      ownsTexture: boolean;
+      calibration: EquipmentCalibrationEntry;
+      fit: NormalizedEquipmentFit;
+    }
+  >();
   private readonly hdEquipmentSheets = new Map<
     HdEquipmentKey,
     Partial<Record<HeroAnimState, THREE.Texture>>
   >();
   private readonly hdCapeFabrics = new Map<string, THREE.Texture>();
   private readonly hdProps = new Map<HdPropKey, THREE.Texture>();
+  private readonly hdPropSheets = new Map<string, THREE.Texture>();
+  private readonly vfxTextures = new Map<VfxAssetId, THREE.Texture>();
+  private animationManifest: AnimationManifest | null = null;
   private readonly hdSurfaces = new Map<
     HdSurfaceKey,
     Partial<Record<HdPbrChannel, THREE.Texture>>
@@ -312,6 +352,12 @@ export class TextureRegistry {
       tex.anisotropy = this.maxAnisotropy;
     }
     for (const tex of this.hdProps.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.hdPropSheets.values()) {
+      tex.anisotropy = this.maxAnisotropy;
+    }
+    for (const tex of this.vfxTextures.values()) {
       tex.anisotropy = this.maxAnisotropy;
     }
     for (const surf of this.hdSurfaces.values()) {
@@ -699,6 +745,107 @@ export class TextureRegistry {
       }
     }
 
+    for (const entry of Object.values(VFX_ASSETS)) {
+      const isDataMap = Boolean(entry.dataMap);
+      const repeat = entry.kind === 'normalMap';
+      tasks.push(
+        loadTextureSafe(loader, entry.path, {
+          isDataMap,
+          repeat,
+          anisotropy: this.maxAnisotropy,
+        }).then((tex) => {
+          if (!tex) return false;
+          if (entry.kind === 'flipbook' || entry.frames > 1) {
+            configureSpritesheetTexture(tex, this.maxAnisotropy);
+          }
+          this.vfxTextures.set(entry.id, tex);
+          return true;
+        }),
+      );
+    }
+
+    const manifest = await loadAnimationManifestSafe();
+    this.animationManifest = manifest;
+    if (manifest) {
+      for (const [sheetId, spec] of Object.entries(manifest.sheets) as Array<
+        [CanonicalSheetId, AnimationManifest['sheets'][CanonicalSheetId]]
+      >) {
+        if (!spec || !spec.baked || !spec.file) continue;
+        tasks.push(
+          loadTextureSafe(loader, spec.file, {
+            isDataMap: false,
+            repeat: false,
+            anisotropy: this.maxAnisotropy,
+          }).then((tex) => {
+            if (!tex) return false;
+            configureSpritesheetTexture(tex, this.maxAnisotropy);
+            const grid: SpriteGridSpec = {
+              cols: spec.cols,
+              rows: spec.rows,
+              frameCount: spec.frameCount,
+              startFrame: 0,
+              cellWidth: spec.cellWidth,
+              cellHeight: spec.cellHeight,
+            };
+            if (sheetId === 'hero_base_idle') {
+              this.hdHeroSheets.set('idle', tex);
+              this.hdHeroSheetGridOverrides.set('idle', grid);
+            } else if (sheetId === 'hero_base_walk') {
+              this.hdHeroSheets.set('walk', tex);
+              this.hdHeroSheetGridOverrides.set('walk', grid);
+            } else if (sheetId === 'hero_base_attack') {
+              this.hdHeroSheets.set('attack', tex);
+              this.hdHeroSheetGridOverrides.set('attack', grid);
+            } else if (sheetId === 'hero_base_roll') {
+              this.hdHeroSheets.set('roll', tex);
+              this.hdHeroSheetGridOverrides.set('roll', grid);
+            } else if (sheetId === 'miaou_sprit') {
+              // Conserve hdCharacters('miaou_sprit') en 512×512 pour les portraits de dialogue
+              this.hdNpcStateSheets.set('miaou_sprit|sheet', tex);
+              this.hdNpcGridOverrides.set('miaou_sprit|sheet', grid);
+            } else if (sheetId === 'mayor_moustache') {
+              // Conserve hdCharacters('mayor_moustache') en 512×512 pour les portraits de dialogue
+              this.hdNpcStateSheets.set('mayor_moustache|sheet', tex);
+              this.hdNpcGridOverrides.set('mayor_moustache|sheet', grid);
+            } else if (sheetId === 'boss_dragon_claw_p2') {
+              // Pas d'override 90f global : resolveEnemySixStateGrid découpe les 6 états × 15 frames
+              this.hdEnemyPhase2Sheets.set('boss_dragon_claw', tex);
+              this.hdEnemyGridOverrides.delete('boss_dragon_claw|*|p2');
+            } else if (
+              sheetId === 'slime_yarn' ||
+              sheetId === 'mouse_goblin' ||
+              sheetId === 'thorn_wolf' ||
+              sheetId === 'fishbone_skeleton' ||
+              sheetId === 'frost_golem' ||
+              sheetId === 'boss_rat_king' ||
+              sheetId === 'boss_dragon_claw'
+            ) {
+              this.hdEnemySheets.set(sheetId, tex);
+              this.hdEnemyGridOverrides.delete(`${sheetId}|*|p1`);
+            } else if (sheetId === 'portal_exit' || sheetId === 'prop_torch') {
+              this.hdPropSheets.set(sheetId, tex);
+            }
+            return true;
+          }),
+        );
+      }
+
+      if (manifest.chestOpeningSheet?.baked && manifest.chestOpeningSheet.file) {
+        tasks.push(
+          loadTextureSafe(loader, manifest.chestOpeningSheet.file, {
+            isDataMap: false,
+            repeat: false,
+            anisotropy: this.maxAnisotropy,
+          }).then((tex) => {
+            if (!tex) return false;
+            configureSpritesheetTexture(tex, this.maxAnisotropy);
+            this.hdPropSheets.set('chest_opening', tex);
+            return true;
+          }),
+        );
+      }
+    }
+
     const results = await Promise.all(tasks);
     const loaded = results.filter(Boolean).length;
     const total = results.length;
@@ -724,12 +871,24 @@ export class TextureRegistry {
       'pillar_',
       'crystal_',
     ];
+    // Ne jamais détruire les textures purement procédurales sans équivalent PNG HD
+    // (sinon la lanterne du joueur et les 16 lampadaires diurnes perdent leur texture GPU).
+    const proceduralOnlyPrefixes = ['hero_lantern_', 'prop_lamppost_'];
     for (const [key, tex] of this.cache.entries()) {
+      if (proceduralOnlyPrefixes.some((p) => key.startsWith(p))) {
+        continue;
+      }
       if (prefixesToRefresh.some((p) => key.startsWith(p))) {
         this.retiredTextures.push(tex);
         this.cache.delete(key);
       }
     }
+    for (const entry of this.fittedArmorCache.values()) {
+      if (entry.ownsTexture) {
+        this.retiredTextures.push(entry.texture);
+      }
+    }
+    this.fittedArmorCache.clear();
     for (const set of this.overworldPbrCache.values()) {
       this.retiredTextures.push(set.map, set.normalMap, set.roughnessMap);
     }
@@ -934,7 +1093,7 @@ export class TextureRegistry {
       return resolved;
     }
 
-    // 2. Planche multi-frames enregistrée directement (ex: DataTexture ou sheet pré-assemblée)
+    // 2. Planche multi-frames 30 FPS dédiée (mode uv-grid GPU direct, zéro boucle Canvas2D)
     const directSheet = this.hdHeroSheets.get(state);
     if (directSheet) {
       const dims = getTextureDimensions(directSheet);
@@ -945,100 +1104,51 @@ export class TextureRegistry {
         dims?.height ?? 0,
         override,
       );
-      const sheetHtmlImg = extractHtmlImage(directSheet);
-      if (!sheetHtmlImg) {
-        const resolved: ResolvedSpriteClipSource = {
-          clip,
-          mode: 'uv-grid',
-          grid,
-          frameCount: grid.frameCount,
-          sheetTexture: directSheet,
-          frames: [],
-          isDedicatedAsset: true,
-        };
-        this.heroResolvedClipCache.set(cacheKey, resolved);
-        return resolved;
-      }
-
-      const poseFrame = mapHeroStateToLegacyFrame(state);
-      const frames: THREE.Texture[] = [];
-      for (let i = 0; i < grid.frameCount; i++) {
-        frames.push(this.getHeroTexture(equipped, poseFrame, i, state));
-      }
       const resolved: ResolvedSpriteClipSource = {
         clip,
-        mode: 'frame-sequence',
+        mode: 'uv-grid',
         grid,
-        frameCount: frames.length,
-        sheetTexture: null,
-        frames,
+        frameCount: grid.frameCount,
+        sheetTexture: directSheet,
+        frames: [],
         isDedicatedAsset: true,
       };
       this.heroResolvedClipCache.set(cacheKey, resolved);
       return resolved;
     }
 
-    // 3. Résolution avec partage d'état explicite documenté (`sharedFrom`) et rétrocompatibilité PNG actuels
+    // 3. États partagés documentés (`hurt`->`idle`, `death`->`roll`, `deck_idle`->`idle`, `jump`->`walk`)
     const effectiveState: HeroAnimState =
       clip.sharedFrom && clip.sharedFrom in HERO_ANIM_CLIPS
         ? (clip.sharedFrom as HeroAnimState)
         : state;
     const isDedicatedAsset = effectiveState === state;
 
-    const modular = this.getHeroModularImages();
-    const poseFrame = mapHeroStateToLegacyFrame(effectiveState);
-    const baseImg = modular?.basePoses[poseFrame] ?? modular?.basePoses.idle;
-
-    if (baseImg) {
-      const bw = baseImg.naturalWidth || baseImg.width;
-      const bh = baseImg.naturalHeight || baseImg.height;
-      const grid = resolveActiveSpriteGrid(HERO_ANIM_CLIPS[effectiveState], bw, bh);
-      if (grid.frameCount > 1) {
-        const frames: THREE.Texture[] = [];
-        for (let i = 0; i < grid.frameCount; i++) {
-          frames.push(this.getHeroTexture(equipped, poseFrame, i, effectiveState));
-        }
-        const resolved: ResolvedSpriteClipSource = {
-          clip,
-          mode: 'frame-sequence',
-          grid,
-          frameCount: frames.length,
-          sheetTexture: null,
-          frames,
-          isDedicatedAsset,
-        };
-        this.heroResolvedClipCache.set(cacheKey, resolved);
-        return resolved;
-      }
-    }
-
-    // Séquence legacy 2 poses pour la marche (`hero_base_walk1` + `hero_base_walk2`)
-    if (effectiveState === 'walk') {
-      const walkFrames: readonly THREE.Texture[] =
-        state === 'jump'
-          ? [this.getHeroTexture(equipped, 'walk2', 0, 'jump')]
-          : [
-              this.getHeroTexture(equipped, 'walk1', 0, 'walk'),
-              this.getHeroTexture(equipped, 'walk2', 0, 'walk'),
-            ];
+    const sharedSheet = this.hdHeroSheets.get(effectiveState);
+    if (sharedSheet) {
+      const dims = getTextureDimensions(sharedSheet);
+      const override = this.hdHeroSheetGridOverrides.get(effectiveState);
+      const grid = resolveActiveSpriteGrid(
+        HERO_ANIM_CLIPS[effectiveState],
+        dims?.width ?? 0,
+        dims?.height ?? 0,
+        override,
+      );
       const resolved: ResolvedSpriteClipSource = {
         clip,
-        mode: 'frame-sequence',
-        grid: {
-          cols: walkFrames.length,
-          rows: 1,
-          frameCount: walkFrames.length,
-          startFrame: 0,
-        },
-        frameCount: walkFrames.length,
-        sheetTexture: null,
-        frames: walkFrames,
+        mode: 'uv-grid',
+        grid,
+        frameCount: grid.frameCount,
+        sheetTexture: sharedSheet,
+        frames: [],
         isDedicatedAsset,
       };
       this.heroResolvedClipCache.set(cacheKey, resolved);
       return resolved;
     }
 
+    // 4. Fallback minimal avant fin du chargement asynchrone (zéro switch 2-poses legacy)
+    const poseFrame = mapHeroStateToLegacyFrame(effectiveState);
     const singleTex = this.getHeroTexture(equipped, poseFrame, 0, effectiveState);
     const resolved: ResolvedSpriteClipSource = {
       clip,
@@ -1149,23 +1259,25 @@ export class TextureRegistry {
       return resolved;
     }
 
-    // 3. Spritesheet partagée (`*_sheet.png` : legacy 1024×256 4×1 ou atlas multi-lignes)
+    // 3. Spritesheet partagée baked 10×9 (6 états × 15 frames = 90 frames @ 30 FPS)
     const baseSheet =
       (effPhase === 2 ? this.hdEnemyPhase2Sheets.get(typeId) : undefined) ??
       this.hdEnemySheets.get(typeId);
     if (baseSheet) {
       const dims = getTextureDimensions(baseSheet);
+      const w = dims?.width ?? 0;
+      const h = dims?.height ?? 0;
       const atlasOverride =
         this.hdEnemyGridOverrides.get(`${typeId}|*|p${effPhase}`) ??
         this.hdEnemyGridOverrides.get(`${typeId}|*|p1`);
-      const grid = resolveEnemyAtlasStateGrid(
-        typeId,
-        state,
-        dims?.width ?? 0,
-        dims?.height ?? 0,
-        atlasOverride,
-      );
+      const isBakedSixState10x9 =
+        !atlasOverride &&
+        ((w === 10 * 256 && h === 9 * 256) || (w === 10 * 384 && h === 9 * 384));
+      const grid = isBakedSixState10x9
+        ? resolveEnemySixStateGrid(typeId, state, w, h)
+        : resolveEnemyAtlasStateGrid(typeId, state, w, h, atlasOverride);
       const hasDedicatedRow =
+        isBakedSixState10x9 ||
         !clip.sharedFrom ||
         (grid.rows >= 6 && state === 'death') ||
         (grid.rows >= 5 && state === 'hurt') ||
@@ -1316,6 +1428,37 @@ export class TextureRegistry {
         sheetTexture: stateSheet,
         frames: [],
         isDedicatedAsset: true,
+      };
+      this.npcResolvedClipCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    const sharedNpcSheet = this.hdNpcStateSheets.get(`${npcId}|sheet`);
+    if (sharedNpcSheet) {
+      const dims = getTextureDimensions(sharedNpcSheet);
+      const w = dims?.width ?? 0;
+      const h = dims?.height ?? 0;
+      const grid =
+        npcId === 'mayor_moustache'
+          ? resolveMayorMoustacheGrid(
+              state === 'talk' ? 'talk' : state === 'move' ? 'greet' : 'idle',
+              w,
+              h,
+            )
+          : resolveActiveSpriteGrid(
+              NPC_ANIM_CLIPS[npcId].idle,
+              w,
+              h,
+              this.hdNpcGridOverrides.get(`${npcId}|sheet`),
+            );
+      const resolved: ResolvedSpriteClipSource = {
+        clip,
+        mode: 'uv-grid',
+        grid,
+        frameCount: grid.frameCount,
+        sheetTexture: sharedNpcSheet,
+        frames: [],
+        isDedicatedAsset: npcId === 'mayor_moustache' ? true : !clip.sharedFrom,
       };
       this.npcResolvedClipCache.set(cacheKey, resolved);
       return resolved;
@@ -1622,6 +1765,191 @@ export class TextureRegistry {
     return this.getOrCreate('particle_star', () => drawStarParticleCanvas());
   }
 
+  public getAnimationManifest(): AnimationManifest | null {
+    return this.animationManifest;
+  }
+
+  public getPropSheetTexture(
+    id: 'portal_exit' | 'prop_torch' | 'chest_opening',
+  ): THREE.Texture | null {
+    return this.hdPropSheets.get(id) ?? null;
+  }
+
+  public getNpcSheetTexture(npcId: NpcId): THREE.Texture | null {
+    return this.hdNpcStateSheets.get(`${npcId}|sheet`) ?? null;
+  }
+
+  public getHeroLanternTexture(lit = true): THREE.Texture {
+    return this.getOrCreate(`hero_lantern_${lit ? 'lit' : 'off'}`, () =>
+      drawHeroLanternCanvas(lit),
+    );
+  }
+
+  public getEquipmentOverlayTexture(itemId: string): THREE.Texture | null {
+    return this.hdEquipment.get(itemId as HdEquipmentKey) ?? null;
+  }
+
+  /**
+   * Retourne la texture d'armure recadrée/centrée sur son axe de torse réel ainsi que
+   * sa transformation idéale (agrandie si trop petite, rapetissée si trop grande).
+   * Utilise strictement le PNG existant (zéro génération d'image).
+   */
+  public getFittedArmorOverlay(
+    itemId: string,
+  ): { texture: THREE.Texture; fit: ArmorFitTransform } | null {
+    if (!itemId) return null;
+    const cached = this.fittedArmorCache.get(itemId);
+    if (cached) {
+      return { texture: cached.texture, fit: cached.fit };
+    }
+
+    const rawTex = this.hdEquipment.get(itemId as HdEquipmentKey);
+    if (!rawTex) return null;
+
+    const def = getEquipmentDefinition(itemId);
+    const shape = def?.visualStyle.shape;
+    const img = extractHtmlImage(rawTex);
+    if (img && typeof document !== 'undefined') {
+      const fitted = createFittedArmorCanvas(img, shape);
+      const texture = this.createCanvasTexture(fitted.canvas, { repeat: false });
+      const fit = computeIdealArmorFit(fitted.metrics, shape);
+      this.fittedArmorCache.set(itemId, { texture, ownsTexture: true, fit });
+      return { texture, fit };
+    }
+
+    const metrics = measureArmorImageMetrics(undefined, shape);
+    const fit = computeIdealArmorFit(metrics, shape);
+    this.fittedArmorCache.set(itemId, { texture: rawTex, ownsTexture: false, fit });
+    return { texture: rawTex, fit };
+  }
+
+  /**
+   * Retourne la texture normalisée (marges transparentes recadrées, orientation canonique
+   * unifiée et pivot calibré) pour n'importe quel équipement du héros.
+   * Utilise les PNG existants ou un canvas procédural zéro-404 pour les armes sans PNG.
+   */
+  public getNormalizedEquipmentOverlay(itemId: string): {
+    texture: THREE.Texture;
+    calibration: EquipmentCalibrationEntry;
+    fit: NormalizedEquipmentFit;
+  } | null {
+    if (!itemId) return null;
+    const cached = this.normalizedEquipmentCache.get(itemId);
+    if (cached) {
+      return {
+        texture: cached.texture,
+        calibration: cached.calibration,
+        fit: cached.fit,
+      };
+    }
+
+    const calibration = getEquipmentCalibration(itemId);
+    if (!calibration) return null;
+
+    const rawTex = this.hdEquipment.get(itemId as HdEquipmentKey);
+    if (!rawTex) {
+      const def = getEquipmentDefinition(itemId);
+      if (def?.slot !== 'weapon') return null;
+
+      if (typeof document !== 'undefined') {
+        const procCanvas = drawProceduralWeaponCanvas(def);
+        const normalized = createNormalizedEquipmentCanvas(procCanvas, calibration);
+        const texture = this.createCanvasTexture(normalized.canvas, { repeat: false });
+        const fit = computeNormalizedEquipmentFit(calibration, normalized.bounds);
+        this.normalizedEquipmentCache.set(itemId, {
+          texture,
+          ownsTexture: true,
+          calibration,
+          fit,
+        });
+        return { texture, calibration, fit };
+      }
+
+      const texture = this.getOrCreateHeadlessDataTexture(`proc_weapon_${itemId}`);
+      const fit = computeNormalizedEquipmentFit(calibration);
+      this.normalizedEquipmentCache.set(itemId, {
+        texture,
+        ownsTexture: false,
+        calibration,
+        fit,
+      });
+      return { texture, calibration, fit };
+    }
+
+    // Pour les armures, réutilise exactement le pipeline d'ajustement de torse idéal
+    if (calibration.slot === 'armor') {
+      const fittedArmor = this.getFittedArmorOverlay(itemId);
+      if (!fittedArmor) return null;
+      const fit: NormalizedEquipmentFit = {
+        quadW: fittedArmor.fit.quadW,
+        quadH: fittedArmor.fit.quadH,
+        visibleW: fittedArmor.fit.visibleW,
+        visibleH: fittedArmor.fit.visibleH,
+        meshOffsetX: 0,
+        meshOffsetY: 0,
+      };
+      this.normalizedEquipmentCache.set(itemId, {
+        texture: fittedArmor.texture,
+        ownsTexture: false,
+        calibration,
+        fit,
+      });
+      return { texture: fittedArmor.texture, calibration, fit };
+    }
+
+    const img = extractHtmlImage(rawTex);
+    if (img && typeof document !== 'undefined') {
+      const normalized = createNormalizedEquipmentCanvas(img, calibration);
+      const texture = this.createCanvasTexture(normalized.canvas, { repeat: false });
+      const fit = computeNormalizedEquipmentFit(calibration, normalized.bounds);
+      this.normalizedEquipmentCache.set(itemId, {
+        texture,
+        ownsTexture: true,
+        calibration,
+        fit,
+      });
+      return { texture, calibration, fit };
+    }
+
+    const fit = computeNormalizedEquipmentFit(calibration);
+    this.normalizedEquipmentCache.set(itemId, {
+      texture: rawTex,
+      ownsTexture: false,
+      calibration,
+      fit,
+    });
+    return { texture: rawTex, calibration, fit };
+  }
+
+  public getLamppostTexture(lit: boolean): THREE.CanvasTexture {
+    return this.getOrCreate(`prop_lamppost_${lit ? 'lit' : 'off'}`, () =>
+      drawLamppostCanvas(lit),
+    );
+  }
+
+  public getChestOpeningTexture(
+    stepIndex: number,
+    tier: 'common' | 'rare' | 'epic' | 'boss',
+  ): THREE.CanvasTexture {
+    const clamped = Math.max(0, Math.min(5, Math.floor(stepIndex)));
+    const progress = clamped / 5;
+    const closedImg = this.getHdPropImage('chest_closed');
+    const openImg = this.getHdPropImage('chest_open');
+    return this.getOrCreate(
+      `chest_opening_${tier}_${clamped}_${closedImg ? 'hd' : 'proc'}`,
+      () => drawChestOpeningFrameCanvas(closedImg, openImg, progress, tier),
+    );
+  }
+
+  public resolveEnemySixStateSheetGrid(
+    enemyKey: HdEnemySheetKey,
+    state: EnemyAnimState,
+    texWidth: number,
+    texHeight: number,
+  ): SpriteGridSpec {
+    return resolveEnemySixStateGrid(enemyKey, state, texWidth, texHeight);
+  }
+
   public getHeroPortraitUrl(equipped: Record<EquipSlot, string>): string {
     return drawHeroPortraitDataUrl(equipped, this.getHeroModularImages());
   }
@@ -1650,6 +1978,45 @@ export class TextureRegistry {
     return getOverworldMiniMapDataUrl(this.getHdTerrainBundle());
   }
 
+  public hasLoadedVfxTexture(id: VfxAssetId): boolean {
+    return this.vfxTextures.has(id);
+  }
+
+  public getVfxTexture(id: VfxAssetId): THREE.Texture {
+    const loaded = this.vfxTextures.get(id);
+    if (loaded) return loaded;
+
+    const entry = VFX_ASSETS[id];
+    const repeat = entry?.kind === 'normalMap';
+    const key = `vfx_fallback_${id}`;
+    const existing = this.headlessCache.get(key);
+    if (existing) return existing;
+
+    if (entry?.dataMap) {
+      const data = new Uint8Array([128, 128, 255, 255]);
+      const tex = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+      tex.name = key;
+      configureDioramaTexture(tex, {
+        isDataMap: true,
+        repeat: true,
+        anisotropy: this.maxAnisotropy,
+      });
+      this.headlessCache.set(key, tex);
+      return tex;
+    }
+
+    if (typeof document !== 'undefined') {
+      return id === 'melee_slash_trail' || id === 'projectile_trail'
+        ? this.getParticleTexture()
+        : this.getOrCreateHeadlessDataTexture(key, repeat);
+    }
+    return this.getOrCreateHeadlessDataTexture(key, repeat);
+  }
+
+  public getArchipelagoMapCanvas(): HTMLCanvasElement {
+    return getArchipelagoMapCanvas(this.getHdTerrainBundle());
+  }
+
   public get size(): number {
     let surfaceCount = 0;
     for (const s of this.hdSurfaces.values()) {
@@ -1667,6 +2034,7 @@ export class TextureRegistry {
       this.hdEquipment.size +
       this.hdCapeFabrics.size +
       this.hdProps.size +
+      this.vfxTextures.size +
       surfaceCount +
       this.overworldPbrCache.size * 3 +
       this.dungeonPbrCache.size * 4 +
@@ -1714,6 +2082,18 @@ export class TextureRegistry {
     this.hdNpcStateSheets.clear();
     this.hdNpcGridOverrides.clear();
     this.hdNpcFrameSequences.clear();
+    for (const entry of this.fittedArmorCache.values()) {
+      if (entry.ownsTexture) {
+        entry.texture.dispose();
+      }
+    }
+    this.fittedArmorCache.clear();
+    for (const entry of this.normalizedEquipmentCache.values()) {
+      if (entry.ownsTexture) {
+        entry.texture.dispose();
+      }
+    }
+    this.normalizedEquipmentCache.clear();
     for (const tex of this.hdEquipment.values()) {
       tex.dispose();
     }
@@ -1736,6 +2116,14 @@ export class TextureRegistry {
       tex.dispose();
     }
     this.hdProps.clear();
+    for (const tex of this.hdPropSheets.values()) {
+      tex.dispose();
+    }
+    this.hdPropSheets.clear();
+    for (const tex of this.vfxTextures.values()) {
+      tex.dispose();
+    }
+    this.vfxTextures.clear();
     for (const surf of this.hdSurfaces.values()) {
       for (const tex of Object.values(surf)) {
         tex?.dispose();

@@ -114,21 +114,21 @@ describe('Donjons M2 — Piliers, Collisions, Torches, FOV & Clé Équipement', 
       ...STARTING_EQUIPMENT,
       shield: 'shield_wood',
     });
-    const withTrinket = getHeroEquipmentKey({
+    const withHelmet = getHeroEquipmentKey({
       ...STARTING_EQUIPMENT,
-      trinket: 'trinket_yarn',
+      helmet: 'helm_knight',
     });
-    const withBoots = getHeroEquipmentKey({
+    const withArmor = getHeroEquipmentKey({
       ...STARTING_EQUIPMENT,
-      boots: 'boots_leather',
+      armor: 'armor_mail',
     });
     const withCape = getHeroEquipmentKey({ ...STARTING_EQUIPMENT, cape: 'cape_traveler' });
 
     expect(withShield).not.toBe(baseKey);
-    expect(withTrinket).not.toBe(baseKey);
-    expect(withBoots).not.toBe(baseKey);
+    expect(withHelmet).not.toBe(baseKey);
+    expect(withArmor).not.toBe(baseKey);
     expect(withCape).not.toBe(baseKey);
-    expect(new Set([baseKey, withShield, withTrinket, withBoots, withCape]).size).toBe(5);
+    expect(new Set([baseKey, withShield, withHelmet, withArmor, withCape]).size).toBe(5);
 
     expect(computeResponsiveFov(16 / 9)).toBe(38);
     expect(computeResponsiveFov(1.2)).toBe(38);

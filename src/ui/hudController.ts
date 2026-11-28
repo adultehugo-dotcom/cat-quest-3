@@ -53,6 +53,20 @@ const DEFAULT_HERO_SVG = `data:image/svg+xml,${encodeURIComponent(
   </svg>`,
 )}`;
 
+const HUD_SPELL_PNG_IDS: ReadonlySet<SpellId> = new Set([
+  'flamepurr',
+  'lightnyan',
+  'freezepaw',
+  'healing_paw',
+]);
+
+function getSpellSlotIconMarkup(spellId: SpellId): string {
+  if (HUD_SPELL_PNG_IDS.has(spellId)) {
+    return `<img class="spell-slot-icon spell-slot-icon--img" src="./assets/icons/spells/${spellId}.png" alt="" />`;
+  }
+  return getSpellSvgMarkup(spellId);
+}
+
 function getSpellSvgMarkup(spellId: SpellId): string {
   switch (spellId) {
     case 'flamepurr':
@@ -245,6 +259,7 @@ export class HudController {
   private readonly spellBar: HTMLDivElement;
 
   private readonly toastStack: HTMLDivElement;
+  private readonly lowHpVignette: HTMLDivElement;
   private readonly spellSlots: Record<SpellId, SpellSlotRefs>;
 
   // Cache de valeurs pour éviter tout thrashing DOM à 60 FPS
@@ -265,6 +280,7 @@ export class HudController {
   private lastSpellBarVisible = true;
   private goldBumpTimer: number | null = null;
   private toastTimers: Set<number> = new Set();
+  private transientTimers: Set<number> = new Set();
 
   constructor(container: HTMLElement, callbacks: HudCallbacks) {
     this.container = container;
@@ -305,7 +321,8 @@ export class HudController {
 
     this.goldPill = document.createElement('div');
     this.goldPill.className = 'hud-gold-pill';
-    this.goldPill.innerHTML = '<span aria-hidden="true">🪙</span>';
+    this.goldPill.innerHTML =
+      '<img class="hud-ui-icon hud-ui-icon--sm" src="./assets/icons/ui/gold.png" alt="" aria-hidden="true" />';
     this.goldValueEl = document.createElement('span');
     this.goldValueEl.textContent = '0 Or';
     this.goldPill.appendChild(this.goldValueEl);
@@ -356,7 +373,8 @@ export class HudController {
     // Badge Clé Runique
     this.keyBadge = document.createElement('div');
     this.keyBadge.className = 'hud-key-badge is-hidden';
-    this.keyBadge.textContent = '🗝️ Clé Runique';
+    this.keyBadge.innerHTML =
+      '<img class="hud-ui-icon hud-ui-icon--sm" src="./assets/icons/ui/key.png" alt="" aria-hidden="true" /><span>Clé Runique</span>';
 
     barsCol.append(metaRow, this.hpTrack, mpTrack, xpTrack, this.keyBadge);
     heroPanel.append(portraitWrap, barsCol);
@@ -390,12 +408,24 @@ export class HudController {
     const actionsRow = document.createElement('div');
     actionsRow.className = 'hud-actions';
 
-    const invBtn = this.createHudActionButton('🎒', 'I', 'Inventaire & Équipement (I)', () => {
-      this.callbacks.onToggleInventory();
-    });
-    const mapBtn = this.createHudActionButton('🗺️', 'M', 'Carte du Monde (M)', () => {
-      this.callbacks.onToggleMap();
-    });
+    const invBtn = this.createHudActionButton(
+      './assets/icons/ui/inventory.png',
+      'I',
+      'Inventaire & Équipement (I)',
+      () => {
+        this.callbacks.onToggleInventory();
+      },
+      true,
+    );
+    const mapBtn = this.createHudActionButton(
+      './assets/icons/ui/map.png',
+      'M',
+      'Carte du Monde (M)',
+      () => {
+        this.callbacks.onToggleMap();
+      },
+      true,
+    );
 
     this.muteBtn = document.createElement('button');
     this.muteBtn.type = 'button';
@@ -407,6 +437,7 @@ export class HudController {
     this.muteBtn.appendChild(this.muteIcon);
     this.muteBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      this.triggerElementPulse(this.muteBtn, 'is-clicked', 220);
       this.callbacks.onToggleMute();
     });
 
@@ -474,7 +505,7 @@ export class HudController {
 
       const inner = document.createElement('div');
       inner.className = 'spell-slot-inner';
-      inner.innerHTML = getSpellSvgMarkup(spellId);
+      inner.innerHTML = getSpellSlotIconMarkup(spellId);
 
       const cdVeil = document.createElement('div');
       cdVeil.className = 'spell-slot-cd-veil';
@@ -520,11 +551,22 @@ export class HudController {
 
     bottomCenter.append(this.promptBtn, this.spellBar);
 
-    // --- 5. Toasts ---
+    // --- 5. Toasts & Vignette PV bas ---
     this.toastStack = document.createElement('div');
     this.toastStack.className = 'toast-stack';
 
-    this.rootEl.append(heroPanel, this.bossBox, topRight, bottomCenter, this.toastStack);
+    this.lowHpVignette = document.createElement('div');
+    this.lowHpVignette.className = 'hud-low-hp-vignette';
+    this.lowHpVignette.setAttribute('aria-hidden', 'true');
+
+    this.rootEl.append(
+      this.lowHpVignette,
+      heroPanel,
+      this.bossBox,
+      topRight,
+      bottomCenter,
+      this.toastStack,
+    );
     this.container.appendChild(this.rootEl);
   }
 
@@ -595,6 +637,16 @@ export class HudController {
 
     for (const ev of events) {
       switch (ev.type) {
+        case 'spell_cast': {
+          if (ev.spellId && this.spellSlots[ev.spellId]) {
+            this.triggerElementPulse(
+              this.spellSlots[ev.spellId].button,
+              'is-casting',
+              340,
+            );
+          }
+          break;
+        }
         case 'level_up': {
           const lvl = ev.value ?? 2;
           emitUniqueToast(
@@ -742,10 +794,17 @@ export class HudController {
       this.hpFill.style.width = `${(hpRatio * 100).toFixed(1)}%`;
     }
     this.hpTrack.classList.toggle('has-shield', shieldCur > 0);
-    const isLowHp = hpRatio > 0 && hpRatio < 0.28;
+    const isLowHp = state.lowHpActive ?? (hpRatio > 0 && hpRatio < 0.2);
     if (isLowHp !== this.lastLowHp) {
       this.lastLowHp = isLowHp;
       this.hpTrack.classList.toggle('is-low-hp', isLowHp);
+      this.lowHpVignette.classList.toggle('is-active', isLowHp);
+    }
+    if (isLowHp) {
+      this.lowHpVignette.style.setProperty(
+        '--low-hp-intensity',
+        (state.lowHpIntensity ?? 0.5).toFixed(2),
+      );
     }
 
     // PM
@@ -827,7 +886,26 @@ export class HudController {
       window.clearTimeout(id);
     }
     this.toastTimers.clear();
+    for (const id of this.transientTimers) {
+      window.clearTimeout(id);
+    }
+    this.transientTimers.clear();
     this.rootEl.remove();
+  }
+
+  private triggerElementPulse(
+    el: HTMLElement,
+    className: string,
+    durationMs: number,
+  ): void {
+    el.classList.remove(className);
+    void el.offsetWidth;
+    el.classList.add(className);
+    const tid = window.setTimeout(() => {
+      this.transientTimers.delete(tid);
+      el.classList.remove(className);
+    }, durationMs);
+    this.transientTimers.add(tid);
   }
 
   private createHudActionButton(
@@ -835,6 +913,7 @@ export class HudController {
     keyHint: string,
     title: string,
     onClick: () => void,
+    isImage = false,
   ): HTMLButtonElement {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -842,15 +921,27 @@ export class HudController {
     btn.title = title;
     btn.setAttribute('aria-label', title);
 
-    const iconSpan = document.createElement('span');
-    iconSpan.textContent = icon;
+    if (isImage) {
+      const img = document.createElement('img');
+      img.className = 'hud-ui-icon';
+      img.src = icon;
+      img.alt = '';
+      img.setAttribute('aria-hidden', 'true');
+      btn.appendChild(img);
+    } else {
+      const iconSpan = document.createElement('span');
+      iconSpan.textContent = icon;
+      btn.appendChild(iconSpan);
+    }
+
     const keySpan = document.createElement('span');
     keySpan.className = 'hud-btn-key';
     keySpan.textContent = keyHint;
 
-    btn.append(iconSpan, keySpan);
+    btn.appendChild(keySpan);
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
+      this.triggerElementPulse(btn, 'is-clicked', 220);
       onClick();
     });
     return btn;
@@ -943,12 +1034,12 @@ export class HudController {
         refs.button.classList.toggle('is-cooldown', isCooldown);
       }
 
-      const pct = isCooldown
-        ? `${Math.min(100, (cd / def.cooldown) * 100).toFixed(1)}%`
-        : '0%';
+      const ratio = isCooldown ? Math.min(1, cd / Math.max(0.05, def.cooldown)) : 0;
+      const pct = isCooldown ? `${(ratio * 100).toFixed(1)}%` : '0%';
       if (pct !== refs.lastCdPct) {
         refs.lastCdPct = pct;
-        refs.cdVeil.style.height = pct;
+        refs.cdVeil.style.setProperty('--cd-deg', `${(ratio * 360).toFixed(1)}deg`);
+        refs.cdVeil.style.height = isCooldown ? '100%' : '0%';
       }
 
       const cdLabel = isCooldown ? `${cd.toFixed(1)}s` : '';

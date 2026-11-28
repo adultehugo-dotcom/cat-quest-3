@@ -3,7 +3,6 @@ import type {
   GameEvent,
   GameState,
 } from '../game/types';
-import { ENEMIES } from '../data/enemiesData';
 import type { ProjectedPoint } from './sceneManager';
 
 export type FloatingTextProjector = (
@@ -142,6 +141,60 @@ const STYLE_SPECS: Record<FloatingTextStyle, StyleSpec> = {
     fontFamily: 'Georgia, "Palatino Linotype", serif',
     duration: 1.45,
     vy: 1.35,
+    popBoost: 0.35,
+  },
+  status_burn: {
+    color: '#ff7a2b',
+    fontSize: 17,
+    fontWeight: '800',
+    fontFamily: '"Segoe UI", system-ui, sans-serif',
+    duration: 0.72,
+    vy: 1.5,
+    popBoost: 0.2,
+  },
+  status_poison: {
+    color: '#7bf054',
+    fontSize: 17,
+    fontWeight: '800',
+    fontFamily: '"Segoe UI", system-ui, sans-serif',
+    duration: 0.72,
+    vy: 1.5,
+    popBoost: 0.2,
+  },
+  status_bleed: {
+    color: '#e84359',
+    fontSize: 17,
+    fontWeight: '800',
+    fontFamily: '"Segoe UI", system-ui, sans-serif',
+    duration: 0.72,
+    vy: 1.5,
+    popBoost: 0.2,
+  },
+  perfect_dodge: {
+    color: '#ffe66d',
+    fontSize: 25,
+    fontWeight: '900',
+    fontFamily: 'Georgia, "Palatino Linotype", serif',
+    duration: 1.15,
+    vy: 2.1,
+    popBoost: 0.55,
+  },
+  stagger_break: {
+    color: '#ffaa3b',
+    fontSize: 24,
+    fontWeight: '900',
+    fontFamily: 'Georgia, "Palatino Linotype", serif',
+    duration: 1.25,
+    vy: 1.9,
+    popBoost: 0.5,
+  },
+  status_purge: {
+    color: '#7ef5a8',
+    fontSize: 20,
+    fontWeight: '800',
+    fontFamily: 'Georgia, "Palatino Linotype", serif',
+    duration: 1.05,
+    vy: 1.7,
     popBoost: 0.35,
   },
 };
@@ -294,13 +347,57 @@ export class FloatingTextManager {
           }
           break;
         }
-        case 'enemy_died': {
-          if (ev.enemyTypeId) {
-            const def = ENEMIES[ev.enemyTypeId];
-            this.spawn(px - 0.35, 2.1, pz, `+${def.xpReward} XP`, 'xp');
-            this.spawn(px + 0.45, 1.65, pz, `+${def.goldReward} Or`, 'gold');
-          } else if (ev.text) {
-            this.spawn(px, 2.1, pz, ev.text, 'xp');
+        case 'gold_pickup': {
+          if (ev.value && ev.value > 0) {
+            this.spawn(px + 0.25, 1.75, pz, `+${ev.value} Or`, 'gold');
+          }
+          break;
+        }
+        case 'xp_pickup': {
+          if (ev.value && ev.value > 0) {
+            this.spawn(px - 0.25, 2.05, pz, `+${ev.value} XP`, 'xp');
+          }
+          break;
+        }
+        case 'perfect_dodge': {
+          this.spawn(
+            px,
+            2.65,
+            pz,
+            ev.text ?? 'ESQUIVE PARFAITE !',
+            'perfect_dodge',
+          );
+          break;
+        }
+        case 'stagger_break': {
+          this.spawn(
+            px,
+            2.75,
+            pz,
+            ev.text ?? 'BRIS DE POSTURE !',
+            'stagger_break',
+          );
+          break;
+        }
+        case 'status_purged': {
+          this.spawn(
+            px,
+            2.5,
+            pz,
+            ev.text ?? 'PURIFIÉ !',
+            'status_purge',
+          );
+          break;
+        }
+        case 'status_tick': {
+          if (ev.value && ev.value > 0) {
+            const stStyle: FloatingTextStyle =
+              ev.statusId === 'poison'
+                ? 'status_poison'
+                : ev.statusId === 'bleed'
+                  ? 'status_bleed'
+                  : 'status_burn';
+            this.spawn(px, 1.85, pz, `${ev.value}`, stStyle);
           }
           break;
         }
@@ -323,9 +420,6 @@ export class FloatingTextManager {
           break;
         }
         case 'chest_opened': {
-          if (ev.value && ev.value > 0) {
-            this.spawn(px, 2.2, pz, `+${ev.value} Or`, 'gold');
-          }
           break;
         }
         case 'player_rested': {

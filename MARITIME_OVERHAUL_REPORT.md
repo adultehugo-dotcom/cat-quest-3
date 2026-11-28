@@ -435,3 +435,4 @@ Six assets statiques 1-frame prioritaires de Miaou-bourg et des coffres interact
 | Suite Vitest | `npm test -- --run` | **PASS** — **`16/16` fichiers, `124/124` tests passés** |
 | Build production Vite | `npm run build` | **PASS** — build généré sans erreur |
 | Vérification visuelle Playwright (`1280×720` & `375×667`) | `playwright-cli` sur `http://localhost:3000` (écran titre, Miaou-bourg, inventaire 8 emplacements + cape Verlet, déplacement, vue mobile) | **PASS** — `0` erreur console/page/WebGL, `0` requête >= 400 (`0` 404), les 4 bâtiments/panneau Miaou-bourg rendus sans frange ni socle d'herbe collé |
+

@@ -8,6 +8,7 @@ import type {
   SpeakerPortraitId,
   ZoneId,
 } from '../game/types';
+import { DragonPortraitFacialController } from './modalsController';
 
 export interface ScreensCallbacks {
   onNewGame: () => void;
@@ -114,7 +115,7 @@ function formatPlayTime(seconds: number): string {
   return `${mins} min ${pad(secs)} s`;
 }
 
-function getZoneBannerName(
+export function getZoneBannerName(
   zoneId: ZoneId | undefined,
   islandId?: IslandId,
 ): string {
@@ -151,10 +152,13 @@ export class ScreensController {
 
   // Boîte de Dialogue
   private readonly dialogueWrap: HTMLDivElement;
+  private readonly dialoguePortraitBox: HTMLDivElement;
   private readonly dialoguePortraitImg: HTMLImageElement;
   private readonly dialogueSpeaker: HTMLSpanElement;
   private readonly dialogueProgress: HTMLSpanElement;
   private readonly dialogueText: HTMLParagraphElement;
+  private readonly dragonFacial = new DragonPortraitFacialController();
+  private lastUpdatePerfMs = 0;
 
   // Menu Pause
   private readonly pauseEl: HTMLDivElement;
@@ -205,14 +209,17 @@ export class ScreensController {
     const banner = document.createElement('div');
     banner.className = 'title-hero-banner';
     banner.innerHTML = `
-      <svg class="title-crest" viewBox="0 0 96 96" aria-hidden="true">
-        <circle cx="48" cy="48" r="44" fill="#3b2214" stroke="#f2be42" stroke-width="4.5"/>
-        <path d="M22 46 L29 18 L43 32 L53 32 L67 18 L74 46 C76 64 64 78 48 78 C32 78 20 64 22 46 Z" fill="#e98d3c" stroke="#2b1e16" stroke-width="3.5"/>
-        <polygon points="33,24 40,10 48,19 56,10 63,24" fill="#ffe07a" stroke="#2b1e16" stroke-width="2.5"/>
-        <circle cx="38" cy="52" r="4.5" fill="#2b1e16"/>
-        <circle cx="58" cy="52" r="4.5" fill="#2b1e16"/>
-        <polygon points="48,58 44,62 52,62" fill="#d45555"/>
-      </svg>
+      <div class="title-crest-wrap" aria-hidden="true">
+        <svg class="title-crest" viewBox="0 0 96 96" aria-hidden="true">
+          <circle cx="48" cy="48" r="44" fill="#3b2214" stroke="#f2be42" stroke-width="4.5"/>
+          <path d="M22 46 L29 18 L43 32 L53 32 L67 18 L74 46 C76 64 64 78 48 78 C32 78 20 64 22 46 Z" fill="#e98d3c" stroke="#2b1e16" stroke-width="3.5"/>
+          <polygon points="33,24 40,10 48,19 56,10 63,24" fill="#ffe07a" stroke="#2b1e16" stroke-width="2.5"/>
+          <circle cx="38" cy="52" r="4.5" fill="#2b1e16"/>
+          <circle cx="58" cy="52" r="4.5" fill="#2b1e16"/>
+          <polygon points="48,58 44,62 52,62" fill="#d45555"/>
+        </svg>
+        <div class="title-crest-sheen"></div>
+      </div>
       <h1 class="title-main">Les Chroniques de Félingard</h1>
       <div class="title-divider" aria-hidden="true"></div>
       <p class="title-sub">L'Éveil du Sang-de-Dragon — Action-RPG 2.5D</p>
@@ -270,11 +277,21 @@ export class ScreensController {
       this.callbacks.onAdvanceDialogue();
     });
 
-    const portraitBox = document.createElement('div');
-    portraitBox.className = 'dialogue-portrait';
+    this.dialoguePortraitBox = document.createElement('div');
+    this.dialoguePortraitBox.className = 'dialogue-portrait';
     this.dialoguePortraitImg = document.createElement('img');
     this.dialoguePortraitImg.alt = 'Portrait du personnage';
-    portraitBox.appendChild(this.dialoguePortraitImg);
+    const dragonEyelids = document.createElement('div');
+    dragonEyelids.className = 'dialogue-dragon-eyelids';
+    dragonEyelids.setAttribute('aria-hidden', 'true');
+    const dragonMouth = document.createElement('div');
+    dragonMouth.className = 'dialogue-dragon-mouth';
+    dragonMouth.setAttribute('aria-hidden', 'true');
+    this.dialoguePortraitBox.append(
+      this.dialoguePortraitImg,
+      dragonEyelids,
+      dragonMouth,
+    );
 
     const contentCol = document.createElement('div');
     contentCol.className = 'dialogue-content';
@@ -303,7 +320,7 @@ export class ScreensController {
     diagFooter.appendChild(nextBtn);
 
     contentCol.append(diagHeader, this.dialogueText, diagFooter);
-    dialogueBox.append(portraitBox, contentCol);
+    dialogueBox.append(this.dialoguePortraitBox, contentCol);
     this.dialogueWrap.appendChild(dialogueBox);
 
     // ========================================================================
@@ -521,20 +538,23 @@ export class ScreensController {
     }
     this.zoneBannerEl.textContent = label;
     this.zoneBannerEl.style.transition = 'none';
+    this.zoneBannerEl.style.opacity = '0';
+    this.zoneBannerEl.style.transform = 'translate(-50%, -44%)';
+    void this.zoneBannerEl.offsetWidth;
+    this.zoneBannerEl.style.transition = 'opacity 0.38s ease, transform 0.38s ease';
     this.zoneBannerEl.style.opacity = '1';
     this.zoneBannerEl.style.transform = 'translate(-50%, -50%)';
-    void this.zoneBannerEl.offsetWidth;
-    this.zoneBannerEl.style.transition = 'opacity 0.42s ease, transform 0.42s ease';
 
     this.zoneBannerHoldTimer = window.setTimeout(() => {
       this.zoneBannerHoldTimer = null;
+      this.zoneBannerEl.style.transition = 'opacity 0.45s ease, transform 0.45s ease';
       this.zoneBannerEl.style.opacity = '0';
       this.zoneBannerEl.style.transform = 'translate(-50%, -56%)';
       this.zoneBannerClearTimer = window.setTimeout(() => {
         this.zoneBannerClearTimer = null;
         this.zoneBannerEl.textContent = '';
-      }, 450);
-    }, 1200);
+      }, 460);
+    }, 1450);
   }
 
   /**
@@ -581,6 +601,8 @@ export class ScreensController {
         this.showTransitionOverlay('Zzz... Miaou !', 1050);
       } else if (ev.type === 'zone_transition') {
         this.showZoneBanner(getZoneBannerName(ev.zoneId, ev.islandId));
+      } else if (ev.type === 'ship_disembarked' && ev.islandId) {
+        this.showZoneBanner(getZoneBannerName('overworld', ev.islandId));
       }
     }
   }
@@ -588,7 +610,16 @@ export class ScreensController {
   /**
    * Synchronise Écran Titre, Dialogue, Pause, Défaite, Victoire et Fondu avec l'état du jeu.
    */
-  public update(state: GameState): void {
+  public update(state: GameState, dtOverride?: number): void {
+    const nowPerf = typeof performance !== 'undefined' ? performance.now() : 0;
+    const dt =
+      typeof dtOverride === 'number'
+        ? Math.max(0, Math.min(0.1, dtOverride))
+        : this.lastUpdatePerfMs > 0
+          ? Math.max(0, Math.min(0.1, (nowPerf - this.lastUpdatePerfMs) / 1000))
+          : 0.016;
+    this.lastUpdatePerfMs = nowPerf;
+
     // 1. Écrans majeurs (Titre / Défaite / Victoire)
     if (state.screen !== this.lastScreen) {
       this.lastScreen = state.screen;
@@ -632,6 +663,9 @@ export class ScreensController {
       if (this.lastDialogueKey !== 'hidden') {
         this.lastDialogueKey = 'hidden';
         this.dialogueWrap.classList.add('is-hidden');
+        this.dialoguePortraitBox.classList.remove('is-dragon-portrait', 'is-blinking');
+        this.dialoguePortraitBox.style.setProperty('--dragon-mouth', '0');
+        this.dragonFacial.reset();
       }
     } else {
       const idx = Math.max(
@@ -648,6 +682,22 @@ export class ScreensController {
         this.dialogueSpeaker.textContent = line.speaker;
         this.dialogueProgress.textContent = `${idx + 1} / ${state.dialogue.lines.length}`;
         this.dialogueText.textContent = line.text;
+        if (line.portraitId !== 'boss_dragon_claw') {
+          this.dragonFacial.reset();
+        }
+      }
+
+      const isDragon = line.portraitId === 'boss_dragon_claw';
+      this.dialoguePortraitBox.classList.toggle('is-dragon-portrait', isDragon);
+      if (isDragon) {
+        const facial = this.dragonFacial.step(dt, true);
+        this.dialoguePortraitBox.classList.toggle('is-blinking', facial.blinking);
+        this.dialoguePortraitBox.style.setProperty(
+          '--dragon-mouth',
+          facial.mouthOpen.toFixed(3),
+        );
+      } else {
+        this.dialoguePortraitBox.classList.remove('is-blinking');
       }
     }
 

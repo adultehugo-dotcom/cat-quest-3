@@ -5,8 +5,9 @@ import type {
   EquipSlot,
   GameState,
 } from '../game/types';
+import { hasStatus } from '../game/statusEffects';
 import { ENEMIES } from '../data/enemiesData';
-import { getEquipmentDefinition } from '../data/equipmentData';
+import { getEquipmentDefinition, getWeaponCombatProfile } from '../data/equipmentData';
 import {
   type EnemyAnimState,
   type HeroAnimState,
@@ -16,16 +17,47 @@ import {
   advanceSpriteAnimCursor,
   applyUvRectToTexture,
   computeGridFrameUvInto,
+  createFixedStepAnimClock,
   createSpriteAnimCursor,
   createSpriteUvRect,
   sampleOneShotProgressFrame,
+  stepFixed30FpsClock,
 } from '../art/hdAssets';
+import {
+  type HeroBeltLanternState,
+  type PaperFlipOvershootState,
+  createHeroBeltLanternState,
+  createPaperFlipOvershootState,
+  sampleHeroFrameSockets,
+  stepHeroBeltLantern,
+  stepPaperFlipOvershoot,
+} from '../art/spriteHero';
+import {
+  type EquipmentCalibrationEntry,
+  HERO_BONE_ORDER,
+  HERO_SKELETON_SPEC,
+  type HeroBoneId,
+  type HeroEquipmentMaskState,
+  type HeroSkeletonPose,
+  type NormalizedEquipmentFit,
+  computeHeroEquipmentMaskState,
+  createHeroSkeletonPose,
+  solveHeroBoneTransformsInto,
+  solveHeroEarPose,
+} from '../art/equipmentRig';
 import {
   type ResolvedSpriteClipSource,
   TextureRegistry,
 } from '../art/textureRegistry';
 import { CapeClothMesh, type CapeWindInput } from './capePhysics';
-import { clearSpriteLight, enableSpriteLighting, setSpriteLight } from './spriteLighting';
+import {
+  type HeroSpriteMaskUniforms,
+  SPRITE_LIGHT_SLOT,
+  clearSpriteLight,
+  createHeroMaskUniforms,
+  enableSpriteLighting,
+  setSpriteLight,
+} from './spriteLighting';
 
 export interface CapeWeatherWind {
   readonly windDirX: number;
@@ -33,14 +65,32 @@ export interface CapeWeatherWind {
   readonly windIntensity: number;
   readonly stormIntensity?: number;
   readonly lanternBoost: number;
+  readonly nightFactor?: number;
 }
 
 const SPRITE_TILT_X = -0.48;
-const HERO_WIDTH = 2.35;
-const HERO_HEIGHT = 2.45;
+const HERO_WIDTH = 3.05;
+const HERO_HEIGHT = 3.18;
 const HP_BAR_WIDTH = 1.45;
 const HP_BAR_HEIGHT = 0.16;
-const LEGACY_TWO_FRAME_WALK_FPS = 9.5;
+
+type HeroEquipCutoutKey =
+  | 'armor'
+  | 'helmet'
+  | 'shield'
+  | 'weapon';
+
+interface HeroEquipCutoutEntry {
+  pivot: THREE.Group;
+  mesh: THREE.Mesh;
+  material: THREE.MeshStandardMaterial;
+  boneId: HeroBoneId;
+  mirrorMode: 'none' | 'left' | 'right';
+  lastItemId: string;
+  lastRevision: number;
+  calibration: EquipmentCalibrationEntry | null;
+  fit: NormalizedEquipmentFit | null;
+}
 
 export interface DeckAnchorsLike {
   readonly heroWorldPos: { readonly x: number; readonly y: number; readonly z: number };
@@ -51,8 +101,18 @@ export interface DeckAnchorsLike {
 }
 
 interface UvTextureBinding {
-  sourceTex: THREE.Texture | null;
-  clonedTex: THREE.Texture | null;
+  clones: Map<THREE.Texture, THREE.Texture>;
+}
+
+function createUvTextureBinding(): UvTextureBinding {
+  return { clones: new Map() };
+}
+
+function disposeUvTextureBinding(binding: UvTextureBinding): void {
+  for (const tex of binding.clones.values()) {
+    tex.dispose();
+  }
+  binding.clones.clear();
 }
 
 interface EnemyVisual {
@@ -73,8 +133,6 @@ interface EnemyVisual {
   material: THREE.MeshStandardMaterial;
   fringeMesh: THREE.Mesh | null;
   fringeMat: THREE.MeshBasicMaterial | null;
-  auraGlowMesh: THREE.Mesh | null;
-  auraGlowMat: THREE.MeshBasicMaterial | null;
   shadowMesh: THREE.Mesh;
   shadowMat: THREE.MeshBasicMaterial;
   hpGroup: THREE.Group;
@@ -88,6 +146,11 @@ interface EnemyVisual {
   flipScaleX: number;
   baseScale: number;
   animSeed: number;
+  phase2TransitionTimer: number;
+  cinematicPropGroup?: THREE.Group;
+  cinematicPropDisposables?: Array<{ dispose(): void }>;
+  cinematicMice?: THREE.Mesh[];
+  cinematicCheese?: THREE.Mesh[];
 }
 
 const ALL_HERO_ANIM_STATES: readonly HeroAnimState[] = [
@@ -158,8 +221,8 @@ function bindResolvedFrameToMaterial(
   fringeMat: THREE.MeshBasicMaterial | null,
 ): void {
   if (source.mode === 'uv-grid' && source.sheetTexture) {
-    if (uvBinding.sourceTex !== source.sheetTexture || !uvBinding.clonedTex) {
-      uvBinding.clonedTex?.dispose();
+    let activeTex = uvBinding.clones.get(source.sheetTexture);
+    if (!activeTex) {
       const clone = source.sheetTexture.clone();
       // Filtre bilinéaire sans mip-bleeding inter-cellules sur les planches atlas
       if (source.grid.cols > 1 || source.grid.rows > 1) {
@@ -170,11 +233,10 @@ function bindResolvedFrameToMaterial(
       clone.wrapS = THREE.ClampToEdgeWrapping;
       clone.wrapT = THREE.ClampToEdgeWrapping;
       clone.needsUpdate = true;
-      uvBinding.sourceTex = source.sheetTexture;
-      uvBinding.clonedTex = clone;
+      uvBinding.clones.set(source.sheetTexture, clone);
+      activeTex = clone;
     }
 
-    const activeTex = uvBinding.clonedTex;
     computeGridFrameUvInto(source.grid, frameIndex, uvRect, true);
     applyUvRectToTexture(activeTex, uvRect);
 
@@ -231,13 +293,39 @@ export class EntityRenderer {
   private readonly hpFillGeo: THREE.PlaneGeometry;
   private readonly auraRingGeo: THREE.RingGeometry;
 
-  // Joueur (PBR éclairé dynamiquement + ombre portée + cape 2D physique, ZÉRO halo global)
+  // Joueur (PBR éclairé dynamiquement + squelette hiérarchique d'os + cape physique, ZÉRO faux halo)
   private readonly playerRoot = new THREE.Group();
   private readonly playerTiltGroup = new THREE.Group();
   private readonly playerMesh: THREE.Mesh;
   private readonly playerMat: THREE.MeshStandardMaterial;
+  private readonly heroMaskUniforms: HeroSpriteMaskUniforms = createHeroMaskUniforms();
+  private readonly heroMaskScratch: HeroEquipmentMaskState = computeHeroEquipmentMaskState({
+    equipped: {},
+  });
+  private readonly heroRigRoot = new THREE.Group();
+  private readonly heroBones: Record<HeroBoneId, THREE.Group>;
+  private readonly heroPoseScratch: HeroSkeletonPose = createHeroSkeletonPose();
+  private readonly lanternBeltAnchor = new THREE.Group();
+  private readonly lanternHandAnchor = new THREE.Group();
   private readonly playerLanternLight: THREE.PointLight;
-  private readonly playerLanternWorldPosition = new THREE.Vector3();
+  private readonly playerWeaponLight: THREE.PointLight;
+  private readonly companionLight: THREE.PointLight;
+  private readonly enemyDynamicLight: THREE.PointLight;
+  private readonly scratchWorldPosA = new THREE.Vector3();
+  private readonly scratchWorldPosC = new THREE.Vector3();
+  private readonly lanternGeo: THREE.PlaneGeometry;
+  private readonly playerLanternMat: THREE.MeshStandardMaterial;
+  private readonly playerLanternMesh: THREE.Mesh;
+  private lanternTexLit = false;
+  private readonly beltLantern: HeroBeltLanternState = createHeroBeltLanternState();
+  private readonly helmetBackPivot = new THREE.Group();
+  private readonly helmetBackMesh: THREE.Mesh;
+  private readonly helmetBackMat: THREE.MeshStandardMaterial;
+  private readonly heroDeathSpiritMesh: THREE.Mesh;
+  private readonly heroDeathSpiritMat: THREE.MeshBasicMaterial;
+  private readonly playerFlipOvershoot: PaperFlipOvershootState = createPaperFlipOvershootState(1);
+  private readonly animClock30Fps = createFixedStepAnimClock();
+  private readonly equipCutouts: Record<HeroEquipCutoutKey, HeroEquipCutoutEntry>;
   private readonly capeCloth: CapeClothMesh;
   private readonly capeInputScratch: CapeWindInput = {
     vx: 0,
@@ -258,6 +346,8 @@ export class EntityRenderer {
     isOnDeck: false,
     bounceY: 0,
     elevationY: 0,
+    collarSocketOffsetX: 0,
+    collarSocketOffsetY: 0,
     speed: 0,
   };
   private lastCapeId = '';
@@ -273,20 +363,24 @@ export class EntityRenderer {
   private readonly playerShieldMat: THREE.MeshBasicMaterial;
   private playerFlipX = 1;
   private walkClock = 0;
+  private walkStridePhase = 0;
+  private walkSheetPhase = 0;
+  private smoothedSpeedRatio = 0;
+  private idleBreathClock = 0;
+  private idleTwitchCooldown = 3.8;
+  private idleTwitchProgress = -1;
+  private idleCycleCounter = 0;
 
-  // État d'animation 30 FPS zéro-allocation du héros (7 slots corps suivis par référence)
+  // État d'animation 30 FPS zéro-allocation du héros (4 slots corps suivis par référence)
   private heroClipsCache: Record<HeroAnimState, ResolvedSpriteClipSource> | null = null;
   private lastHeroWeapon = '';
   private lastHeroShield = '';
   private lastHeroHelmet = '';
   private lastHeroArmor = '';
-  private lastHeroBoots = '';
-  private lastHeroGloves = '';
-  private lastHeroTrinket = '';
   private lastHeroRevision = -1;
   private readonly heroAnimCursor = createSpriteAnimCursor('hero_idle');
   private readonly heroUvRect = createSpriteUvRect();
-  private readonly heroUvBinding: UvTextureBinding = { sourceTex: null, clonedTex: null };
+  private readonly heroUvBinding: UvTextureBinding = createUvTextureBinding();
   private activeHeroState: HeroAnimState = 'idle';
   private activeAttackTotalDuration = 0.22;
   private prevAttackAnimTimer = 0;
@@ -300,6 +394,8 @@ export class EntityRenderer {
   private readonly companionRoot = new THREE.Group();
   private readonly companionMesh: THREE.Mesh;
   private readonly companionMat: THREE.MeshStandardMaterial;
+  private readonly companionHaloMesh: THREE.Mesh;
+  private readonly companionHaloMat: THREE.MeshBasicMaterial;
   private readonly companionShadow: THREE.Mesh;
   private readonly companionShadowMat: THREE.MeshBasicMaterial;
   private companionFlipX = 1;
@@ -307,11 +403,12 @@ export class EntityRenderer {
   private lastCompanionRevision = -1;
   private readonly companionAnimCursor = createSpriteAnimCursor('miaou_sprit_idle');
   private readonly companionUvRect = createSpriteUvRect();
-  private readonly companionUvBinding: UvTextureBinding = { sourceTex: null, clonedTex: null };
+  private readonly companionUvBinding: UvTextureBinding = createUvTextureBinding();
   private activeCompanionState: NpcAnimState = 'idle';
   private prevCompX = 0;
   private prevCompZ = 0;
   private hasPrevCompPos = false;
+  private companionTeleportTimer = 0;
 
   // Ennemis dynamiques par ID (Set réutilisé pour zéro allocation par frame)
   private readonly enemies = new Map<string, EnemyVisual>();
@@ -358,21 +455,169 @@ export class EntityRenderer {
       emissive: new THREE.Color(0x000000),
       emissiveIntensity: 0,
     });
-    enableSpriteLighting(this.playerMat);
+    enableSpriteLighting(this.playerMat, {
+      heroMaskUniforms: this.heroMaskUniforms,
+    });
     this.playerMesh = new THREE.Mesh(this.spriteGeo, this.playerMat);
     this.playerMesh.scale.set(HERO_WIDTH, HERO_HEIGHT, 1);
     this.playerMesh.castShadow = true;
     this.playerMesh.receiveShadow = false;
+    this.playerMesh.frustumCulled = false;
     this.playerMesh.userData.skipSSAO = true;
     this.playerMesh.userData.isSprite25D = true;
     this.playerTiltGroup.add(this.playerMesh);
 
-    this.playerLanternLight = new THREE.PointLight(0xffb65c, 0, 9, 2);
+    // Squelette hiérarchique 3D du héros (`pelvis -> spine -> chest -> head/arms, legs`)
+    // Hérite exactement du squash/stretch et du flip du corps sans aucune dérive
+    this.heroRigRoot.name = 'HeroSkeletonRig';
+    this.playerTiltGroup.add(this.heroRigRoot);
+
+    const bones = {} as Record<HeroBoneId, THREE.Group>;
+    for (const boneId of HERO_BONE_ORDER) {
+      const g = new THREE.Group();
+      g.name = `Bone_${boneId}`;
+      bones[boneId] = g;
+    }
+    for (const boneId of HERO_BONE_ORDER) {
+      const spec = HERO_SKELETON_SPEC[boneId];
+      const g = bones[boneId];
+      g.position.set(spec.restX, spec.restY, spec.restZ);
+      if (spec.parent) {
+        bones[spec.parent].add(g);
+      } else {
+        this.heroRigRoot.add(g);
+      }
+    }
+    this.heroBones = bones;
+
+    // Ancres hiérarchiques de la lanterne (strictement sur la DROITE du héros : ceinture & main droite)
+    this.lanternBeltAnchor.name = 'LanternBeltAnchor';
+    this.lanternBeltAnchor.position.set(0.015, 0.012, 0.012);
+    this.heroBones.waist.add(this.lanternBeltAnchor);
+
+    this.lanternHandAnchor.name = 'LanternHandAnchor';
+    this.lanternHandAnchor.position.set(0.115, 0.045, 0.018);
+    this.heroBones.rightHand.add(this.lanternHandAnchor);
+
+    // 9 couches d'équipement PBR parentées à leurs os anatomiques avec pivot mécanique dédié
+    const createEquipCutout = (
+      boneId: HeroBoneId,
+      renderOrder: number,
+      mirrorMode: 'none' | 'left' | 'right' = 'none',
+    ): HeroEquipCutoutEntry => {
+      const pivot = new THREE.Group();
+      pivot.name = `Socket_${boneId}_${renderOrder}`;
+      pivot.visible = false;
+      this.heroBones[boneId].add(pivot);
+
+      const material = new THREE.MeshStandardMaterial({
+        roughness: 0.62,
+        metalness: 0.18,
+        transparent: true,
+        alphaTest: 0.28,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        emissive: new THREE.Color(0x000000),
+        emissiveIntensity: 0,
+      });
+      enableSpriteLighting(material);
+      const mesh = new THREE.Mesh(this.glowGeo, material);
+      mesh.frustumCulled = false;
+      mesh.renderOrder = renderOrder;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.userData.skipSSAO = true;
+      mesh.userData.isSprite25D = true;
+      pivot.add(mesh);
+      return {
+        pivot,
+        mesh,
+        material,
+        boneId,
+        mirrorMode,
+        lastItemId: '',
+        lastRevision: -1,
+        calibration: null,
+        fit: null,
+      };
+    };
+    this.equipCutouts = {
+      armor: createEquipCutout('chest', 4, 'none'),
+      helmet: createEquipCutout('head', 8, 'none'),
+      shield: createEquipCutout('leftHand', 9, 'none'),
+      weapon: createEquipCutout('rightHand', 10, 'none'),
+    };
+
+    // Couche d'occlusion arrière du casque/chapeau (passe derrière la tête pour entourer
+    // naturellement le crâne et masquer proprement l'arrière des oreilles sans déborder)
+    this.helmetBackPivot.name = 'Socket_head_back_occlusion';
+    this.helmetBackPivot.visible = false;
+    this.heroBones.head.add(this.helmetBackPivot);
+    this.helmetBackMat = new THREE.MeshStandardMaterial({
+      roughness: 0.78,
+      metalness: 0.14,
+      color: new THREE.Color(0x2c3442),
+      transparent: true,
+      opacity: 0.78,
+      alphaTest: 0.25,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    enableSpriteLighting(this.helmetBackMat);
+    this.helmetBackMesh = new THREE.Mesh(this.glowGeo, this.helmetBackMat);
+    this.helmetBackMesh.frustumCulled = false;
+    this.helmetBackMesh.renderOrder = 1;
+    this.helmetBackMesh.userData.skipSSAO = true;
+    this.helmetBackMesh.userData.isSprite25D = true;
+    this.helmetBackPivot.add(this.helmetBackMesh);
+
+    // Vraies sources lumineuses PointLight (atténuation quadratique physique decay = 2)
+    // Remplacent TOUS les anciens faux halos additifs (lanterne, arme, bijou, compagnon, boss)
+    this.playerLanternLight = new THREE.PointLight(0xffb454, 0, 12.5, 2);
     this.playerLanternLight.castShadow = false;
     this.playerLanternLight.visible = false;
-    this.playerLanternLight.position.set(0.64, 1.32, 0.68);
+    this.playerLanternLight.position.set(0.55, 1.15, 0.45);
     this.playerLanternLight.userData.skipSSAO = true;
-    this.playerRoot.add(this.playerLanternLight);
+    this.rootGroup.add(this.playerLanternLight);
+
+    this.playerWeaponLight = new THREE.PointLight(0x5ce6ff, 0, 8.0, 2);
+    this.playerWeaponLight.castShadow = false;
+    this.playerWeaponLight.visible = false;
+    this.playerWeaponLight.userData.skipSSAO = true;
+    this.rootGroup.add(this.playerWeaponLight);
+
+    this.companionLight = new THREE.PointLight(0x78e8ff, 2.0, 7.0, 2);
+    this.companionLight.castShadow = false;
+    this.companionLight.visible = true;
+    this.companionLight.userData.skipSSAO = true;
+    this.rootGroup.add(this.companionLight);
+
+    this.enemyDynamicLight = new THREE.PointLight(0xff4c24, 0, 13.0, 2);
+    this.enemyDynamicLight.castShadow = false;
+    this.enemyDynamicLight.visible = false;
+    this.enemyDynamicLight.userData.skipSSAO = true;
+    this.rootGroup.add(this.enemyDynamicLight);
+
+    // Lanterne 2.5D du héros montée dans `heroRigRoot` avec pivot suspendu sur l'anneau supérieur
+    this.lanternGeo = new THREE.PlaneGeometry(1, 1);
+    this.lanternGeo.translate(0, -0.5, 0);
+    this.playerLanternMat = new THREE.MeshStandardMaterial({
+      map: this.textures.getHeroLanternTexture(false),
+      emissive: new THREE.Color(0xffb648),
+      emissiveIntensity: 0,
+      roughness: 0.38,
+      metalness: 0.48,
+      transparent: true,
+      alphaTest: 0.25,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    enableSpriteLighting(this.playerLanternMat);
+    this.playerLanternMesh = new THREE.Mesh(this.lanternGeo, this.playerLanternMat);
+    this.playerLanternMesh.frustumCulled = false;
+    this.playerLanternMesh.renderOrder = 11;
+    this.playerLanternMesh.userData.skipSSAO = true;
+    this.heroRigRoot.add(this.playerLanternMesh);
 
     this.capeCloth = new CapeClothMesh();
     // Attachée directement à playerRoot (repère vertical monde) pour vraie gravité,
@@ -388,7 +633,7 @@ export class EntityRenderer {
     });
     this.playerShadow = new THREE.Mesh(this.shadowGeo, this.playerShadowMat);
     this.playerShadow.position.y = 0.03;
-    this.playerShadow.scale.set(0.82, 1, 0.56);
+    this.playerShadow.scale.set(1.04, 1, 0.72);
     this.playerShadow.renderOrder = 1;
     this.playerShadow.userData.skipSSAO = true;
     this.playerRoot.add(this.playerShadow);
@@ -422,6 +667,23 @@ export class EntityRenderer {
     this.playerShieldRing.userData.skipSSAO = true;
     this.playerRoot.add(this.playerShieldRing);
 
+    // Esprit félin doré-cyan s'élevant doucement lors de la séquence de mort du héros
+    this.heroDeathSpiritMat = new THREE.MeshBasicMaterial({
+      map: this.textures.getStarParticleTexture(),
+      color: new THREE.Color(1.4, 1.85, 2.2),
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    this.heroDeathSpiritMesh = new THREE.Mesh(this.glowGeo, this.heroDeathSpiritMat);
+    this.heroDeathSpiritMesh.rotation.x = SPRITE_TILT_X;
+    this.heroDeathSpiritMesh.visible = false;
+    this.heroDeathSpiritMesh.renderOrder = 12;
+    this.heroDeathSpiritMesh.userData.skipSSAO = true;
+    this.playerRoot.add(this.heroDeathSpiritMesh);
+
     this.rootGroup.add(this.playerRoot);
 
     // --- Construction du Compagnon Miaou-sprit (émissif HDR > 1.2 pour Bloom !) ---
@@ -448,6 +710,22 @@ export class EntityRenderer {
     this.companionMesh.userData.skipSSAO = true;
     this.companionMesh.userData.isSprite25D = true;
     this.companionRoot.add(this.companionMesh);
+
+    this.companionHaloMat = new THREE.MeshBasicMaterial({
+      map: this.textures.getParticleTexture(),
+      color: new THREE.Color(0x78e8ff),
+      transparent: true,
+      opacity: 0.24,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    this.companionHaloMesh = new THREE.Mesh(this.glowGeo, this.companionHaloMat);
+    this.companionHaloMesh.scale.set(2.1, 2.1, 1);
+    this.companionHaloMesh.rotation.x = SPRITE_TILT_X;
+    this.companionHaloMesh.renderOrder = 3;
+    this.companionHaloMesh.userData.skipSSAO = true;
+    this.companionRoot.add(this.companionHaloMesh);
 
     this.companionShadowMat = new THREE.MeshBasicMaterial({
       map: this.textures.getShadowTexture(),
@@ -487,10 +765,7 @@ export class EntityRenderer {
       this.lastHeroWeapon === equipped.weapon &&
       this.lastHeroShield === equipped.shield &&
       this.lastHeroHelmet === equipped.helmet &&
-      this.lastHeroArmor === equipped.armor &&
-      this.lastHeroBoots === equipped.boots &&
-      this.lastHeroGloves === equipped.gloves &&
-      this.lastHeroTrinket === equipped.trinket
+      this.lastHeroArmor === equipped.armor
     ) {
       return this.heroClipsCache;
     }
@@ -500,9 +775,6 @@ export class EntityRenderer {
     this.lastHeroShield = equipped.shield;
     this.lastHeroHelmet = equipped.helmet;
     this.lastHeroArmor = equipped.armor;
-    this.lastHeroBoots = equipped.boots;
-    this.lastHeroGloves = equipped.gloves;
-    this.lastHeroTrinket = equipped.trinket;
 
     const table = {} as Record<HeroAnimState, ResolvedSpriteClipSource>;
     for (let i = 0; i < ALL_HERO_ANIM_STATES.length; i++) {
@@ -539,7 +811,7 @@ export class EntityRenderer {
     root.add(tiltGroup);
 
     const clips = this.buildEnemyClipTable(enemy.typeId, enemy.phase);
-    const uvBinding: UvTextureBinding = { sourceTex: null, clonedTex: null };
+    const uvBinding: UvTextureBinding = createUvTextureBinding();
     const uvRect = createSpriteUvRect();
     const animCursor = createSpriteAnimCursor(clips.idle.clip.id);
     // Léger déphasage temporel par spawn pour éviter un synchronisme mécanique des meutes
@@ -565,6 +837,7 @@ export class EntityRenderer {
     spriteMesh.scale.set(baseScale * flipScaleX, baseScale, 1);
     spriteMesh.castShadow = true;
     spriteMesh.receiveShadow = false;
+    spriteMesh.frustumCulled = false;
     spriteMesh.userData.skipSSAO = true;
     spriteMesh.userData.isSprite25D = true;
     tiltGroup.add(spriteMesh);
@@ -587,6 +860,7 @@ export class EntityRenderer {
       fringeMesh.scale.set(baseScale * flipScaleX, baseScale, 1);
       fringeMesh.castShadow = false;
       fringeMesh.receiveShadow = false;
+      fringeMesh.frustumCulled = false;
       fringeMesh.renderOrder = 3;
       fringeMesh.userData.skipSSAO = true;
       tiltGroup.add(fringeMesh);
@@ -602,30 +876,7 @@ export class EntityRenderer {
       fringeMat,
     );
 
-    // Billboard d'aura additive derrière les ennemis & boss lumineux
-    let auraGlowMesh: THREE.Mesh | null = null;
-    let auraGlowMat: THREE.MeshBasicMaterial | null = null;
-    if (baseGlow) {
-      auraGlowMat = new THREE.MeshBasicMaterial({
-        map: this.textures.getParticleTexture(),
-        color: new THREE.Color(baseGlow.hex),
-        transparent: true,
-        opacity: 0.36,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-        side: THREE.DoubleSide,
-      });
-      auraGlowMesh = new THREE.Mesh(this.glowGeo, auraGlowMat);
-      auraGlowMesh.position.set(0, baseScale * 0.5, -0.04);
-      auraGlowMesh.scale.set(baseScale * 1.35, baseScale * 1.3, 1);
-      auraGlowMesh.castShadow = false;
-      auraGlowMesh.receiveShadow = false;
-      auraGlowMesh.renderOrder = 2;
-      auraGlowMesh.userData.skipSSAO = true;
-      tiltGroup.add(auraGlowMesh);
-    }
-
-    // Ombre de contact douce au sol (complète l'ombre portée directionnelle réelle)
+    // Ombre de contact douce au sol (l'éclairage des ennemis lumineux passe par enemyDynamicLight)
     const shadowMat = new THREE.MeshBasicMaterial({
       map: this.textures.getShadowTexture(),
       transparent: true,
@@ -730,8 +981,6 @@ export class EntityRenderer {
       material,
       fringeMesh,
       fringeMat,
-      auraGlowMesh,
-      auraGlowMat,
       shadowMesh,
       shadowMat,
       hpGroup,
@@ -745,22 +994,25 @@ export class EntityRenderer {
       flipScaleX,
       baseScale,
       animSeed,
+      phase2TransitionTimer: 0,
     };
   }
 
   private disposeEnemyVisual(vis: EnemyVisual): void {
     this.rootGroup.remove(vis.root);
-    vis.uvBinding.clonedTex?.dispose();
-    vis.uvBinding.clonedTex = null;
-    vis.uvBinding.sourceTex = null;
+    disposeUvTextureBinding(vis.uvBinding);
     vis.material.dispose();
     vis.fringeMat?.dispose();
-    vis.auraGlowMat?.dispose();
     vis.shadowMat.dispose();
     vis.hpBgMat.dispose();
     vis.hpFillMat.dispose();
     vis.frostRingMat.dispose();
     vis.bossAuraMat?.dispose();
+    if (vis.cinematicPropDisposables) {
+      for (const d of vis.cinematicPropDisposables) {
+        d.dispose();
+      }
+    }
   }
 
   /**
@@ -773,6 +1025,17 @@ export class EntityRenderer {
     this.lastHeroRevision = -1;
     this.lastCompanionRevision = -1;
     this.lastCapeRevision = -1;
+
+    for (const eq of Object.values(this.equipCutouts)) {
+      eq.lastRevision = -1;
+      eq.calibration = null;
+      eq.fit = null;
+    }
+
+    const lanternTex = this.textures.getHeroLanternTexture(this.lanternTexLit);
+    this.playerLanternMat.map = lanternTex;
+    this.playerLanternMat.emissiveMap = this.lanternTexLit ? lanternTex : null;
+    this.playerLanternMat.needsUpdate = true;
 
     for (const vis of this.enemies.values()) {
       vis.registryRevision = -1;
@@ -813,18 +1076,35 @@ export class EntityRenderer {
       state.zoneId === 'overworld' &&
       (shipMode === 'boarding' || shipMode === 'disembarking');
 
-    // Petite lumière chaude portée par le héros à l'extérieur quand la météo
-    // ou le cycle nuit/aube le justifient; aucun coût d'ombre secondaire.
-    const lanternPower = weather?.lanternBoost ?? 0;
-    const lanternActive = state.zoneId === 'overworld' && !isOnDeck && lanternPower > 0.04;
-    this.playerLanternLight.visible = lanternActive;
-    this.playerLanternLight.intensity = lanternActive ? 1.55 * lanternPower : 0;
+    const inDungeon = state.zoneId !== 'overworld';
+    const portalTr = state.portalTransition;
+    const isPortalWalking = Boolean(portalTr);
 
     const speed = Math.hypot(p.vx, p.vz);
-    const isDead = p.hp <= 0 || state.screen === 'defeat';
-    const isMoving = !isDead && !isOnDeck && !isShipJumping && speed > 0.35;
+    const isDeathSequence = Boolean(state.deathSequence);
+    const isDead = isDeathSequence || p.hp <= 0 || state.screen === 'defeat';
+    const deathProgress = state.deathSequence
+      ? Math.max(0, Math.min(1, state.deathSequence.elapsed / Math.max(0.1, state.deathSequence.duration)))
+      : isDead
+        ? 1
+        : 0;
+    const isMoving =
+      !isDead &&
+      !isOnDeck &&
+      !isShipJumping &&
+      (speed > 0.35 || isPortalWalking);
+
+    // Synchronise finement la cadence de foulée à la vitesse réelle au sol (plus posée et naturelle)
+    const maxWalkSpeed = 7.4;
+    const effectiveSpeed = isPortalWalking ? Math.max(speed, 4.2) : speed;
+    const rawSpeedRatio = isMoving ? Math.max(0.22, Math.min(1.15, effectiveSpeed / maxWalkSpeed)) : 0;
+    this.smoothedSpeedRatio += (rawSpeedRatio - this.smoothedSpeedRatio) * Math.min(1, dt * 10);
     if (isMoving) {
-      this.walkClock += dt * LEGACY_TWO_FRAME_WALK_FPS;
+      this.walkClock += dt * (4.6 * Math.max(0.35, this.smoothedSpeedRatio));
+      this.walkStridePhase += dt * (effectiveSpeed * 1.12);
+      this.walkSheetPhase += dt * (11.5 * Math.max(0.35, this.smoothedSpeedRatio));
+    } else {
+      this.idleBreathClock += dt;
     }
 
     // Suivi sans allocation de la durée totale des actions ponctuelles (combo, roulade, impact)
@@ -910,6 +1190,11 @@ export class EntityRenderer {
       frameIdx = sampleOneShotProgressFrame(hurtProgress, activeClipSource.frameCount);
       this.heroAnimCursor.frameIndex = frameIdx;
       this.heroAnimCursor.finished = hurtProgress >= 1 - 1e-4;
+    } else if (heroState === 'death') {
+      this.heroAnimCursor.clipId = activeClipSource.clip.id;
+      frameIdx = sampleOneShotProgressFrame(deathProgress, activeClipSource.frameCount);
+      this.heroAnimCursor.frameIndex = frameIdx;
+      this.heroAnimCursor.finished = deathProgress >= 1 - 1e-4;
     } else if (heroState === 'jump') {
       const tr = state.ship.transition;
       const jumpProgress = tr
@@ -919,15 +1204,6 @@ export class EntityRenderer {
       frameIdx = sampleOneShotProgressFrame(jumpProgress, activeClipSource.frameCount);
       this.heroAnimCursor.frameIndex = frameIdx;
       this.heroAnimCursor.finished = jumpProgress >= 1 - 1e-4;
-    } else if (heroState === 'walk' && activeClipSource.frameCount <= 2) {
-      // Préserve la cadence naturelle 9.5 Hz tant que la marche utilise les 2 poses legacy
-      frameIdx = advanceSpriteAnimCursor(
-        this.heroAnimCursor,
-        activeClipSource.clip,
-        activeClipSource.frameCount,
-        dt,
-        LEGACY_TWO_FRAME_WALK_FPS,
-      );
     } else {
       frameIdx = advanceSpriteAnimCursor(
         this.heroAnimCursor,
@@ -937,9 +1213,49 @@ export class EntityRenderer {
       );
     }
 
+    // Sur les planches HD chargées en jeu réel :
+    // - au repos : cadence plus calme et variée (pauses naturelles avant un léger mouvement d'oreilles)
+    // - en marche : cadence des jambes/pieds plus posée et synchronisée à la vitesse réelle
+    let renderedFrameIdx = frameIdx;
+    if (
+      this.textures.isHdLoaded &&
+      activeClipSource.mode === 'uv-grid' &&
+      activeClipSource.frameCount > 8
+    ) {
+      if (heroState === 'idle' || heroState === 'deck_idle') {
+        if (this.idleTwitchProgress >= 0) {
+          this.idleTwitchProgress += dt * 0.56;
+          if (this.idleTwitchProgress >= 1) {
+            this.idleTwitchProgress = -1;
+            this.idleCycleCounter += 1;
+            // Pause variable (~4.2 s à 7.1 s) pour éviter toute boucle nerveuse/répétitive
+            const variedGap = 4.2 + ((this.idleCycleCounter * 1.37) % 2.9);
+            this.idleTwitchCooldown = variedGap;
+          } else {
+            renderedFrameIdx = Math.min(
+              activeClipSource.frameCount - 1,
+              Math.floor(this.idleTwitchProgress * activeClipSource.frameCount),
+            );
+          }
+        } else {
+          this.idleTwitchCooldown -= dt;
+          if (this.idleTwitchCooldown <= 0) {
+            this.idleTwitchProgress = 0;
+          }
+          // Respiration très lente sur les premières frames calmes (sans tic répété d'oreilles)
+          const calmSpan = Math.min(6, activeClipSource.frameCount - 1);
+          const wave = 0.5 - 0.5 * Math.cos(this.idleBreathClock * 1.15);
+          renderedFrameIdx = Math.round(wave * calmSpan);
+        }
+      } else if (heroState === 'walk') {
+        renderedFrameIdx =
+          Math.floor(this.walkSheetPhase) % Math.max(1, activeClipSource.frameCount);
+      }
+    }
+
     bindResolvedFrameToMaterial(
       activeClipSource,
-      frameIdx,
+      renderedFrameIdx,
       this.heroUvBinding,
       this.heroUvRect,
       this.playerMat,
@@ -957,7 +1273,7 @@ export class EntityRenderer {
       this.playerTiltGroup.rotation.z = -shipDeck.deckRoll * 0.35;
       this.playerShadow.visible = true;
       this.playerShadow.position.y = 0.028;
-      this.playerShadow.scale.set(0.76, 1, 0.52);
+      this.playerShadow.scale.set(0.96, 1, 0.66);
     } else if (isShipJumping) {
       const elevY = p.elevationY ?? 0;
       this.playerRoot.position.set(p.x, elevY, p.z);
@@ -966,27 +1282,39 @@ export class EntityRenderer {
       this.playerShadow.visible = elevY < 0.25;
       this.playerShadow.position.y = Math.max(0.03, -elevY + 0.03);
       const sScale = Math.max(0.35, 1 - elevY * 0.22);
-      this.playerShadow.scale.set(0.82 * sScale, 1, 0.56 * sScale);
+      this.playerShadow.scale.set(1.04 * sScale, 1, 0.72 * sScale);
     } else {
       this.playerRoot.position.set(p.x, p.elevationY ?? 0, p.z);
       this.playerTiltGroup.rotation.z = 0;
       this.playerShadow.visible = true;
       this.playerShadow.position.y = 0.03;
-      this.playerShadow.scale.set(0.82, 1, 0.56);
+      this.playerShadow.scale.set(1.04, 1, 0.72);
     }
 
-    // Flip horizontal fluide sans jamais passer de profil (scale.x signé, DoubleSide)
-    const targetFlip = p.facingX < 0 ? -1 : 1;
-    this.playerFlipX = approachFlip(this.playerFlipX, targetFlip, dt * 16);
+    // Retournement 180° façon feuille rigide avec courbe d'overshoot amortie
+    const targetFlip: 1 | -1 = p.facingX < 0 ? -1 : 1;
+    stepPaperFlipOvershoot(this.playerFlipOvershoot, targetFlip, dt, 0.18);
+    this.playerFlipX = this.playerFlipOvershoot.scaleX;
     this.playerMesh.rotation.y = 0;
 
     // Squash & stretch expressif selon l'action (ligne de sol pieds préservée)
     let sx = HERO_WIDTH;
     let sy = HERO_HEIGHT;
     let bounceY = 0;
+    let portalScale = 1;
+
+    if (portalTr) {
+      const pt = Math.max(0, Math.min(1, portalTr.elapsed / Math.max(0.05, portalTr.duration)));
+      if (portalTr.phase === 'entering') {
+        portalScale = Math.max(0.28, 1 - pt * pt * 0.68);
+      } else {
+        const emerge = 1 - Math.pow(1 - pt, 2);
+        portalScale = 0.35 + emerge * 0.65;
+      }
+    }
 
     if (isOnDeck) {
-      const seaBreath = Math.sin(this.animTime * 2.8) * 0.022;
+      const seaBreath = Math.sin(this.animTime * 2.4) * 0.02;
       sx = HERO_WIDTH * (1 - seaBreath * 0.45);
       sy = HERO_HEIGHT * (1 + seaBreath);
       bounceY = 0;
@@ -998,52 +1326,327 @@ export class EntityRenderer {
       sy = HERO_HEIGHT * (1 + stretch);
       bounceY = 0;
     } else if (heroState === 'death') {
-      sx = HERO_WIDTH * 1.04;
-      sy = HERO_HEIGHT * 0.84;
-      bounceY = 0;
+      // Séquence de mort du héros (~2.0 s) : choc -> bascule latérale -> affaissement au sol
+      const stagger = deathProgress < 0.25 ? Math.sin((deathProgress / 0.25) * Math.PI) * 0.08 : 0;
+      const fallT = Math.max(0, Math.min(1, (deathProgress - 0.18) / 0.58));
+      const fallEase = fallT * fallT * (3 - 2 * fallT);
+      sx = HERO_WIDTH * (1.0 + fallEase * 0.1 + stagger);
+      sy = HERO_HEIGHT * (1.0 - fallEase * 0.26 - stagger * 0.5);
+      bounceY = stagger * 0.16 - fallEase * 0.18;
+      this.playerTiltGroup.rotation.z = -fallEase * 1.18 * targetFlip;
+      this.playerShadow.scale.set(1.04 + fallEase * 0.55, 1, 0.72 + fallEase * 0.25);
     } else if (heroState === 'roll') {
       const sq = 1 + Math.sin(this.animTime * 28) * 0.1;
       sx = HERO_WIDTH * 0.96 * sq;
       sy = (HERO_HEIGHT * 0.88) / sq;
       bounceY = 0.22;
     } else if (heroState === 'attack') {
-      sx = HERO_WIDTH * 1.1;
-      sy = HERO_HEIGHT * 0.94;
-      bounceY = 0.06;
+      const weaponProfile = getWeaponCombatProfile(p.equipped.weapon);
+      const isHeavyWeapon =
+        weaponProfile.attackShape === 'cleave' ||
+        weaponProfile.weaponFamily === 'axe_hammer' ||
+        p.equipped.weapon === 'blade_dragon';
+      const isArcaneWeapon =
+        weaponProfile.weaponFamily === 'staff' ||
+        weaponProfile.weaponFamily === 'bow_crossbow';
+      sx = HERO_WIDTH * (isHeavyWeapon ? 1.14 : isArcaneWeapon ? 1.07 : 1.1);
+      sy = HERO_HEIGHT * (isHeavyWeapon ? 0.92 : 0.95);
+      bounceY = isHeavyWeapon ? 0.08 : 0.05;
     } else if (heroState === 'hurt') {
       sx = HERO_WIDTH * 1.05;
       sy = HERO_HEIGHT * 0.95;
       bounceY = 0.03;
     } else if (isMoving) {
-      const hop = Math.abs(Math.sin(this.walkClock * Math.PI * 0.5));
-      sx = HERO_WIDTH * (1.06 - hop * 0.1);
-      sy = HERO_HEIGHT * (0.94 + hop * 0.12);
-      bounceY = hop * 0.14;
+      const hop = Math.abs(Math.sin(this.walkStridePhase)) * Math.min(1, this.smoothedSpeedRatio);
+      sx = HERO_WIDTH * (1.03 - hop * 0.055);
+      sy = HERO_HEIGHT * (0.97 + hop * 0.07);
+      bounceY = hop * 0.09;
     } else {
-      const breath = Math.sin(this.animTime * 3.2) * 0.025;
-      sx = HERO_WIDTH * (1 - breath * 0.5);
+      const breath = Math.sin(this.animTime * 1.9) * 0.018;
+      sx = HERO_WIDTH * (1 - breath * 0.45);
       sy = HERO_HEIGHT * (1 + breath);
     }
 
+    sx *= portalScale;
+    sy *= portalScale;
+
     this.playerMesh.scale.set(sx * this.playerFlipX, sy, 1);
+    this.heroRigRoot.scale.set(sx * this.playerFlipX, sy, 1);
     this.playerTiltGroup.position.y = bounceY;
     this.lastPlayerBounceY = bounceY;
 
-    // Position fluide de la lanterne du héros + synchronisation du slot 8 du shader local
-    this.playerLanternLight.position.set(0.62 * this.playerFlipX, 1.38 + bounceY * 0.5, 0.44);
-    if (lanternActive) {
-      this.playerLanternWorldPosition
-        .copy(this.playerRoot.position)
-        .add(this.playerLanternLight.position);
+    // Esprit félin s'élevant à la fin de la séquence de mort du héros
+    if (heroState === 'death' && deathProgress > 0.42) {
+      const soulT = Math.min(1, (deathProgress - 0.42) / 0.58);
+      this.heroDeathSpiritMesh.visible = true;
+      this.heroDeathSpiritMesh.position.set(
+        Math.sin(soulT * Math.PI * 3) * 0.22,
+        0.55 + soulT * 2.1,
+        0.2,
+      );
+      const soulScale = 0.55 + Math.sin(soulT * Math.PI) * 0.45;
+      this.heroDeathSpiritMesh.scale.set(soulScale, soulScale, 1);
+      this.heroDeathSpiritMat.opacity = Math.sin(soulT * Math.PI) * 0.88;
+    } else {
+      this.heroDeathSpiritMesh.visible = false;
+      this.heroDeathSpiritMat.opacity = 0;
+    }
+
+    // 1. Résolution de la pose hiérarchique des 16 os du squelette (zéro allocation)
+    const isBlocking = (p.shieldHp ?? 0) > 0 && (p.shieldTimer ?? 0) > 0;
+    const bonePose = solveHeroBoneTransformsInto(
+      this.heroPoseScratch,
+      heroState,
+      frameIdx,
+      activeClipSource.frameCount,
+      {
+        blocking: isBlocking,
+        time: this.animTime,
+        weaponId: p.equipped.weapon,
+        comboStep: p.comboStep,
+        stridePhase: this.walkStridePhase,
+        speedRatio: Math.max(0.2, this.smoothedSpeedRatio),
+        deathProgress,
+      },
+    );
+    const earPose = solveHeroEarPose(this.animTime, heroState, p.equipped.helmet);
+    for (const boneId of HERO_BONE_ORDER) {
+      const b = bonePose[boneId];
+      const node = this.heroBones[boneId];
+      node.position.set(b.x, b.y, b.z);
+      const extraHeadTilt = boneId === 'head' ? (earPose.leftRotZ + earPose.rightRotZ) * 0.14 : 0;
+      node.rotation.z = b.rotZ + extraHeadTilt;
+      node.scale.set(b.scaleX, b.scaleY, 1);
+    }
+
+    // 2. Synchronisation des 9 couches d'équipement PBR parentées à leurs os anatomiques
+    // Restent visibles & articulées pendant TOUTES les animations (roulade & séquence de mort incluses)
+    const showSocketEquip = activeClipSource.mode === 'uv-grid';
+    const rev = this.textures.revision;
+    const syncBoneEquipment = (key: HeroEquipCutoutKey, itemId: string): void => {
+      const entry = this.equipCutouts[key];
+      if (!showSocketEquip || !itemId) {
+        entry.pivot.visible = false;
+        return;
+      }
+      if (entry.lastItemId !== itemId || entry.lastRevision !== rev) {
+        entry.lastItemId = itemId;
+        entry.lastRevision = rev;
+        const resolved = this.textures.getNormalizedEquipmentOverlay(itemId);
+        if (resolved) {
+          entry.calibration = resolved.calibration;
+          entry.fit = resolved.fit;
+          entry.material.map = resolved.texture;
+          entry.material.roughness = resolved.calibration.pbr.roughness;
+          entry.material.metalness = resolved.calibration.pbr.metalness;
+          entry.material.emissiveMap =
+            resolved.calibration.pbr.emissiveHex !== undefined ? resolved.texture : null;
+          entry.material.needsUpdate = true;
+        } else {
+          entry.calibration = null;
+          entry.fit = null;
+          entry.material.map = null;
+          entry.material.emissiveMap = null;
+          entry.material.needsUpdate = true;
+        }
+      }
+      if (!entry.material.map || !entry.calibration || !entry.fit) {
+        entry.pivot.visible = false;
+        return;
+      }
+      const cal = entry.calibration;
+      const fit = entry.fit;
+      const mirrorSign =
+        entry.mirrorMode === 'left'
+          ? (cal.leftMirrorSign ?? 1)
+          : entry.mirrorMode === 'right'
+            ? (cal.rightMirrorSign ?? 1)
+            : 1;
+
+      entry.pivot.visible = true;
+      entry.pivot.position.set(cal.offsetX, cal.offsetY, cal.offsetZ);
+      entry.pivot.rotation.z = cal.baseRotZ;
+      entry.pivot.scale.set(mirrorSign, 1, 1);
+
+      // Positionne le quad de façon à ce que le pivot mécanique (ex. poignée d'épée)
+      // coïncide exactement avec l'origine (0, 0) du socket de l'os parent !
+      entry.mesh.position.set(fit.meshOffsetX, fit.meshOffsetY, 0);
+      entry.mesh.scale.set(fit.quadW, fit.quadH, 1);
+    };
+
+    syncBoneEquipment('armor', p.equipped.armor);
+    syncBoneEquipment('helmet', p.equipped.helmet);
+    syncBoneEquipment('shield', p.equipped.shield);
+    syncBoneEquipment('weapon', p.equipped.weapon);
+
+    // Masquage anatomique 3D (torse sous plastron + haut du crâne/oreilles sous heaume fermé)
+    const mask = computeHeroEquipmentMaskState(
+      {
+        equipped: p.equipped,
+        heroState,
+        bonePose,
+        showSocketEquip: showSocketEquip && (this.equipCutouts.armor.pivot.visible || this.equipCutouts.helmet.pivot.visible),
+      },
+      this.heroMaskScratch,
+    );
+    const torsoActive = mask.torsoMasked && this.equipCutouts.armor.pivot.visible;
+    const headActive = mask.headMaskEnabled && this.equipCutouts.helmet.pivot.visible;
+    this.heroMaskUniforms.uHeroTorsoMask.value.set(
+      mask.torsoCenterU,
+      mask.torsoCenterV,
+      mask.torsoHalfW,
+      mask.torsoHalfH,
+    );
+    this.heroMaskUniforms.uHeroHeadMask.value.set(
+      mask.headCenterU,
+      mask.headCenterV,
+      mask.headHalfW,
+      mask.headHalfH,
+    );
+    this.heroMaskUniforms.uHeroMaskMeta.value.set(
+      torsoActive ? 1 : 0,
+      headActive ? 1 : 0,
+      mask.torsoRotZ,
+      mask.headRotZ,
+    );
+
+    // Couche d'occlusion arrière du casque/chapeau (derrière la tête pour un port cohérent)
+    const helmEntry = this.equipCutouts.helmet;
+    const helmOcc = helmEntry.calibration?.helmetOcclusion;
+    if (helmEntry.pivot.visible && helmEntry.material.map && helmEntry.calibration && helmEntry.fit && helmOcc) {
+      this.helmetBackPivot.visible = true;
+      this.helmetBackPivot.position.set(
+        helmEntry.calibration.offsetX,
+        helmEntry.calibration.offsetY + helmOcc.backOffsetY,
+        -0.018,
+      );
+      this.helmetBackPivot.rotation.z = helmEntry.calibration.baseRotZ;
+      if (this.helmetBackMat.map !== helmEntry.material.map) {
+        this.helmetBackMat.map = helmEntry.material.map;
+        this.helmetBackMat.needsUpdate = true;
+      }
+      this.helmetBackMat.color.setHex(helmOcc.backTintHex);
+      this.helmetBackMat.opacity = helmOcc.backLayerAlpha;
+      this.helmetBackMesh.position.set(helmEntry.fit.meshOffsetX, helmEntry.fit.meshOffsetY, 0);
+      this.helmetBackMesh.scale.set(
+        helmEntry.fit.quadW * helmOcc.backScaleX,
+        helmEntry.fit.quadH * helmOcc.backScaleY,
+        1,
+      );
+    } else {
+      this.helmetBackPivot.visible = false;
+    }
+
+    // 3. Lanterne de CEINTURE permanente (JAMAIS en main) :
+    // - Rangée et invisible dans les lieux lumineux
+    // - Dans les lieux sombres (nuit, tempête, brouillard, donjon) : commence ÉTEINTE à la
+    //   ceinture puis s'allume progressivement en ~2.0 secondes
+    const sockets = sampleHeroFrameSockets(
+      heroState,
+      frameIdx,
+      activeClipSource.frameCount,
+      { blocking: isBlocking, facingSign: targetFlip },
+    );
+    stepHeroBeltLantern(
+      this.beltLantern,
+      {
+        lanternBoost: weather?.lanternBoost ?? 0,
+        inDungeon,
+        isOnDeck,
+        isDead,
+        vx: isDead ? 0 : p.vx,
+        vz: isDead ? 0 : p.vz,
+        facingSign: targetFlip,
+        windIntensity: weather?.windIntensity ?? 0.2,
+      },
+      dt,
+    );
+
+    const lanternLit = this.beltLantern.visible && this.beltLantern.lightLevel > 0.06;
+    if (this.lanternTexLit !== lanternLit) {
+      this.lanternTexLit = lanternLit;
+      const nextLanternTex = this.textures.getHeroLanternTexture(lanternLit);
+      this.playerLanternMat.map = nextLanternTex;
+      this.playerLanternMat.emissiveMap = lanternLit ? nextLanternTex : null;
+      this.playerLanternMat.needsUpdate = true;
+    }
+
+    // Met à jour la matrice monde de l'arbre d'os pour ancrer la lanterne STRICTEMENT sur la ceinture
+    this.playerRoot.updateMatrixWorld(true);
+    this.lanternBeltAnchor.getWorldPosition(this.scratchWorldPosA);
+    this.heroRigRoot.worldToLocal(this.scratchWorldPosA);
+    const deploySmooth =
+      this.beltLantern.deploy * this.beltLantern.deploy * (3 - 2 * this.beltLantern.deploy);
+
+    this.playerLanternMesh.visible = this.beltLantern.visible;
+    this.playerLanternMesh.position.set(
+      this.scratchWorldPosA.x,
+      this.scratchWorldPosA.y - (1 - deploySmooth) * 0.028,
+      this.scratchWorldPosA.z + 0.022,
+    );
+    this.playerLanternMesh.rotation.z = this.beltLantern.swingAngle * targetFlip;
+    const lanternWorldScale = 0.42 * (0.28 + 0.72 * deploySmooth);
+    this.playerLanternMesh.scale.set(
+      lanternWorldScale / HERO_WIDTH,
+      lanternWorldScale / HERO_HEIGHT,
+      1,
+    );
+    // Vitre de lanterne émissive HDR synchronisée à la montée progressive 2.0 s
+    this.playerLanternMat.emissiveIntensity = lanternLit
+      ? 0.1 +
+        this.beltLantern.effectiveIntensity * 0.92 +
+        Math.sin(this.animTime * 9.5) * 0.06 * this.beltLantern.lightLevel
+      : 0;
+
+    // 4. Vraie PointLight de la lanterne de ceinture (slot 8 du shader PBR, strictement synchronisée)
+    this.playerLanternMesh.updateMatrixWorld(true);
+    this.playerLanternMesh.getWorldPosition(this.scratchWorldPosC);
+    this.scratchWorldPosC.y = Math.max(0.82, this.scratchWorldPosC.y - 0.14);
+    this.scratchWorldPosC.z += 0.36;
+    this.playerLanternLight.position.copy(this.scratchWorldPosC);
+    if (this.beltLantern.visible && this.beltLantern.effectiveIntensity > 0.015) {
+      const flicker = 0.94 + Math.sin(this.animTime * 11.4) * 0.06;
+      const baseLanternInt = inDungeon ? 6.8 : 5.9;
+      this.playerLanternLight.visible = true;
+      this.playerLanternLight.intensity =
+        baseLanternInt * this.beltLantern.effectiveIntensity * flicker;
+      this.playerLanternLight.distance = 8.4 + 3.2 * this.beltLantern.lightLevel;
       setSpriteLight(
-        8,
-        this.playerLanternWorldPosition,
+        SPRITE_LIGHT_SLOT.HERO_LANTERN,
+        this.playerLanternLight.position,
         this.playerLanternLight.color,
         this.playerLanternLight.intensity,
         this.playerLanternLight.distance,
       );
     } else {
-      clearSpriteLight(8);
+      this.playerLanternLight.visible = false;
+      this.playerLanternLight.intensity = 0;
+      clearSpriteLight(SPRITE_LIGHT_SLOT.HERO_LANTERN);
+    }
+
+    // 5. Vraie PointLight de l'arme lumineuse (`staff_arcane`, `blade_dragon`, etc.) (slot 9)
+    const weaponRealLight = this.equipCutouts.weapon.calibration?.pbr.realLight;
+    if (!isDead && weaponRealLight && this.equipCutouts.weapon.pivot.visible) {
+      this.equipCutouts.weapon.mesh.getWorldPosition(this.scratchWorldPosC);
+      this.scratchWorldPosC.y += 0.18;
+      this.scratchWorldPosC.z += 0.25;
+      const wWave = 0.88 + Math.sin(this.animTime * 4.6) * 0.12;
+      this.playerWeaponLight.visible = true;
+      this.playerWeaponLight.color.setHex(weaponRealLight.colorHex);
+      this.playerWeaponLight.intensity = weaponRealLight.intensity * wWave;
+      this.playerWeaponLight.distance = weaponRealLight.distance;
+      this.playerWeaponLight.position.copy(this.scratchWorldPosC);
+      setSpriteLight(
+        SPRITE_LIGHT_SLOT.HERO_WEAPON,
+        this.playerWeaponLight.position,
+        this.playerWeaponLight.color,
+        this.playerWeaponLight.intensity,
+        this.playerWeaponLight.distance,
+      );
+    } else {
+      this.playerWeaponLight.visible = false;
+      this.playerWeaponLight.intensity = 0;
+      clearSpriteLight(SPRITE_LIGHT_SLOT.HERO_WEAPON);
     }
 
     // Simulation de la cape en tissu souple (uniquement couche de rendu, zéro alloc/frame,
@@ -1102,9 +1705,11 @@ export class EntityRenderer {
     this.capeInputScratch.isOnDeck = isOnDeck;
     this.capeInputScratch.bounceY = bounceY;
     this.capeInputScratch.elevationY = isOnDeck ? 0 : (p.elevationY ?? 0);
+    this.capeInputScratch.collarSocketOffsetX = sockets.cape.x * 0.35;
+    this.capeInputScratch.collarSocketOffsetY = (sockets.cape.y - 0.52) * 0.55;
     this.capeCloth.update(dt, this.capeInputScratch);
 
-    // Flash blanc HDR sur impact & clignotement i-frames post-coup
+    // Flash blanc HDR sur impact & clignotement i-frames post-coup (synchronisé sur les couches d'équipement)
     if (p.hitFlashTimer > 0) {
       this.playerMat.emissive.setHex(0xffffff);
       this.playerMat.emissiveIntensity = 1.25;
@@ -1114,10 +1719,61 @@ export class EntityRenderer {
       this.playerMat.emissive.setHex(0xffe9b0);
       this.playerMat.emissiveIntensity = pulse;
       this.playerMat.color.setHex(0xffffff);
+    } else if ((p.perfectDodgeBuffTimer ?? 0) > 0) {
+      this.playerMat.emissive.setHex(0xffd859);
+      this.playerMat.emissiveIntensity = 0.28 + Math.sin(this.animTime * 10) * 0.12;
+      this.playerMat.color.setHex(0xffffff);
+    } else if (hasStatus(p, 'burn')) {
+      this.playerMat.emissive.setHex(0xff5e1a);
+      this.playerMat.emissiveIntensity = 0.42 + Math.sin(this.animTime * 10) * 0.14;
+      this.playerMat.color.setHex(0xffd0b0);
+    } else if (hasStatus(p, 'chill')) {
+      this.playerMat.emissive.setHex(0x2884c8);
+      this.playerMat.emissiveIntensity = 0.45;
+      this.playerMat.color.setHex(0x88dcff);
+    } else if (hasStatus(p, 'poison')) {
+      this.playerMat.emissive.setHex(0x46b830);
+      this.playerMat.emissiveIntensity = 0.38;
+      this.playerMat.color.setHex(0xc8ffb8);
+    } else if (hasStatus(p, 'bleed')) {
+      this.playerMat.emissive.setHex(0xc91e3a);
+      this.playerMat.emissiveIntensity = 0.38 + Math.sin(this.animTime * 12) * 0.12;
+      this.playerMat.color.setHex(0xffb8c2);
+    } else if (hasStatus(p, 'stun')) {
+      this.playerMat.emissive.setHex(0xffcf40);
+      this.playerMat.emissiveIntensity = 0.44 + Math.sin(this.animTime * 18) * 0.16;
+      this.playerMat.color.setHex(0xfff4c2);
+    } else if (hasStatus(p, 'shock')) {
+      this.playerMat.emissive.setHex(0xffe042);
+      this.playerMat.emissiveIntensity = 0.46;
+      this.playerMat.color.setHex(0xfff6b8);
+    } else if (hasStatus(p, 'curse')) {
+      this.playerMat.emissive.setHex(0x7e22ce);
+      this.playerMat.emissiveIntensity = 0.46 + Math.sin(this.animTime * 8) * 0.14;
+      this.playerMat.color.setHex(0xd8b4fe);
     } else {
       this.playerMat.emissive.setHex(0x000000);
       this.playerMat.emissiveIntensity = 0;
       this.playerMat.color.setHex(0xffffff);
+    }
+    const eqEmissiveHex = this.playerMat.emissive.getHex();
+    const eqEmissiveInt = this.playerMat.emissiveIntensity;
+    for (const eq of Object.values(this.equipCutouts)) {
+      if (!eq.pivot.visible) continue;
+      if (eqEmissiveInt > 0.01) {
+        eq.material.emissive.setHex(eqEmissiveHex);
+        eq.material.emissiveIntensity = eqEmissiveInt;
+      } else {
+        const pbr = eq.calibration?.pbr;
+        if (pbr?.emissiveHex !== undefined && pbr.emissiveIntensity) {
+          const pulse = 0.88 + Math.sin(this.animTime * 4.2) * 0.12;
+          eq.material.emissive.setHex(pbr.emissiveHex);
+          eq.material.emissiveIntensity = pbr.emissiveIntensity * pulse;
+        } else {
+          eq.material.emissive.setHex(0x000000);
+          eq.material.emissiveIntensity = 0;
+        }
+      }
     }
 
     // Aura verte HDR de régénération (Soin-velours)
@@ -1147,6 +1803,7 @@ export class EntityRenderer {
     state: GameState,
     dt: number,
     shipDeck?: DeckAnchorsLike | null,
+    weather?: CapeWeatherWind,
   ): void {
     this.companionRoot.visible = true;
 
@@ -1160,7 +1817,33 @@ export class EntityRenderer {
       state.zoneId === 'overworld' &&
       (shipMode === 'boarding' || shipMode === 'disembarking');
 
-    let bobY = 1.45 + Math.sin(this.animTime * 4.0 + comp.bobPhase) * 0.24;
+    // Réactions animées du compagnon (critique, esquive parfaite, victoire de boss)
+    const reactTimer = comp.reactionTimer ?? 0;
+    const reactDur = Math.max(0.01, comp.reactionDuration ?? 0.5);
+    const reactProgress = reactTimer > 0 ? 1 - reactTimer / reactDur : 0;
+    let reactBounceY = 0;
+    let reactSpinZ = 0;
+    let reactScale = 1;
+    let reactEmissiveBoost = 0;
+    if (reactTimer > 0 && comp.reactionKind) {
+      if (comp.reactionKind === 'crit') {
+        reactBounceY = Math.abs(Math.sin(reactProgress * Math.PI * 2)) * 0.42;
+        reactScale = 1 + Math.sin(reactProgress * Math.PI) * 0.22;
+        reactEmissiveBoost = 0.55 * (1 - reactProgress);
+      } else if (comp.reactionKind === 'perfect_dodge') {
+        reactBounceY = Math.sin(reactProgress * Math.PI) * 0.48;
+        reactSpinZ = reactProgress * Math.PI * 2;
+        reactScale = 1 + Math.sin(reactProgress * Math.PI) * 0.28;
+        reactEmissiveBoost = 0.85 * Math.sin(reactProgress * Math.PI);
+      } else if (comp.reactionKind === 'boss_victory') {
+        reactBounceY = Math.abs(Math.sin(reactProgress * Math.PI * 3)) * 0.65;
+        reactSpinZ = Math.sin(reactProgress * Math.PI * 4) * 0.28;
+        reactScale = 1 + Math.sin(reactProgress * Math.PI) * 0.34;
+        reactEmissiveBoost = 1.05 * (0.5 + 0.5 * Math.sin(reactProgress * Math.PI * 3));
+      }
+    }
+
+    let bobY = 1.45 + Math.sin(this.animTime * 4.0 + comp.bobPhase) * 0.24 + reactBounceY;
 
     if (isOnDeck && shipDeck) {
       this.companionRoot.position.set(
@@ -1168,7 +1851,7 @@ export class EntityRenderer {
         shipDeck.companionWorldPos.y,
         shipDeck.companionWorldPos.z,
       );
-      bobY = 0.42 + Math.sin(this.animTime * 3.6 + comp.bobPhase) * 0.14;
+      bobY = 0.42 + Math.sin(this.animTime * 3.6 + comp.bobPhase) * 0.14 + reactBounceY;
       this.companionMesh.position.y = bobY;
       this.companionShadow.visible = true;
       this.companionShadow.position.y = -0.11;
@@ -1176,7 +1859,7 @@ export class EntityRenderer {
     } else if (isShipJumping) {
       const compY = comp.y ?? 0;
       this.companionRoot.position.set(comp.x, compY, comp.z);
-      bobY = 0.72 + Math.sin(this.animTime * 4.2 + comp.bobPhase) * 0.12;
+      bobY = 0.72 + Math.sin(this.animTime * 4.2 + comp.bobPhase) * 0.12 + reactBounceY;
       this.companionMesh.position.y = bobY;
       this.companionShadow.visible = false;
     } else {
@@ -1202,11 +1885,18 @@ export class EntityRenderer {
     const curX = this.companionRoot.position.x;
     const curZ = this.companionRoot.position.z;
     if (this.hasPrevCompPos && dt > 1e-4) {
-      compSpeed = Math.hypot(curX - this.prevCompX, curZ - this.prevCompZ) / dt;
+      const jumpDist = Math.hypot(curX - this.prevCompX, curZ - this.prevCompZ);
+      if (jumpDist > 5.5) {
+        this.companionTeleportTimer = 0.36;
+      }
+      compSpeed = jumpDist / dt;
     }
     this.prevCompX = curX;
     this.prevCompZ = curZ;
     this.hasPrevCompPos = true;
+    if (this.companionTeleportTimer > 0) {
+      this.companionTeleportTimer = Math.max(0, this.companionTeleportTimer - dt);
+    }
 
     const currentDialogueLine = state.dialogue.active
       ? state.dialogue.lines[state.dialogue.currentIndex]
@@ -1241,20 +1931,100 @@ export class EntityRenderer {
       null,
     );
 
-    // Pulsation astrale HDR (> 1.2) pour un Bloom doux autour de Miaou-sprit !
+    // Pulsation astrale HDR (> 1.2) + sursaut de téléportation / prise de parole / réactions
+    const tpRatio = this.companionTeleportTimer > 0 ? this.companionTeleportTimer / 0.36 : 0;
+    const talkBoost = isCompanionSpeaking ? 0.24 + Math.abs(Math.sin(this.animTime * 11.5)) * 0.2 : 0;
+    const isGuiding = comp.guideKind === 'chest' || comp.guideKind === 'quest';
+    const guideBoost = isGuiding ? 0.18 + Math.sin(this.animTime * 5.2) * 0.12 : 0;
     this.companionMat.emissiveIntensity =
-      1.36 + Math.sin(this.animTime * 3.4 + comp.bobPhase) * 0.16;
+      1.36 +
+      Math.sin(this.animTime * 3.4 + comp.bobPhase) * 0.16 +
+      talkBoost +
+      guideBoost +
+      reactEmissiveBoost +
+      tpRatio * 1.15;
 
     const targetFlip = p.facingX < 0 ? -1 : 1;
     this.companionFlipX = approachFlip(this.companionFlipX, targetFlip, dt * 10);
     this.companionMesh.rotation.y = 0;
-    this.companionMesh.scale.set(1.3 * this.companionFlipX, 1.3, 1);
+    this.companionMesh.rotation.z = reactSpinZ;
+    const talkScaleY = isCompanionSpeaking ? 1 + Math.sin(this.animTime * 12) * 0.055 : 1;
+    const tpPop = tpRatio > 0 ? 1 + Math.sin((1 - tpRatio) * Math.PI) * 0.32 : 1;
+    this.companionMesh.scale.set(
+      1.3 * this.companionFlipX * tpPop * reactScale,
+      1.3 * talkScaleY * tpPop * reactScale,
+      1,
+    );
+
+    // Lumière chaude dynamique dans les donjons et la nuit + halo lumineux discret (slot 10)
+    const inDungeon = state.zoneId !== 'overworld';
+    const nightDarkness = Math.max(
+      weather?.nightFactor ?? 0,
+      (weather?.lanternBoost ?? 0) * 0.85,
+    );
+    const warmthBlend = inDungeon ? 1.0 : Math.max(0, Math.min(1, nightDarkness));
+    // Cyan astral (#78e8ff) -> Ambre doré chaud (#ffc878)
+    this.companionLight.color.setRGB(
+      0.47 + (1.0 - 0.47) * warmthBlend,
+      0.91 + (0.78 - 0.91) * warmthBlend,
+      1.0 + (0.47 - 1.0) * warmthBlend,
+    );
+    this.companionLight.distance = 7.0 + warmthBlend * 3.5;
+
+    const compLightPulse =
+      0.9 +
+      Math.sin(this.animTime * 3.4 + comp.bobPhase) * 0.12 +
+      tpRatio * 0.8 +
+      reactEmissiveBoost * 0.45;
+    this.companionLight.position.set(
+      this.companionRoot.position.x,
+      this.companionRoot.position.y + bobY + 0.35,
+      this.companionRoot.position.z + 0.18,
+    );
+    this.companionLight.intensity = (2.0 + warmthBlend * 1.4) * compLightPulse;
+    this.companionLight.visible = true;
+
+    // Halo lumineux autour de Miaou-sprit (renforcé en guidage, donjon/nuit et réaction)
+    this.companionHaloMesh.position.set(0, bobY + 0.48, -0.05);
+    const haloScale =
+      (1.85 + warmthBlend * 0.55 + (isGuiding ? 0.35 : 0) + reactEmissiveBoost * 0.45) *
+      (1 + Math.sin(this.animTime * 4.2) * 0.08);
+    this.companionHaloMesh.scale.set(haloScale, haloScale, 1);
+    this.companionHaloMat.color.copy(this.companionLight.color);
+    if (comp.guideKind === 'chest' && warmthBlend < 0.5) {
+      this.companionHaloMat.color.lerp(this.companionLight.color.setHex(0xffdf7a), 0.35);
+      // Restore companionLight color after temporary lerp
+      this.companionLight.color.setRGB(
+        0.47 + (1.0 - 0.47) * warmthBlend,
+        0.91 + (0.78 - 0.91) * warmthBlend,
+        1.0 + (0.47 - 1.0) * warmthBlend,
+      );
+    }
+    this.companionHaloMat.opacity = Math.min(
+      0.56,
+      0.16 + warmthBlend * 0.18 + (isGuiding ? 0.12 : 0) + reactEmissiveBoost * 0.15,
+    );
+
+    setSpriteLight(
+      SPRITE_LIGHT_SLOT.COMPANION,
+      this.companionLight.position,
+      this.companionLight.color,
+      this.companionLight.intensity,
+      this.companionLight.distance,
+    );
   }
 
   private updateEnemies(state: GameState, dt: number): void {
     const seenIds = this.seenEnemyIds;
     seenIds.clear();
     const texRev = this.textures.revision;
+    let bestEnemyLightDistSq = Number.POSITIVE_INFINITY;
+    let bestEnemyLightX = 0;
+    let bestEnemyLightY = 1.4;
+    let bestEnemyLightZ = 0;
+    let bestEnemyLightHex = 0xff4822;
+    let bestEnemyLightInt = 0;
+    let bestEnemyLightRange = 10;
 
     for (let idx = 0; idx < state.enemies.length; idx++) {
       const enemy = state.enemies[idx];
@@ -1267,13 +2037,116 @@ export class EntityRenderer {
 
       // Mise à jour Phase 2 du Boss Dragon ou rechargement d'assets -> rafraîchit la table de clips
       if (vis.phase !== enemy.phase || vis.registryRevision !== texRev) {
+        if (vis.phase === 1 && enemy.phase === 2 && enemy.typeId === 'boss_dragon_claw') {
+          vis.phase2TransitionTimer = 0.95;
+        }
         vis.phase = enemy.phase;
         vis.registryRevision = texRev;
         vis.clips = this.buildEnemyClipTable(enemy.typeId, enemy.phase);
       }
+      if (vis.phase2TransitionTimer > 0) {
+        vis.phase2TransitionTimer = Math.max(0, vis.phase2TransitionTimer - dt);
+      }
 
       const isDead = enemy.state === 'dead' || enemy.hp <= 0;
+      const cin = state.cinematic;
+      const isBossInDeathCin =
+        isDead && cin && cin.kind === 'boss_death' && cin.bossId === enemy.id;
+      const isBossInIntroCin =
+        !isDead && cin && cin.kind === 'boss_intro' && cin.bossId === enemy.id;
+
+      // Mise en scène spécifique Boss Cinématiques (Trône/Souris/Fromage Roi Rat & Descente/Craquelures Drak-Miaou)
+      if (enemy.typeId === 'boss_rat_king' && (isBossInIntroCin || isBossInDeathCin)) {
+        if (!vis.cinematicPropGroup) {
+          const propGroup = new THREE.Group();
+          const disposables: Array<{ dispose(): void }> = [];
+          const mice: THREE.Mesh[] = [];
+          const cheese: THREE.Mesh[] = [];
+
+          const throneGeo = new THREE.BoxGeometry(2.1, 0.32, 1.5);
+          const throneMat = new THREE.MeshStandardMaterial({ color: 0x5c3a8c, roughness: 0.65 });
+          const throne = new THREE.Mesh(throneGeo, throneMat);
+          throne.position.y = 0.42;
+          propGroup.add(throne);
+          disposables.push(throneGeo, throneMat);
+
+          const mouseGeo = new THREE.SphereGeometry(0.24, 10, 8);
+          const mouseMat = new THREE.MeshStandardMaterial({ color: 0x383246, roughness: 0.8 });
+          disposables.push(mouseGeo, mouseMat);
+          for (let m = 0; m < 4; m++) {
+            const mesh = new THREE.Mesh(mouseGeo, mouseMat);
+            const side = m < 2 ? -0.95 : 0.95;
+            const front = m % 2 === 0 ? 0.65 : -0.65;
+            mesh.position.set(side, 0.24, front);
+            propGroup.add(mesh);
+            mice.push(mesh);
+          }
+
+          const cheeseGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.22, 12);
+          const cheeseMat = new THREE.MeshStandardMaterial({ color: 0xf5c542, roughness: 0.45, emissive: 0x7a5210, emissiveIntensity: 0.25 });
+          disposables.push(cheeseGeo, cheeseMat);
+          for (let c = 0; c < 3; c++) {
+            const cMesh = new THREE.Mesh(cheeseGeo, cheeseMat);
+            cMesh.position.set((c - 1) * 1.15, 0.2, 1.1);
+            propGroup.add(cMesh);
+            cheese.push(cMesh);
+          }
+
+          vis.root.add(propGroup);
+          vis.cinematicPropGroup = propGroup;
+          vis.cinematicPropDisposables = disposables;
+          vis.cinematicMice = mice;
+          vis.cinematicCheese = cheese;
+        }
+        vis.cinematicPropGroup.visible = true;
+        const cProg = cin ? Math.min(1, cin.elapsed / Math.max(0.1, cin.duration)) : 0;
+        if (vis.cinematicMice && vis.cinematicCheese) {
+          for (let m = 0; m < vis.cinematicMice.length; m++) {
+            const side = m < 2 ? -0.95 : 0.95;
+            const front = m % 2 === 0 ? 0.65 : -0.65;
+            if (isBossInDeathCin) {
+              const flee = cProg * 4.5;
+              vis.cinematicMice[m].position.set(side * (1 + flee), 0.24, front * (1 + flee));
+            } else {
+              vis.cinematicMice[m].position.set(side, 0.24 + Math.abs(Math.sin(this.animTime * 10 + m)) * 0.1, front);
+            }
+          }
+          for (let c = 0; c < vis.cinematicCheese.length; c++) {
+            if (isBossInDeathCin) {
+              const scatter = cProg * 3.8;
+              vis.cinematicCheese[c].position.set((c - 1) * (1.15 + scatter), 0.2 + Math.abs(Math.sin(cProg * Math.PI * 2 + c)) * 0.4, 1.1 + scatter * 0.6);
+              vis.cinematicCheese[c].rotation.y += dt * 6;
+            } else {
+              vis.cinematicCheese[c].position.set((c - 1) * 1.15, 0.2, 1.1);
+            }
+          }
+        }
+      } else if (vis.cinematicPropGroup) {
+        vis.cinematicPropGroup.visible = false;
+      }
+
       if (isDead) {
+        if (isBossInDeathCin && cin) {
+          const cProg = Math.min(1, cin.elapsed / Math.max(0.1, cin.duration));
+          vis.root.visible = true;
+          vis.root.position.set(enemy.x, 0, enemy.z);
+          vis.hpGroup.visible = false;
+          if (enemy.typeId === 'boss_dragon_claw') {
+            const crackPulse = 0.65 + Math.abs(Math.sin(this.animTime * 16)) * 1.15;
+            vis.material.emissiveMap = vis.material.map;
+            vis.material.emissive.setHex(cin.stage === 'cracks' || cin.stage === 'double_shockwave' ? 0xff5a1f : 0xffcc66);
+            vis.material.emissiveIntensity = crackPulse * (1 - cProg * 0.45);
+            vis.material.transparent = true;
+            vis.material.opacity = cProg > 0.68 ? Math.max(0, 1 - (cProg - 0.68) / 0.32) : 1;
+            vis.tiltGroup.position.y = Math.sin(cProg * Math.PI) * 0.3;
+          } else {
+            vis.material.transparent = true;
+            vis.material.opacity = Math.max(0, 1 - cProg * 0.85);
+            vis.spriteMesh.rotation.z = cProg * 0.35 * (vis.flipScaleX >= 0 ? -1 : 1);
+          }
+          continue;
+        }
+
         const deathClip = vis.clips.death;
         if (deathClip.isDedicatedAsset && deathClip.frameCount > 1) {
           vis.activeState = 'death';
@@ -1283,12 +2156,19 @@ export class EntityRenderer {
             deathClip.frameCount,
             dt,
           );
-          if (vis.animCursor.finished) {
+          if (vis.animCursor.finished && (enemy.deathTimer ?? 0) <= 0) {
             vis.root.visible = false;
             continue;
           }
           vis.root.visible = true;
+          vis.root.position.set(enemy.x, 0, enemy.z);
           vis.hpGroup.visible = false;
+          if ((enemy.deathTimer ?? 0) > 0 && (enemy.deathDuration ?? 0) > 0) {
+            const dProg = 1 - (enemy.deathTimer ?? 0) / Math.max(0.05, enemy.deathDuration ?? 0.35);
+            vis.material.transparent = true;
+            vis.material.opacity = Math.max(0, 1 - dProg * 0.85);
+            vis.spriteMesh.rotation.z = dProg * 0.45 * (vis.flipScaleX >= 0 ? -1 : 1);
+          }
           bindResolvedFrameToMaterial(
             deathClip,
             deathFrame,
@@ -1300,9 +2180,30 @@ export class EntityRenderer {
           );
           continue;
         }
+
+        if ((enemy.deathTimer ?? 0) > 0 && (enemy.deathDuration ?? 0) > 0) {
+          const dProg = 1 - (enemy.deathTimer ?? 0) / Math.max(0.05, enemy.deathDuration ?? 0.35);
+          vis.root.visible = true;
+          vis.root.position.set(enemy.x, 0, enemy.z);
+          vis.hpGroup.visible = false;
+          vis.material.transparent = true;
+          vis.material.opacity = Math.max(0, 1 - dProg);
+          vis.spriteMesh.rotation.z = dProg * 0.55 * (vis.flipScaleX >= 0 ? -1 : 1);
+          vis.tiltGroup.position.y = Math.sin(dProg * Math.PI) * 0.45;
+          continue;
+        }
+
         vis.root.visible = false;
+        vis.material.emissiveIntensity = 0;
+        vis.tiltGroup.position.y = 0;
         continue;
       }
+
+      if (vis.material.opacity !== 1) {
+        vis.material.opacity = 1;
+        vis.material.transparent = false;
+      }
+      vis.spriteMesh.rotation.z = 0;
       vis.root.visible = true;
       vis.root.position.set(enemy.x, 0, enemy.z);
 
@@ -1324,7 +2225,9 @@ export class EntityRenderer {
 
       const moveSpeed = Math.hypot(enemy.vx ?? 0, enemy.vz ?? 0);
       let enemyState: EnemyAnimState = 'idle';
-      if (enemy.state === 'windup') {
+      if (enemy.state === 'staggered' || (enemy.staggeredTimer ?? 0) > 0) {
+        enemyState = 'hurt';
+      } else if (enemy.state === 'windup') {
         enemyState = 'windup';
       } else if (enemy.state === 'recover') {
         enemyState = 'attack';
@@ -1376,7 +2279,14 @@ export class EntityRenderer {
       let sy = vis.baseScale;
       let hopY = 0;
 
-      if (enemy.state === 'windup') {
+      const isStaggered = enemy.state === 'staggered' || (enemy.staggeredTimer ?? 0) > 0;
+      const isChilled = enemy.slowTimer > 0 || hasStatus(enemy, 'chill');
+
+      if (isStaggered) {
+        const wobble = Math.sin(this.animTime * 16) * 0.06;
+        sx = vis.baseScale * (1.1 + wobble);
+        sy = vis.baseScale * (0.84 - wobble * 0.5);
+      } else if (enemy.state === 'windup') {
         const pulse = 1 + Math.sin(this.animTime * 22) * 0.05;
         sx = vis.baseScale * 1.12 * pulse;
         sy = (vis.baseScale * 0.88) / pulse;
@@ -1393,13 +2303,37 @@ export class EntityRenderer {
         sy = vis.baseScale * (1 + breath);
       }
 
+      if (vis.phase2TransitionTimer > 0) {
+        const tr = vis.phase2TransitionTimer / 0.95;
+        const roarSwell = 1 + Math.sin(tr * Math.PI) * 0.16;
+        sx *= roarSwell;
+        sy *= roarSwell * (1 + Math.sin(this.animTime * 24) * 0.04);
+      }
+
+      if (isBossInIntroCin && cin) {
+        if (enemy.typeId === 'boss_dragon_claw') {
+          const cProg = Math.min(1, cin.elapsed / Math.max(0.1, cin.duration));
+          const desc = cProg < 0.55 ? 1 - cProg / 0.55 : 0;
+          hopY = desc * desc * 10.5;
+          vis.shadowMesh.scale.set(
+            enemy.radius * (1.05 - desc * 0.55),
+            1,
+            enemy.radius * (0.72 - desc * 0.35),
+          );
+        } else if (enemy.typeId === 'boss_rat_king') {
+          hopY = 0.52 + Math.sin(this.animTime * 8) * 0.06;
+        }
+      } else {
+        vis.shadowMesh.scale.set(enemy.radius * 1.05, 1, enemy.radius * 0.72);
+      }
+
       vis.spriteMesh.scale.set(sx * vis.flipScaleX, sy, 1);
       if (vis.fringeMesh) {
         vis.fringeMesh.scale.set(sx * vis.flipScaleX, sy, 1);
       }
       vis.tiltGroup.position.y = hopY;
 
-      // Couleur / Emissive HDR : Flash blanc > Givre > Boss Phase 2 > Lueur magique naturelle
+      // Couleur / Emissive HDR : Flash blanc > Stagger > Givre > Statuts > Boss Phase 2 > Lueur magique naturelle
       if (enemy.hitFlashTimer > 0) {
         if (vis.material.emissiveMap !== null) {
           vis.material.emissiveMap = null;
@@ -1408,7 +2342,15 @@ export class EntityRenderer {
         vis.material.color.setHex(0xffffff);
         vis.material.emissive.setHex(0xffffff);
         vis.material.emissiveIntensity = 1.25;
-      } else if (enemy.slowTimer > 0) {
+      } else if (isStaggered) {
+        if (vis.material.emissiveMap !== vis.material.map) {
+          vis.material.emissiveMap = vis.material.map;
+          vis.material.needsUpdate = true;
+        }
+        vis.material.color.setHex(0xffe8b0);
+        vis.material.emissive.setHex(0xffaa2b);
+        vis.material.emissiveIntensity = 0.68 + Math.sin(this.animTime * 14) * 0.24;
+      } else if (isChilled) {
         if (vis.material.emissiveMap !== vis.material.map) {
           vis.material.emissiveMap = vis.material.map;
           vis.material.needsUpdate = true;
@@ -1416,12 +2358,61 @@ export class EntityRenderer {
         vis.material.color.setHex(0x88dcff);
         vis.material.emissive.setHex(0x2884c8);
         vis.material.emissiveIntensity = 0.52;
+      } else if (hasStatus(enemy, 'burn')) {
+        if (vis.material.emissiveMap !== vis.material.map) {
+          vis.material.emissiveMap = vis.material.map;
+          vis.material.needsUpdate = true;
+        }
+        vis.material.color.setHex(0xffd0b0);
+        vis.material.emissive.setHex(0xff5e1a);
+        vis.material.emissiveIntensity = 0.45 + Math.sin(this.animTime * 10) * 0.14;
+      } else if (hasStatus(enemy, 'poison')) {
+        if (vis.material.emissiveMap !== vis.material.map) {
+          vis.material.emissiveMap = vis.material.map;
+          vis.material.needsUpdate = true;
+        }
+        vis.material.color.setHex(0xc8ffb8);
+        vis.material.emissive.setHex(0x46b830);
+        vis.material.emissiveIntensity = 0.4;
+      } else if (hasStatus(enemy, 'shock')) {
+        if (vis.material.emissiveMap !== vis.material.map) {
+          vis.material.emissiveMap = vis.material.map;
+          vis.material.needsUpdate = true;
+        }
+        vis.material.color.setHex(0xfff6b8);
+        vis.material.emissive.setHex(0xffe042);
+        vis.material.emissiveIntensity = 0.48;
+      } else if (hasStatus(enemy, 'bleed')) {
+        if (vis.material.emissiveMap !== vis.material.map) {
+          vis.material.emissiveMap = vis.material.map;
+          vis.material.needsUpdate = true;
+        }
+        vis.material.color.setHex(0xffb8c2);
+        vis.material.emissive.setHex(0xc91e3a);
+        vis.material.emissiveIntensity = 0.42 + Math.sin(this.animTime * 12) * 0.14;
+      } else if (hasStatus(enemy, 'stun')) {
+        if (vis.material.emissiveMap !== vis.material.map) {
+          vis.material.emissiveMap = vis.material.map;
+          vis.material.needsUpdate = true;
+        }
+        vis.material.color.setHex(0xfff4c2);
+        vis.material.emissive.setHex(0xffcf40);
+        vis.material.emissiveIntensity = 0.46 + Math.sin(this.animTime * 18) * 0.16;
+      } else if (hasStatus(enemy, 'curse')) {
+        if (vis.material.emissiveMap !== vis.material.map) {
+          vis.material.emissiveMap = vis.material.map;
+          vis.material.needsUpdate = true;
+        }
+        vis.material.color.setHex(0xd8b4fe);
+        vis.material.emissive.setHex(0x7e22ce);
+        vis.material.emissiveIntensity = 0.48 + Math.sin(this.animTime * 8) * 0.14;
       } else if (enemy.isBoss && enemy.phase === 2) {
         if (vis.material.emissiveMap !== vis.material.map) {
           vis.material.emissiveMap = vis.material.map;
           vis.material.needsUpdate = true;
         }
-        const rage = 0.85 + Math.sin(this.animTime * 9) * 0.28;
+        const surge = vis.phase2TransitionTimer > 0 ? 0.65 * (vis.phase2TransitionTimer / 0.95) : 0;
+        const rage = 0.85 + Math.sin(this.animTime * 9) * 0.28 + surge;
         vis.material.color.setHex(0xffd8d0);
         vis.material.emissive.setHex(0xff3822);
         vis.material.emissiveIntensity = rage;
@@ -1440,23 +2431,33 @@ export class EntityRenderer {
         vis.material.emissiveIntensity = 0;
       }
 
-      // Aura additive derrière les ennemis lumineux & Boss Dragon Phase 2
-      if (vis.auraGlowMesh && vis.auraGlowMat && baseGlow) {
-        if (enemy.isBoss && enemy.phase === 2) {
-          vis.auraGlowMat.color.setHex(0xff4822);
-          vis.auraGlowMat.opacity = 0.54 + Math.sin(this.animTime * 7.5) * 0.14;
-          const p2Glow = 1.55 + Math.sin(this.animTime * 7.5) * 0.08;
-          vis.auraGlowMesh.scale.set(vis.baseScale * p2Glow, vis.baseScale * p2Glow, 1);
-        } else {
-          vis.auraGlowMat.color.setHex(baseGlow.hex);
-          vis.auraGlowMat.opacity = 0.34 + Math.sin(this.animTime * 3.5 + vis.animSeed) * 0.06;
-          vis.auraGlowMesh.scale.set(vis.baseScale * 1.35, vis.baseScale * 1.3, 1);
+      // Enregistre l'ennemi/boss lumineux le plus proche pour la vraie PointLight dynamique (slot 11)
+      if (baseGlow || (enemy.isBoss && enemy.phase === 2)) {
+        const dSq =
+          (enemy.x - state.player.x) * (enemy.x - state.player.x) +
+          (enemy.z - state.player.z) * (enemy.z - state.player.z);
+        const isPhase2Boss = enemy.isBoss && enemy.phase === 2;
+        const effectiveDistSq = isPhase2Boss ? dSq * 0.25 : dSq;
+        if (effectiveDistSq < bestEnemyLightDistSq && dSq < 26 * 26) {
+          bestEnemyLightDistSq = effectiveDistSq;
+          bestEnemyLightX = enemy.x;
+          bestEnemyLightY = Math.max(1.2, vis.baseScale * 0.52);
+          bestEnemyLightZ = enemy.z + 0.35;
+          if (isPhase2Boss) {
+            bestEnemyLightHex = 0xff441e;
+            bestEnemyLightInt = 11.5 + Math.sin(this.animTime * 8.0) * 2.2;
+            bestEnemyLightRange = 14.5;
+          } else if (baseGlow) {
+            bestEnemyLightHex = baseGlow.hex;
+            bestEnemyLightInt = (enemy.isBoss ? 8.5 : 5.2) * (0.9 + Math.sin(this.animTime * 3.5 + vis.animSeed) * 0.12);
+            bestEnemyLightRange = enemy.isBoss ? 12.0 : 8.5;
+          }
         }
       }
 
       // Anneau de givre au sol si ralenti
-      vis.frostRing.visible = enemy.slowTimer > 0;
-      if (enemy.slowTimer > 0) {
+      vis.frostRing.visible = isChilled;
+      if (isChilled) {
         vis.frostRing.rotation.y = -this.animTime * 1.8;
       }
 
@@ -1485,6 +2486,25 @@ export class EntityRenderer {
       }
     }
 
+    if (bestEnemyLightInt > 0.05) {
+      this.enemyDynamicLight.visible = true;
+      this.enemyDynamicLight.position.set(bestEnemyLightX, bestEnemyLightY, bestEnemyLightZ);
+      this.enemyDynamicLight.color.setHex(bestEnemyLightHex);
+      this.enemyDynamicLight.intensity = bestEnemyLightInt;
+      this.enemyDynamicLight.distance = bestEnemyLightRange;
+      setSpriteLight(
+        SPRITE_LIGHT_SLOT.ENEMY_OR_SPELL,
+        this.enemyDynamicLight.position,
+        this.enemyDynamicLight.color,
+        this.enemyDynamicLight.intensity,
+        this.enemyDynamicLight.distance,
+      );
+    } else {
+      this.enemyDynamicLight.visible = false;
+      this.enemyDynamicLight.intensity = 0;
+      clearSpriteLight(SPRITE_LIGHT_SLOT.ENEMY_OR_SPELL);
+    }
+
     for (const [id, vis] of this.enemies.entries()) {
       if (!seenIds.has(id)) {
         this.disposeEnemyVisual(vis);
@@ -1501,9 +2521,10 @@ export class EntityRenderer {
   ): void {
     const safeDt = Math.min(Math.max(dt, 0), 0.05);
     this.animTime += safeDt;
+    stepFixed30FpsClock(this.animClock30Fps, safeDt);
 
     this.updatePlayer(state, safeDt, shipDeck, weather);
-    this.updateCompanion(state, safeDt, shipDeck);
+    this.updateCompanion(state, safeDt, shipDeck, weather);
     this.updateEnemies(state, safeDt);
   }
 
@@ -1518,6 +2539,12 @@ export class EntityRenderer {
     hemOffsetZ: number;
     lanternActive: boolean;
     lanternIntensity: number;
+    lanternSocket: 'belt' | 'hand';
+    lanternHandBlend: number;
+    lanternSwingAngle: number;
+    lanternVisible: boolean;
+    lanternLightLevel: number;
+    flipOvershootRad: number;
   } {
     const s = this.capeCloth.solver;
     const rootY = this.playerRoot.position.y;
@@ -1543,6 +2570,12 @@ export class EntityRenderer {
       hemOffsetZ: Math.round(s.posZ[bottomCenterIdx] * 1000) / 1000,
       lanternActive: this.playerLanternLight.visible,
       lanternIntensity: Math.round(this.playerLanternLight.intensity * 100) / 100,
+      lanternSocket: this.beltLantern.socket,
+      lanternHandBlend: 0,
+      lanternSwingAngle: Math.round(this.beltLantern.swingAngle * 1000) / 1000,
+      lanternVisible: this.playerLanternMesh.visible,
+      lanternLightLevel: Math.round(this.beltLantern.lightLevel * 1000) / 1000,
+      flipOvershootRad: Math.round(this.playerFlipOvershoot.overshootRad * 1000) / 1000,
     };
   }
 
@@ -1645,25 +2678,33 @@ export class EntityRenderer {
 
   public dispose(): void {
     this.clear();
-    this.heroUvBinding.clonedTex?.dispose();
-    this.heroUvBinding.clonedTex = null;
-    this.heroUvBinding.sourceTex = null;
-    this.companionUvBinding.clonedTex?.dispose();
-    this.companionUvBinding.clonedTex = null;
-    this.companionUvBinding.sourceTex = null;
+    clearSpriteLight(SPRITE_LIGHT_SLOT.HERO_LANTERN);
+    clearSpriteLight(SPRITE_LIGHT_SLOT.HERO_WEAPON);
+    clearSpriteLight(SPRITE_LIGHT_SLOT.COMPANION);
+    clearSpriteLight(SPRITE_LIGHT_SLOT.ENEMY_OR_SPELL);
+    disposeUvTextureBinding(this.heroUvBinding);
+    disposeUvTextureBinding(this.companionUvBinding);
     this.scene.remove(this.rootGroup);
     this.spriteGeo.dispose();
+    this.lanternGeo.dispose();
     this.glowGeo.dispose();
     this.shadowGeo.dispose();
     this.hpBgGeo.dispose();
     this.hpFillGeo.dispose();
     this.auraRingGeo.dispose();
     this.playerMat.dispose();
+    for (const eq of Object.values(this.equipCutouts)) {
+      eq.material.dispose();
+    }
+    this.helmetBackMat.dispose();
+    this.heroDeathSpiritMat.dispose();
+    this.playerLanternMat.dispose();
     this.capeCloth.dispose();
     this.playerShadowMat.dispose();
     this.playerRegenMat.dispose();
     this.playerShieldMat.dispose();
     this.companionMat.dispose();
+    this.companionHaloMat.dispose();
     this.companionShadowMat.dispose();
   }
 }

@@ -6,10 +6,14 @@ import {
   type WeatherAudioState,
   type WeatherAudioStatus,
 } from './audio/audioEngine';
+import { DUNGEONS } from './data/dungeonsData';
 import { ALL_NEW_ISLANDS, NEW_ISLANDS } from './data/worldIslands';
 import { GameEngine } from './game/gameEngine';
 import { InputManager } from './game/input';
+import { addEquipment } from './game/progression';
+import { sampleShorelineField } from './game/shorelineNavigation';
 import type {
+  ActiveModal,
   EquipSlot,
   GameEvent,
   IslandId,
@@ -19,10 +23,16 @@ import type {
   QuestProgress,
   ShipMode,
   SpeakerPortraitId,
+  WildlifeDensity,
+  ZoneId,
 } from './game/types';
 import { EffectsRenderer } from './render/effectsRenderer';
 import { EntityRenderer } from './render/entityRenderer';
 import { FloatingTextManager } from './render/floatingText';
+import {
+  SPRITE_LIGHT_COUNT,
+  getSpriteLightSlotSnapshot,
+} from './render/spriteLighting';
 import { SceneManager } from './render/sceneManager';
 import {
   type OceanCoastIsland,
@@ -40,7 +50,9 @@ import {
   type TorchLightPosition,
   WorldRenderer,
 } from './render/worldRenderer';
+import { WildlifeSystem } from './render/wildlifeSystem';
 import { HudController } from './ui/hudController';
+import { MinimapController } from './ui/minimapController';
 import { ModalsController } from './ui/modalsController';
 import { ScreensController } from './ui/screensController';
 
@@ -50,6 +62,7 @@ import { ScreensController } from './ui/screensController';
 // ============================================================================
 
 const MAX_DELTA_SEC = 0.05;
+const FORGE_HEARTH_POS = { x: 8.15, z: 21.1 } as const;
 
 const STATIC_PORTRAIT_IDS: readonly SpeakerPortraitId[] = [
   'miaou_sprit',
@@ -69,6 +82,20 @@ export interface CatQuestQaHook {
     islandId: IslandId;
     inVillage: boolean;
     time: number;
+    timeScale: number;
+    lowHpActive: boolean;
+    lowHpIntensity: number;
+    playerProjectilesCount: number;
+    enemyProjectilesCount: number;
+    hazardZonesCount: number;
+    lootDropsCount: number;
+    cinematic: {
+      kind: string;
+      bossTypeId: string;
+      stage: string;
+      elapsed: number;
+    } | null;
+    wildlifeDensity: WildlifeDensity;
     player: {
       x: number;
       z: number;
@@ -84,6 +111,8 @@ export interface CatQuestQaHook {
       xpToNext: number;
       gold: number;
       hasRunicKey: boolean;
+      perfectDodgeBuffTimer: number;
+      activeStatuses: ReadonlyArray<{ id: string; remainingSec: number }>;
       equipped: Record<EquipSlot, string>;
       stats: { atk: number; mag: number; def: number; critChance: number };
       spellLevels: Record<string, number>;
@@ -116,6 +145,9 @@ export interface CatQuestQaHook {
       hp: number;
       maxHp: number;
       phase: 1 | 2;
+      stagger: number;
+      maxStagger: number;
+      staggeredTimer: number;
     } | null;
     enemiesAlive: number;
     enemiesTotal: number;
@@ -178,11 +210,34 @@ export interface CatQuestQaHook {
     gpuTextures: number;
     drawCalls: number;
     triangles: number;
+    minimapVisible: boolean;
     cape: Readonly<ReturnType<EntityRenderer['getCapeDiagnostics']>>;
+    wildlife: Readonly<ReturnType<WildlifeSystem['getDiagnostics']>>;
   }>;
   readonly setWeatherForTest?: (override: WeatherQaOverride) => void;
   readonly advanceWeatherForTest?: (seconds: number) => void;
   readonly setAudioVolumeForTest?: (volume: number) => void;
+  readonly setWildlifeDensityForTest?: (density: WildlifeDensity) => void;
+  readonly equipItemsForTest?: (itemIds: readonly string[]) => void;
+  readonly enterZoneForTest?: (zoneId: ZoneId, x?: number, z?: number) => void;
+  readonly setHeroPoseForTest?: (opts: {
+    facingX?: 1 | -1;
+    attackAnimTimer?: number;
+    dodgeTimer?: number;
+    vx?: number;
+    vz?: number;
+  }) => void;
+  readonly getLightingDiagnostics?: () => Readonly<{
+    activeSpriteLightCount: number;
+    slots: readonly {
+      index: number;
+      x: number;
+      y: number;
+      z: number;
+      intensity: number;
+      distance: number;
+    }[];
+  }>;
 }
 
 declare global {
@@ -210,7 +265,7 @@ function getEquippedSignature(
   equipped: Record<EquipSlot, string>,
   hdLoaded: boolean,
 ): string {
-  return `${hdLoaded ? 'hd' : 'proc'}|${equipped.weapon}|${equipped.shield}|${equipped.helmet}|${equipped.armor}|${equipped.boots}|${equipped.gloves}|${equipped.cape}|${equipped.trinket}`;
+  return `${hdLoaded ? 'hd' : 'proc'}|${equipped.weapon}|${equipped.shield}|${equipped.helmet}|${equipped.armor}|${equipped.cape}`;
 }
 
 function bootstrap(): void {
@@ -237,6 +292,7 @@ function bootstrap(): void {
   const effectsRenderer = new EffectsRenderer(sceneManager.scene, textures);
   const weatherController = new WeatherCycleController();
   const weatherVfx = new WeatherVfxRenderer(sceneManager.scene);
+  const wildlifeSystem = new WildlifeSystem(sceneManager.scene);
   const floatingTextManager = new FloatingTextManager(floatingTextLayer);
 
   const audioEngine = new AudioEngine();
@@ -262,6 +318,9 @@ function bootstrap(): void {
     seaAgitation: 0.3,
     seaProximity: 0.7,
     shipSpeedRatio: 0,
+    nightFactor: 0,
+    isSailing: false,
+    inCombat: false,
   };
 
   const syncAtmosphereAndAudio = (dtForAudio: number): void => {
@@ -270,9 +329,9 @@ function bootstrap(): void {
     sceneManager.applyOverworldAtmosphere(w, isOverworld);
 
     let seaProximity = 0;
+    const isSailing = isOverworld && engine.state.ship.mode !== 'parked';
     if (isOverworld) {
-      const mode = engine.state.ship.mode;
-      if (mode !== 'parked') {
+      if (isSailing) {
         seaProximity = 1.0;
       } else {
         const dCoast = sampleOceanCoastDistance(
@@ -287,6 +346,17 @@ function bootstrap(): void {
       }
     }
 
+    // Facteur nocturne [0..1] aligné sur le cycle jour/nuit (0 = plein jour, 1 = nuit noire)
+    const tod = w.timeOfDay;
+    let nightFactor = 0;
+    if (tod < 0.18 || tod > 0.86) {
+      nightFactor = 1;
+    } else if (tod < 0.3) {
+      nightFactor = Math.max(0, Math.min(1, (0.3 - tod) / 0.12));
+    } else if (tod > 0.74) {
+      nightFactor = Math.max(0, Math.min(1, (tod - 0.74) / 0.12));
+    }
+
     weatherAudioState.inOverworld = isOverworld;
     weatherAudioState.stormIntensity = w.stormIntensity;
     weatherAudioState.fogIntensity = w.fogIntensity;
@@ -298,8 +368,42 @@ function bootstrap(): void {
       isOverworld && engine.state.ship.isSailing
         ? Math.min(1, Math.abs(engine.state.ship.speed) / 13.5)
         : 0;
+    weatherAudioState.nightFactor = nightFactor;
+    weatherAudioState.isSailing = isSailing;
+    weatherAudioState.inCombat =
+      Boolean(engine.state.inCombat) ||
+      (engine.state.combatMusicTimer ?? 0) > 0 ||
+      engine.getActiveBoss() !== null;
 
     audioEngine.updateWeatherAmbience(weatherAudioState, dtForAudio);
+
+    const dungeonDef =
+      engine.state.zoneId !== 'overworld' ? DUNGEONS[engine.state.zoneId] : null;
+    const shoreSample = isOverworld
+      ? sampleShorelineField(engine.state.player.x, engine.state.player.z)
+      : null;
+    audioEngine.updateSpatialAmbience({
+      zoneId: engine.state.zoneId,
+      islandId: engine.state.islandId,
+      listenerX: engine.state.player.x,
+      listenerZ: engine.state.player.z,
+      torches: dungeonDef?.torches,
+      activeCrystals: engine.state.healingCrystals.filter((c) => !c.used),
+      forgeHearth: FORGE_HEARTH_POS,
+      shorePoint: shoreSample
+        ? {
+            x: shoreSample.shoreX,
+            z: shoreSample.shoreZ,
+            signedDistance: shoreSample.signedDistance,
+          }
+        : null,
+      seaProximity,
+      nightFactor,
+      stormIntensity: w.stormIntensity,
+      rainIntensity: w.rainIntensity,
+      inCombat: weatherAudioState.inCombat,
+      isSailing,
+    });
 
     const pendingThunder = weatherController.consumePendingThunder();
     if (pendingThunder > 0 && isOverworld) {
@@ -319,6 +423,18 @@ function bootstrap(): void {
     const url = textures.getHeroFullPreviewUrl(equipped);
     heroFullPreviewCache.set(key, url);
     return url;
+  };
+
+  let lastSfxModal: ActiveModal = engine.state.activeModal;
+  const syncModalTransitionSfx = (nextModal: ActiveModal): void => {
+    if (nextModal === lastSfxModal) return;
+    if (lastSfxModal !== 'none') {
+      audioEngine.playUiScreenSfx(lastSfxModal, 'close');
+    }
+    if (nextModal !== 'none') {
+      audioEngine.playUiScreenSfx(nextModal, 'open');
+    }
+    lastSfxModal = nextModal;
   };
 
   // --- 2. Contrôleurs UI Parchemin ---
@@ -342,16 +458,16 @@ function bootstrap(): void {
     onToggleInventory: () => {
       audioEngine.unlock();
       if (engine.state.screen === 'playing' && !engine.state.dialogue.active) {
-        audioEngine.playSfx('meow_ui');
         engine.toggleModal('inventory');
+        syncModalTransitionSfx(engine.state.activeModal);
       }
       blurFocusedButton();
     },
     onToggleMap: () => {
       audioEngine.unlock();
       if (engine.state.screen === 'playing' && !engine.state.dialogue.active) {
-        audioEngine.playSfx('meow_ui');
         engine.toggleModal('map');
+        syncModalTransitionSfx(engine.state.activeModal);
       }
       blurFocusedButton();
     },
@@ -367,20 +483,31 @@ function bootstrap(): void {
         return;
       }
       if (engine.state.screen === 'paused' || engine.state.activeModal === 'pause') {
-        audioEngine.playSfx('meow_ui');
         engine.resumeGame();
+        syncModalTransitionSfx(engine.state.activeModal);
         inputManager.reset();
       } else if (engine.state.screen === 'playing') {
-        audioEngine.playSfx('meow_ui');
         engine.openModal('pause');
+        syncModalTransitionSfx(engine.state.activeModal);
       }
       blurFocusedButton();
     },
     onOpenQuests: () => {
       audioEngine.unlock();
       if (engine.state.screen === 'playing' && !engine.state.dialogue.active) {
-        audioEngine.playSfx('meow_ui');
         engine.toggleModal('quests');
+        syncModalTransitionSfx(engine.state.activeModal);
+      }
+      blurFocusedButton();
+    },
+  });
+
+  const minimapController = new MinimapController(hudLayer, {
+    onOpenWorldMap: () => {
+      audioEngine.unlock();
+      if (engine.state.screen === 'playing' && !engine.state.dialogue.active) {
+        engine.toggleModal('map');
+        syncModalTransitionSfx(engine.state.activeModal);
       }
       blurFocusedButton();
     },
@@ -389,8 +516,8 @@ function bootstrap(): void {
   const modalsController = new ModalsController(modalLayer, {
     onClose: () => {
       audioEngine.unlock();
-      audioEngine.playSfx('meow_ui');
       engine.closeModal();
+      syncModalTransitionSfx(engine.state.activeModal);
       inputManager.reset();
       blurFocusedButton();
     },
@@ -398,7 +525,7 @@ function bootstrap(): void {
       audioEngine.unlock();
       const equippedOk = engine.equipItem(itemId);
       if (equippedOk) {
-        audioEngine.playSfx('meow_ui');
+        audioEngine.playVariant('ui_interact');
         syncHeroVisuals(true);
         screensController.setHasSave(engine.hasSavedGame());
       }
@@ -414,7 +541,7 @@ function bootstrap(): void {
     onTrackQuest: (questId) => {
       audioEngine.unlock();
       if (engine.trackQuest(questId)) {
-        audioEngine.playSfx('meow_ui');
+        audioEngine.playVariant('ui_interact');
       }
       blurFocusedButton();
     },
@@ -423,7 +550,8 @@ function bootstrap(): void {
       const result = engine.buyMysteryChest();
       if (result) {
         if (!result.isUpgrade) {
-          audioEngine.playSfx('chest_open');
+          audioEngine.playVariant('loot_chest_open', { fadeOutTailSec: 0.22 });
+          audioEngine.duckMusic(0.5, 0.45, 0.65);
         }
         screensController.setHasSave(engine.hasSavedGame());
       }
@@ -434,7 +562,27 @@ function bootstrap(): void {
       audioEngine.unlock();
       const result = engine.upgradeSpell(spellId);
       if (result.success) {
-        audioEngine.playSfx('level_up');
+        audioEngine.playVariant('ui_forge_upgrade');
+        screensController.setHasSave(engine.hasSavedGame());
+      }
+      blurFocusedButton();
+      return result.success;
+    },
+    onUpgradeEquipment: (itemId) => {
+      audioEngine.unlock();
+      const result = engine.upgradeEquipment(itemId);
+      if (result.success) {
+        syncHeroVisuals(true);
+        screensController.setHasSave(engine.hasSavedGame());
+      }
+      blurFocusedButton();
+      return result.success;
+    },
+    onBuyEquipment: (itemId) => {
+      audioEngine.unlock();
+      const result = engine.buyEquipment(itemId);
+      if (result.success) {
+        syncHeroVisuals(true);
         screensController.setHasSave(engine.hasSavedGame());
       }
       blurFocusedButton();
@@ -448,6 +596,7 @@ function bootstrap(): void {
       audioEngine.playSfx('meow_ui');
       clearTransientRenderers();
       engine.startNewGame();
+      lastSfxModal = engine.state.activeModal;
       inputManager.reset();
       syncHeroVisuals(true);
       blurFocusedButton();
@@ -457,6 +606,7 @@ function bootstrap(): void {
       if (engine.continueSavedGame()) {
         audioEngine.playSfx('meow_ui');
         clearTransientRenderers();
+        lastSfxModal = engine.state.activeModal;
         inputManager.reset();
         syncHeroVisuals(true);
       }
@@ -473,8 +623,8 @@ function bootstrap(): void {
     },
     onResumeGame: () => {
       audioEngine.unlock();
-      audioEngine.playSfx('meow_ui');
       engine.resumeGame();
+      syncModalTransitionSfx(engine.state.activeModal);
       inputManager.reset();
       blurFocusedButton();
     },
@@ -483,6 +633,7 @@ function bootstrap(): void {
       audioEngine.playSfx('meow_ui');
       clearTransientRenderers();
       engine.returnToTitle();
+      lastSfxModal = engine.state.activeModal;
       sceneManager.setZoneLighting(engine.state.zoneId);
       worldRenderer.loadZone(engine.state.zoneId, engine.state);
       screensController.setHasSave(engine.hasSavedGame());
@@ -494,6 +645,7 @@ function bootstrap(): void {
       audioEngine.playSfx('meow_ui');
       clearTransientRenderers();
       engine.respawnAtInn();
+      lastSfxModal = engine.state.activeModal;
       screensController.setHasSave(engine.hasSavedGame());
       inputManager.reset();
       blurFocusedButton();
@@ -552,6 +704,7 @@ function bootstrap(): void {
   syncHeroVisuals(true);
 
   modalsController.setMapImage(textures.getMiniMapUrl());
+  minimapController.refreshTerrain(textures.getHdTerrainBundle());
   screensController.setHasSave(engine.hasSavedGame());
   hudController.setMuted(audioEngine.isMuted());
 
@@ -562,9 +715,12 @@ function bootstrap(): void {
     heroFullPreviewCache.clear();
     worldRenderer.refreshTextures(engine.state);
     entityRenderer.refreshTextures(engine.state);
+    effectsRenderer.refreshTextures();
+    sceneManager.setHeatDistortion(0, textures.getVfxTexture('heat_distortion_normal'));
     syncStaticSpeakerPortraits();
     syncHeroVisuals(true);
     modalsController.setMapImage(textures.getMiniMapUrl());
+    minimapController.refreshTerrain(textures.getHdTerrainBundle());
     textures.flushRetiredTextures();
   });
 
@@ -573,9 +729,9 @@ function bootstrap(): void {
     sceneManager.ndcToWorld(ndcX, ndcY),
   );
 
-  // Thème musical pastoral prêt dès la première interaction utilisateur
-  let lastMusicTrack: MusicTrackId | null = 'overworld';
-  audioEngine.setMusicTheme('overworld');
+  // Thème musical du menu prêt dès la première interaction utilisateur
+  let lastMusicTrack: MusicTrackId | null = 'menu';
+  audioEngine.setMusicTheme('menu');
 
   // --- 4. Traitement des événements de simulation ---
   const processEventBatch = (events: GameEvent[]): void => {
@@ -598,11 +754,6 @@ function bootstrap(): void {
       ) {
         saveMayHaveChanged = true;
       }
-      if (ev.type === 'ship_boarding' || ev.type === 'ship_disembarked') {
-        audioEngine.playSfx('dodge_whoosh');
-      } else if (ev.type === 'ship_boarded' || ev.type === 'ship_refused') {
-        audioEngine.playSfx('meow_ui');
-      }
     }
 
     if (zoneChanged) {
@@ -619,6 +770,7 @@ function bootstrap(): void {
     }
 
     audioEngine.handleEvents(events);
+    worldRenderer.processEvents(events);
     effectsRenderer.processEvents(events, engine.state);
     floatingTextManager.processEvents(events, engine.state);
     hudController.handleEvents(events);
@@ -634,14 +786,14 @@ function bootstrap(): void {
     if (engine.state.screen === 'defeat') {
       desired = null;
     } else if (engine.state.screen === 'title') {
-      desired = 'overworld';
+      desired = 'menu';
     } else {
       desired = engine.getCurrentMusicTrack();
     }
 
     if (desired !== lastMusicTrack) {
       lastMusicTrack = desired;
-      audioEngine.setMusicTheme(desired);
+      audioEngine.setMusicTheme(desired, 1.35);
     }
   };
 
@@ -668,6 +820,7 @@ function bootstrap(): void {
       engine.state.ship.position.z,
       isOverworld,
     );
+    wildlifeSystem.update(engine.state, 0, w);
   }
   entityRenderer.update(
     engine.state,
@@ -678,6 +831,7 @@ function bootstrap(): void {
   effectsRenderer.update(engine.state, 0);
   sceneManager.render(0.016);
   hudController.update(engine.state);
+  minimapController.update(engine.state, 0.016);
   modalsController.update(engine.state);
   screensController.update(engine.state);
 
@@ -710,13 +864,16 @@ function bootstrap(): void {
     // Feedback audio & nettoyage d'entrées lors des transitions dialogue / modales au clavier
     if (prevDialogueActive) {
       if (!engine.state.dialogue.active) {
-        audioEngine.playSfx('meow_ui');
+        if (engine.state.activeModal === 'none') {
+          audioEngine.playUiScreenSfx('pause', 'close');
+        }
         inputManager.reset();
       } else if (engine.state.dialogue.currentIndex !== prevDialogueIdx) {
-        audioEngine.playSfx('meow_ui');
+        audioEngine.playVariant('ui_interact');
       }
-    } else if (prevModal !== engine.state.activeModal) {
-      audioEngine.playSfx('meow_ui');
+    }
+    if (prevModal !== engine.state.activeModal) {
+      syncModalTransitionSfx(engine.state.activeModal);
       if (engine.state.activeModal === 'none') {
         inputManager.reset();
       }
@@ -732,7 +889,7 @@ function bootstrap(): void {
       engine.state.screen === 'paused' ||
       engine.state.activeModal !== 'none' ||
       engine.state.hitstopTimer > 0;
-    const animDt = isSimFrozen ? 0 : dt;
+    const animDt = isSimFrozen ? 0 : dt * (engine.state.timeScale ?? 1);
 
     // Caméra & screen shake toujours fluides (y compris hitstop et orbite Écran Titre)
     // La météo est visuelle et sonore: elle continue ses transitions même si le
@@ -755,6 +912,7 @@ function bootstrap(): void {
       engine.state.ship.position.z,
       isOverworld,
     );
+    wildlifeSystem.update(engine.state, animDt, weatherSnap);
     entityRenderer.update(
       engine.state,
       animDt,
@@ -763,9 +921,32 @@ function bootstrap(): void {
     );
     effectsRenderer.update(engine.state, animDt);
     floatingTextManager.update(animDt, projectWorldToScreen);
+
+    if (engine.state.zoneId === 'dungeon_dragon_lair') {
+      const cin = engine.state.cinematic;
+      const boss = engine.getActiveBoss();
+      const dragonDefeated = engine.state.defeatedBossIds.includes('boss_dragon_claw');
+      const cleared =
+        cin?.kind === 'boss_death' && cin.bossTypeId === 'boss_dragon_claw'
+          ? (cin.lairBrighten ?? 0)
+          : dragonDefeated && !boss
+            ? 1
+            : 0;
+      const heat = Math.max(
+        cin?.heatDistortion ?? 0,
+        boss?.typeId === 'boss_dragon_claw' && boss.phase === 2 ? 0.55 : 0,
+        (boss?.activeSweepDuration ?? 0) > 0 ? 0.45 : 0,
+      );
+      worldRenderer.setDragonLairAtmosphere(heat, cleared);
+      sceneManager.setHeatDistortion(heat, textures.getVfxTexture('heat_distortion_normal'));
+    } else {
+      sceneManager.setHeatDistortion(0);
+    }
+
     sceneManager.render(dt);
 
     hudController.update(engine.state);
+    minimapController.update(engine.state, dt);
     modalsController.update(engine.state);
     screensController.update(engine.state);
 
@@ -792,6 +973,22 @@ function bootstrap(): void {
         islandId: s.islandId,
         inVillage: s.inVillage,
         time: Math.round(s.time * 100) / 100,
+        timeScale: Math.round((s.timeScale ?? 1) * 100) / 100,
+        lowHpActive: Boolean(s.lowHpActive),
+        lowHpIntensity: Math.round((s.lowHpIntensity ?? 0) * 100) / 100,
+        playerProjectilesCount: s.playerProjectiles.length,
+        enemyProjectilesCount: s.enemyProjectiles.length,
+        hazardZonesCount: s.hazardZones.length,
+        lootDropsCount: s.lootDrops.length,
+        cinematic: s.cinematic
+          ? Object.freeze({
+              kind: s.cinematic.kind,
+              bossTypeId: s.cinematic.bossTypeId,
+              stage: s.cinematic.stage,
+              elapsed: Math.round(s.cinematic.elapsed * 100) / 100,
+            })
+          : null,
+        wildlifeDensity: s.options.wildlifeDensity,
         player: Object.freeze({
           x: Math.round(p.x * 100) / 100,
           z: Math.round(p.z * 100) / 100,
@@ -807,6 +1004,15 @@ function bootstrap(): void {
           xpToNext: p.xpToNext,
           gold: p.gold,
           hasRunicKey: p.hasRunicKey,
+          perfectDodgeBuffTimer: Math.round((p.perfectDodgeBuffTimer ?? 0) * 100) / 100,
+          activeStatuses: Object.freeze(
+            (p.activeStatuses ?? []).map((st) =>
+              Object.freeze({
+                id: st.id,
+                remainingSec: Math.round(st.remainingSec * 100) / 100,
+              }),
+            ),
+          ),
           equipped: Object.freeze({ ...p.equipped }),
           stats: Object.freeze({ ...p.stats }),
           spellLevels: Object.freeze({ ...p.spellLevels }),
@@ -840,6 +1046,9 @@ function bootstrap(): void {
               hp: Math.round(boss.hp),
               maxHp: Math.round(boss.maxHp),
               phase: boss.phase,
+              stagger: Math.round((boss.stagger ?? 0) * 10) / 10,
+              maxStagger: boss.maxStagger ?? 0,
+              staggeredTimer: Math.round((boss.staggeredTimer ?? 0) * 100) / 100,
             })
           : null,
         enemiesAlive,
@@ -903,6 +1112,7 @@ function bootstrap(): void {
         musicTrack: audioEngine.getMusicTheme(),
         audioMuted: audioEngine.isMuted(),
         audioVolume: audioEngine.getVolume(),
+        audioBuses: audioEngine.getBusVolumes(),
         audioUnlocked: audioEngine.isUnlocked(),
         weatherAudio: audioEngine.getWeatherAudioStatus(),
         hasSave: engine.hasSavedGame(),
@@ -910,7 +1120,9 @@ function bootstrap(): void {
         gpuTextures: sceneManager.renderer.info.memory.textures,
         drawCalls: sceneManager.renderer.info.render.calls,
         triangles: sceneManager.renderer.info.render.triangles,
+        minimapVisible: minimapController.isVisible(),
         cape: Object.freeze(entityRenderer.getCapeDiagnostics()),
+        wildlife: Object.freeze(wildlifeSystem.getDiagnostics()),
       }),
     setWeatherForTest: (override: WeatherQaOverride) => {
       weatherController.applyQaOverride(override);
@@ -930,6 +1142,69 @@ function bootstrap(): void {
       audioEngine.setVolume(volume);
       hudController.setMuted(audioEngine.isMuted());
     },
+    setWildlifeDensityForTest: (density: WildlifeDensity) => {
+      engine.setWildlifeDensity(density);
+      wildlifeSystem.update(engine.state, 0.016, weatherController.getSnapshot());
+    },
+    equipItemsForTest: (itemIds: readonly string[]) => {
+      for (const id of itemIds) {
+        addEquipment(engine.state.player, id);
+        engine.equipItem(id);
+      }
+      hudController.update(engine.state);
+      modalsController.update(engine.state);
+      modalsController.setHeroPortrait(
+        textures.getHeroFullPreviewUrl(engine.state.player.equipped),
+      );
+      hudController.setHeroPortrait(
+        textures.getHeroPortraitUrl(engine.state.player.equipped),
+      );
+    },
+    enterZoneForTest: (zoneId: ZoneId, x?: number, z?: number) => {
+      const defaultPos = zoneId === 'overworld' ? { x: 0, z: 24 } : { x: 0, z: 12 };
+      engine.loadZone(zoneId, { x: x ?? defaultPos.x, z: z ?? defaultPos.z }, true);
+      worldRenderer.loadZone(engine.state.zoneId, engine.state);
+      syncAtmosphereAndAudio(0.016);
+    },
+    setHeroPoseForTest: (opts: {
+      facingX?: 1 | -1;
+      attackAnimTimer?: number;
+      dodgeTimer?: number;
+      vx?: number;
+      vz?: number;
+    }) => {
+      const p = engine.state.player;
+      if (opts.facingX !== undefined) p.facingX = opts.facingX;
+      if (opts.attackAnimTimer !== undefined) p.attackAnimTimer = opts.attackAnimTimer;
+      if (opts.dodgeTimer !== undefined) p.dodgeTimer = opts.dodgeTimer;
+      if (opts.vx !== undefined) p.vx = opts.vx;
+      if (opts.vz !== undefined) p.vz = opts.vz;
+    },
+    getLightingDiagnostics: () => {
+      const slots: {
+        index: number;
+        x: number;
+        y: number;
+        z: number;
+        intensity: number;
+        distance: number;
+      }[] = [];
+      let activeSpriteLightCount = 0;
+      for (let i = 0; i < SPRITE_LIGHT_COUNT; i++) {
+        const s = getSpriteLightSlotSnapshot(i);
+        if (!s) continue;
+        if (s.intensity > 0.01) activeSpriteLightCount++;
+        slots.push({
+          index: i,
+          x: Math.round(s.x * 100) / 100,
+          y: Math.round(s.y * 100) / 100,
+          z: Math.round(s.z * 100) / 100,
+          intensity: Math.round(s.intensity * 100) / 100,
+          distance: Math.round(s.distance * 100) / 100,
+        });
+      }
+      return Object.freeze({ activeSpriteLightCount, slots });
+    },
   });
 
   window.__CAT_QUEST__ = qaHook;
@@ -944,9 +1219,11 @@ function bootstrap(): void {
     }
     inputManager.detach();
     hudController.dispose();
+    minimapController.dispose();
     modalsController.dispose();
     screensController.dispose();
     floatingTextManager.dispose();
+    wildlifeSystem.dispose();
     weatherVfx.dispose();
     effectsRenderer.dispose();
     entityRenderer.dispose();

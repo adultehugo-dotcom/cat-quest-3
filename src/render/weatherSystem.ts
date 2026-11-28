@@ -125,14 +125,14 @@ const DAY_KEYFRAMES: readonly DayKeyframe[] = [
     // 00:00 — Pleine nuit lunaire (bleu profond argenté, lisible pour le jeu)
     t: 0.0,
     dirPos: [-18, 34, -26],
-    dirColor: 0x9ec0f5,
-    dirIntensity: 0.72,
-    ambientColor: 0x3b598f,
-    ambientIntensity: 0.34,
-    hemiSky: 0x4b70ad,
-    hemiGround: 0x22334a,
-    hemiIntensity: 0.36,
-    fogColor: 0x10223d,
+    dirColor: 0x6b8fd6,
+    dirIntensity: 0.66,
+    ambientColor: 0x1f3666,
+    ambientIntensity: 0.31,
+    hemiSky: 0x2c4a82,
+    hemiGround: 0x101c30,
+    hemiIntensity: 0.22,
+    fogColor: 0x0c1a33,
     sunSpecColor: 0xbcd8ff,
     skyReflect: 0x142c4f,
     horizonReflect: 0x1d3b63,
@@ -147,14 +147,14 @@ const DAY_KEYFRAMES: readonly DayKeyframe[] = [
     // 04:45 — Fin de nuit avant l'aube
     t: 0.2,
     dirPos: [16, 26, -28],
-    dirColor: 0x9eb8e8,
-    dirIntensity: 0.72,
-    ambientColor: 0x415b8c,
-    ambientIntensity: 0.35,
-    hemiSky: 0x5674ad,
-    hemiGround: 0x28364a,
-    hemiIntensity: 0.37,
-    fogColor: 0x192c4a,
+    dirColor: 0x7293d6,
+    dirIntensity: 0.66,
+    ambientColor: 0x243b6b,
+    ambientIntensity: 0.32,
+    hemiSky: 0x33508a,
+    hemiGround: 0x142033,
+    hemiIntensity: 0.24,
+    fogColor: 0x12213b,
     sunSpecColor: 0xc2d4f5,
     skyReflect: 0x1a3457,
     horizonReflect: 0x2d4363,
@@ -301,14 +301,14 @@ const DAY_KEYFRAMES: readonly DayKeyframe[] = [
     // 20:50 — Entrée dans la nuit lunaire
     t: 0.87,
     dirPos: [-20, 32, -26],
-    dirColor: 0x9ec0f5,
-    dirIntensity: 0.72,
-    ambientColor: 0x3b598f,
-    ambientIntensity: 0.34,
-    hemiSky: 0x4b70ad,
-    hemiGround: 0x22334a,
-    hemiIntensity: 0.36,
-    fogColor: 0x10223d,
+    dirColor: 0x6b8fd6,
+    dirIntensity: 0.66,
+    ambientColor: 0x1f3666,
+    ambientIntensity: 0.31,
+    hemiSky: 0x2c4a82,
+    hemiGround: 0x101c30,
+    hemiIntensity: 0.22,
+    fogColor: 0x0c1a33,
     sunSpecColor: 0xbcd8ff,
     skyReflect: 0x142c4f,
     horizonReflect: 0x1d3b63,
@@ -323,14 +323,14 @@ const DAY_KEYFRAMES: readonly DayKeyframe[] = [
     // 24:00 — Boucle exacte sur minuit
     t: 1.0,
     dirPos: [-18, 34, -26],
-    dirColor: 0x9ec0f5,
-    dirIntensity: 0.72,
-    ambientColor: 0x3b598f,
-    ambientIntensity: 0.34,
-    hemiSky: 0x4b70ad,
-    hemiGround: 0x22334a,
-    hemiIntensity: 0.36,
-    fogColor: 0x10223d,
+    dirColor: 0x6b8fd6,
+    dirIntensity: 0.66,
+    ambientColor: 0x1f3666,
+    ambientIntensity: 0.31,
+    hemiSky: 0x2c4a82,
+    hemiGround: 0x101c30,
+    hemiIntensity: 0.22,
+    fogColor: 0x0c1a33,
     sunSpecColor: 0xbcd8ff,
     skyReflect: 0x142c4f,
     horizonReflect: 0x1d3b63,
@@ -348,14 +348,14 @@ const FOG_DAY_COLOR = new THREE.Color(0x9ab0bd);
 const FOG_SUNSET_COLOR = new THREE.Color(0x967e78);
 const FOG_NIGHT_COLOR = new THREE.Color(0x283a52);
 
-const STORM_DAY_FOG_COLOR = new THREE.Color(0x2c3c4c);
-const STORM_SUNSET_FOG_COLOR = new THREE.Color(0x3a323b);
-const STORM_NIGHT_FOG_COLOR = new THREE.Color(0x101c2b);
+const STORM_DAY_FOG_COLOR = new THREE.Color(0x162230);
+const STORM_SUNSET_FOG_COLOR = new THREE.Color(0x211b26);
+const STORM_NIGHT_FOG_COLOR = new THREE.Color(0x070e18);
 
-const STORM_WATER_SHALLOW = new THREE.Color(0x1f5966);
-const STORM_WATER_MID = new THREE.Color(0x103347);
-const STORM_WATER_DEEP = new THREE.Color(0x071926);
-const STORM_WATER_FOAM = new THREE.Color(0xa6b9c2);
+const STORM_WATER_SHALLOW = new THREE.Color(0x133c48);
+const STORM_WATER_MID = new THREE.Color(0x092130);
+const STORM_WATER_DEEP = new THREE.Color(0x040f19);
+const STORM_WATER_FOAM = new THREE.Color(0x8298a6);
 
 const LIGHTNING_SKY_COLOR = new THREE.Color(0xbcd8f7);
 const LIGHTNING_DIR_COLOR = new THREE.Color(0xd8ecff);
@@ -812,32 +812,33 @@ export class WeatherCycleController {
       caustics *= 1 - fogW * 0.55;
     }
 
-    // Modulation météo : Tempête (ciel plombé sombre, houle forte, pluie, brume dense)
+    // Modulation météo : Tempête (ciel très sombre et lourd, houle forte, pluie, lisibilité préservée)
     this.tmpColor2
       .copy(STORM_DAY_FOG_COLOR)
       .lerp(STORM_SUNSET_FOG_COLOR, warmHorizonMix * 0.65)
-      .lerp(STORM_NIGHT_FOG_COLOR, nightFactor * 0.88);
+      .lerp(STORM_NIGHT_FOG_COLOR, nightFactor * 0.90);
 
     if (stormW > 0.001) {
-      s.fogColor.lerp(this.tmpColor2, stormW * 0.94);
-      s.skyReflectColor.lerp(this.tmpColor2, stormW * 0.85);
-      s.horizonReflectColor.lerp(this.tmpColor2, stormW * 0.88);
-      s.hemiSkyColor.lerp(this.tmpColor2, stormW * 0.72);
-      s.ambientColor.lerp(this.tmpColor2, stormW * 0.52);
-      s.dirLightColor.lerp(LIGHTNING_SKY_COLOR, stormW * 0.42);
-      // Garde une lisibilité nette du bateau et des côtes proches même en tempête nocturne
-      s.dirLightIntensity *= 1 - stormW * 0.48;
-      s.ambientIntensity = Math.max(0.32, s.ambientIntensity + stormW * 0.06);
-      s.hemiIntensity += stormW * 0.05;
+      s.fogColor.lerp(this.tmpColor2, stormW * 0.96);
+      s.skyReflectColor.lerp(this.tmpColor2, stormW * 0.92);
+      s.horizonReflectColor.lerp(this.tmpColor2, stormW * 0.92);
+      s.hemiSkyColor.lerp(this.tmpColor2, stormW * 0.84);
+      s.hemiGroundColor.lerp(STORM_NIGHT_FOG_COLOR, stormW * 0.58);
+      s.ambientColor.lerp(this.tmpColor2, stormW * 0.82);
+      s.dirLightColor.lerp(STORM_DAY_FOG_COLOR, stormW * 0.56);
+      // Tempête nettement assombrie tout en préservant la lisibilité du héros, du bateau et des menaces
+      s.dirLightIntensity *= 1 - stormW * 0.78;
+      s.ambientIntensity = Math.max(0.14, s.ambientIntensity * (1 - stormW * 0.52));
+      s.hemiIntensity = Math.max(0.13, s.hemiIntensity * (1 - stormW * 0.54));
 
-      // Teintes d'océan plus sombres et tourmentées pendant la tempête
-      s.waterShallowColor.lerp(STORM_WATER_SHALLOW, stormW * 0.72);
-      s.waterMidColor.lerp(STORM_WATER_MID, stormW * 0.78);
-      s.waterDeepColor.lerp(STORM_WATER_DEEP, stormW * 0.82);
-      s.waterFoamColor.lerp(STORM_WATER_FOAM, stormW * 0.62);
+      // Teintes d'océan sombres et menaçantes pendant la tempête
+      s.waterShallowColor.lerp(STORM_WATER_SHALLOW, stormW * 0.84);
+      s.waterMidColor.lerp(STORM_WATER_MID, stormW * 0.88);
+      s.waterDeepColor.lerp(STORM_WATER_DEEP, stormW * 0.90);
+      s.waterFoamColor.lerp(STORM_WATER_FOAM, stormW * 0.72);
 
-      sunGlint *= 1 - stormW * 0.62;
-      caustics *= 1 - stormW * 0.82;
+      sunGlint *= 1 - stormW * 0.78;
+      caustics *= 1 - stormW * 0.90;
     }
 
     // Intensités atmosphériques lissées + rafales de vent organiques
@@ -899,8 +900,8 @@ export class WeatherCycleController {
       nightFactor * 0.95 +
         sunsetFactor * 0.45 +
         dawnFactor * 0.32 +
-        stormW * 0.72 +
-        fogW * 0.55,
+        stormW * 0.92 +
+        fogW * 0.58,
       0,
       1,
     );

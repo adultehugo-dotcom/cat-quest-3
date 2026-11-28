@@ -506,6 +506,64 @@ function drawCatCottage(ctx: CanvasRenderingContext2D, size: number): void {
   ctx.restore();
 }
 
+function drawBush(ctx: CanvasRenderingContext2D): void {
+  const cx = 96;
+  const baseY = 174;
+  drawInkEllipse(ctx, cx - 34, baseY - 26, 30, 26, '#2f7a3e', 4.2);
+  drawInkEllipse(ctx, cx + 34, baseY - 26, 30, 26, '#2f7a3e', 4.2);
+  drawInkEllipse(ctx, cx, baseY - 38, 42, 34, '#449e4f', 4.4);
+  drawInkEllipse(ctx, cx - 10, baseY - 46, 26, 20, '#62c25e', 0);
+  // Petites baies/fleurs colorées
+  drawInkEllipse(ctx, cx - 22, baseY - 34, 4.5, 4.5, '#ff7878', 1.8);
+  drawInkEllipse(ctx, cx + 16, baseY - 42, 4.5, 4.5, '#ffd452', 1.8);
+  drawInkEllipse(ctx, cx + 4, baseY - 24, 4.5, 4.5, '#ff7878', 1.8);
+}
+
+function drawBarrel(ctx: CanvasRenderingContext2D): void {
+  const cx = 96;
+  const baseY = 176;
+  // Corps du tonneau en chêne bombé
+  ctx.beginPath();
+  ctx.moveTo(cx - 32, baseY - 82);
+  ctx.quadraticCurveTo(cx - 46, baseY - 41, cx - 34, baseY);
+  ctx.lineTo(cx + 34, baseY);
+  ctx.quadraticCurveTo(cx + 46, baseY - 41, cx + 32, baseY - 82);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(cx - 42, baseY - 41, cx + 42, baseY - 41);
+  grad.addColorStop(0, '#6c3f1d');
+  grad.addColorStop(0.42, '#a86938');
+  grad.addColorStop(1, '#5d3417');
+  ctx.fillStyle = grad;
+  ctx.fill();
+  ctx.strokeStyle = INK_COLOR;
+  ctx.lineWidth = 4.6;
+  ctx.stroke();
+
+  // Couvercle supérieur
+  drawInkEllipse(ctx, cx, baseY - 82, 32, 10, '#8d562b', 3.6);
+
+  // Douelles verticales
+  ctx.strokeStyle = 'rgba(42, 22, 10, 0.55)';
+  ctx.lineWidth = 2.4;
+  for (const ox of [-14, 0, 14]) {
+    ctx.beginPath();
+    ctx.moveTo(cx + ox * 0.85, baseY - 73);
+    ctx.quadraticCurveTo(cx + ox * 1.15, baseY - 40, cx + ox * 0.9, baseY - 2);
+    ctx.stroke();
+  }
+
+  // Cerclages en fer
+  for (const hy of [baseY - 64, baseY - 22]) {
+    ctx.fillStyle = '#535e6b';
+    ctx.strokeStyle = INK_COLOR;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.roundRect(cx - 39, hy, 78, 10, 3);
+    ctx.fill();
+    ctx.stroke();
+  }
+}
+
 export function drawPropCanvas(kind: PropKind): HTMLCanvasElement {
   const { canvas, ctx } = createCanvas(192, 192);
   switch (kind) {
@@ -538,6 +596,12 @@ export function drawPropCanvas(kind: PropKind): HTMLCanvasElement {
       break;
     case 'fence':
       drawFence(ctx);
+      break;
+    case 'bush':
+      drawBush(ctx);
+      break;
+    case 'barrel':
+      drawBarrel(ctx);
       break;
   }
   return canvas;
@@ -1493,3 +1557,146 @@ export function drawTorchHdCanvas(
 
   return canvas;
 }
+
+/**
+ * Dessine un lampadaire médiéval en fer forgé (`prop_lamppost`) en mode éteint
+ * (jour) ou allumé chaud (crépuscule / nuit / brouillard / tempête).
+ */
+export function drawLamppostCanvas(lit: boolean): HTMLCanvasElement {
+  const { canvas, ctx } = createCanvas(256, 384);
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+
+  // Socle de pierre & fer forgé
+  drawInkEllipse(ctx, 128, 356, 44, 15, '#595452', 5);
+  ctx.fillStyle = '#3a3438';
+  ctx.strokeStyle = '#1f1916';
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.roundRect(114, 108, 28, 246, 8);
+  ctx.fill();
+  ctx.stroke();
+
+  // Reflet métallique vertical
+  ctx.fillStyle = 'rgba(210, 215, 228, 0.22)';
+  ctx.fillRect(120, 114, 6, 234);
+
+  // Potence courbée élégante
+  ctx.strokeStyle = '#1f1916';
+  ctx.lineWidth = 14;
+  ctx.beginPath();
+  ctx.moveTo(128, 124);
+  ctx.quadraticCurveTo(128, 66, 174, 72);
+  ctx.stroke();
+  ctx.strokeStyle = '#4c464d';
+  ctx.lineWidth = 7;
+  ctx.stroke();
+
+  // Volute décorative
+  ctx.strokeStyle = '#2b2528';
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.arc(146, 116, 14, Math.PI * 0.2, Math.PI * 1.4);
+  ctx.stroke();
+
+  // Lanterne suspendue (éclairage assuré par de vraies PointLights, jamais par un faux halo peint)
+  const lx = 176;
+  const ly = 114;
+
+  // Toit de lanterne
+  ctx.fillStyle = '#363034';
+  ctx.strokeStyle = '#1f1916';
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(lx - 26, ly - 16);
+  ctx.lineTo(lx, ly - 38);
+  ctx.lineTo(lx + 26, ly - 16);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Vitre de lanterne
+  const glassGrad = ctx.createRadialGradient(lx, ly + 6, 4, lx, ly + 6, 26);
+  if (lit) {
+    glassGrad.addColorStop(0, '#fffce0');
+    glassGrad.addColorStop(0.55, '#ffd460');
+    glassGrad.addColorStop(1, '#e88222');
+  } else {
+    glassGrad.addColorStop(0, '#c8d6df');
+    glassGrad.addColorStop(1, '#687985');
+  }
+  ctx.fillStyle = glassGrad;
+  ctx.beginPath();
+  ctx.moveTo(lx - 20, ly - 16);
+  ctx.lineTo(lx + 20, ly - 16);
+  ctx.lineTo(lx + 15, ly + 28);
+  ctx.lineTo(lx - 15, ly + 28);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Base de lanterne
+  ctx.fillStyle = '#363034';
+  ctx.beginPath();
+  ctx.roundRect(lx - 17, ly + 26, 34, 10, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  return canvas;
+}
+
+/**
+ * Produit une frame intermédiaire d'ouverture de coffre (`chest_opening_sheet`
+ * en repli procédural zéro-404 à partir des PNG existants `chest_closed` et `chest_open`).
+ */
+export function drawChestOpeningFrameCanvas(
+  closedImg: HTMLImageElement | undefined,
+  openImg: HTMLImageElement | undefined,
+  progress01: number,
+  tier: 'common' | 'rare' | 'epic' | 'boss',
+): HTMLCanvasElement {
+  const size = 512;
+  const { canvas, ctx } = createCanvas(size, size);
+  const p = Math.max(0, Math.min(1, progress01));
+
+  // Squash d'anticipation puis jaillissement doré à l'ouverture
+  const squashX = p < 0.35 ? 1 + Math.sin((p / 0.35) * Math.PI) * 0.08 : 1 - Math.sin(((p - 0.35) / 0.65) * Math.PI) * 0.04;
+  const squashY = p < 0.35 ? 1 - Math.sin((p / 0.35) * Math.PI) * 0.09 : 1 + Math.sin(((p - 0.35) / 0.65) * Math.PI) * 0.1;
+
+  ctx.save();
+  ctx.translate(size * 0.5, size * 0.92);
+  ctx.scale(squashX, squashY);
+  ctx.translate(-size * 0.5, -size * 0.92);
+
+  if (closedImg && openImg) {
+    ctx.globalAlpha = 1 - Math.max(0, (p - 0.35) / 0.45);
+    ctx.drawImage(closedImg, 0, 0, size, size);
+    ctx.globalAlpha = Math.min(1, Math.max(0, (p - 0.25) / 0.5));
+    ctx.drawImage(openImg, 0, 0, size, size);
+  } else {
+    const chestTier: ChestTier =
+      tier === 'boss' ? 'golden' : tier === 'epic' ? 'epic' : tier === 'rare' ? 'rare' : 'wood';
+    const base = drawChestCanvas(chestTier, p > 0.5 ? 'open' : 'closed');
+    ctx.drawImage(base, 0, 0, size, size);
+  }
+  ctx.restore();
+
+  // Rayon lumineux d'ouverture proportionnel au palier de rareté
+  if (p > 0.28) {
+    const burst = Math.sin(((p - 0.28) / 0.72) * Math.PI);
+    const beamColor =
+      tier === 'epic'
+        ? 'rgba(208, 128, 255, '
+        : tier === 'rare'
+          ? 'rgba(110, 210, 255, '
+          : 'rgba(255, 224, 112, ';
+    const grad = ctx.createRadialGradient(256, 250, 12, 256, 230, 180);
+    grad.addColorStop(0, `${beamColor}${(0.75 * burst).toFixed(3)})`);
+    grad.addColorStop(1, `${beamColor}0)`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+  }
+
+  return canvas;
+}
+

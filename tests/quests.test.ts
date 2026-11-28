@@ -249,6 +249,11 @@ describe('Quêtes — Quête Principale (3 Actes), Secondaires & Flèche Dorée'
 
     expect(engine.state.defeatedBossIds).toContain('boss_dragon_claw');
     expect(engine.state.quests.main_dragon_blood.status).toBe('completed');
+    const idle = createEmptyInputState();
+    for (let i = 0; i < 100 && engine.state.cinematic !== null; i++) {
+      engine.step(0.05, idle);
+    }
+    expect(engine.state.cinematic).toBeNull();
     while (engine.state.dialogue.active) engine.advanceDialogue();
     expect(engine.state.screen).toBe('victory');
 

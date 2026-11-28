@@ -153,6 +153,11 @@ const OVERWORLD_PROPS: WorldProp[] = [
   { id: 'prop_sign_1', kind: 'signpost', x: 13.5, z: 16.5, scale: 1.0, collidable: true, colliderRadius: 0.45 },
   { id: 'prop_sign_2', kind: 'signpost', x: -13.5, z: 15.5, scale: 1.0, collidable: true, colliderRadius: 0.45 },
   { id: 'prop_sign_3', kind: 'signpost', x: 2.5, z: 12.2, scale: 1.0, collidable: true, colliderRadius: 0.45 },
+  { id: 'prop_bush_1', kind: 'bush', x: -12.5, z: 25, scale: 1.0, collidable: false },
+  { id: 'prop_bush_2', kind: 'bush', x: 13.5, z: 25, scale: 1.05, collidable: false },
+  { id: 'prop_bush_3', kind: 'bush', x: -21, z: 4, scale: 1.1, collidable: false },
+  { id: 'prop_barrel_1', kind: 'barrel', x: 11.8, z: 20.5, scale: 1.0, collidable: false },
+  { id: 'prop_barrel_2', kind: 'barrel', x: -11.5, z: 20.5, scale: 1.0, collidable: false },
 
   // --- Bois Griffu : arbres tordus, champignons, rochers ---
   { id: 'prop_twist_1', kind: 'twisted_tree', x: -15, z: 8, scale: 1.2, collidable: true, colliderRadius: 0.95 },

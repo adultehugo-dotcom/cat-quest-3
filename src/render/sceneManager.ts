@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { SSAOPass } from 'three/examples/jsm/postprocessing/SSAOPass.js';
@@ -12,6 +13,7 @@ import {
   createTiltShiftVignettePass,
   updateTiltShiftResolution,
 } from './shaders/tiltShiftShader';
+import { createHeatDistortionPass } from './shaders/heatDistortionShader';
 import type { WeatherSnapshot } from './weatherSystem';
 import { clearSpriteLight, setSpriteLight } from './spriteLighting';
 
@@ -53,6 +55,8 @@ export interface ProjectedPoint {
   visible: boolean;
 }
 
+export type DynamicLightFlickerMode = 'torch' | 'lamp' | 'forge' | 'magic' | 'steady';
+
 export interface TorchLightPosition {
   x: number;
   y: number;
@@ -60,6 +64,8 @@ export interface TorchLightPosition {
   intensity?: number;
   distance?: number;
   outdoor?: boolean;
+  color?: number;
+  flickerMode?: DynamicLightFlickerMode;
 }
 
 export interface PostProcessingConfig {
@@ -86,6 +92,8 @@ interface TorchSpec {
   intensity: number;
   distance: number;
   outdoor: boolean;
+  colorHex: number | null;
+  flickerMode: DynamicLightFlickerMode;
 }
 
 /**
@@ -197,6 +205,9 @@ export class SceneManager {
   private readonly overworldFog = new THREE.Fog(0x216b94, 115, 265);
   private currentShadowExtent = SHADOW_EXTENT_GAMEPLAY;
 
+  // Environnement IBL PMREM procédural pour reflets PBR réels sur armures/lames/métaux
+  private envRenderTarget: THREE.WebGLRenderTarget | null = null;
+
   // Pipeline Post-Processing (EffectComposer)
   private composer: EffectComposer | null = null;
   private composerTarget: THREE.WebGLRenderTarget | null = null;
@@ -204,6 +215,7 @@ export class SceneManager {
   private ssaoPass: DioramaSSAOPass | null = null;
   private bloomPass: UnrealBloomPass | null = null;
   private tiltShiftPass: ShaderPass | null = null;
+  private heatDistortionPass: ShaderPass | null = null;
   private outputPass: OutputPass | null = null;
   private postProcessingActive = false;
 
@@ -242,6 +254,7 @@ export class SceneManager {
   private readonly isSoftwareRenderer: boolean;
   private cameraInitialized = false;
   private lastScreen: GameState['screen'] | null = null;
+  private heatDistortionNormalMap: THREE.Texture | null = null;
 
   private readonly boundResize: () => void;
 
@@ -316,9 +329,22 @@ export class SceneManager {
     this.scene.add(this.dirLight);
     this.scene.add(this.dirLight.target);
 
-    // Groupe dédié aux torches dynamiques des donjons
-    this.torchGroup.name = 'DynamicTorchLights';
+    // Groupe dédié aux sources lumineuses dynamiques réelles (torches, lampadaires, forge, portails, cristaux)
+    this.torchGroup.name = 'DynamicWorldLights';
     this.scene.add(this.torchGroup);
+
+    // Environnement IBL PMREM (RoomEnvironment) pour des reflets spéculaires réalistes sur métaux & armures
+    try {
+      const pmrem = new THREE.PMREMGenerator(this.renderer);
+      const roomEnv = new RoomEnvironment();
+      this.envRenderTarget = pmrem.fromScene(roomEnv, 0.04);
+      this.scene.environment = this.envRenderTarget.texture;
+      this.scene.environmentIntensity = 0.55;
+      roomEnv.dispose();
+      pmrem.dispose();
+    } catch {
+      this.envRenderTarget = null;
+    }
 
     this.setZoneLighting('overworld');
     if (!this.isSoftwareRenderer) {
@@ -378,12 +404,12 @@ export class SceneManager {
         }
       }
 
-      // 3. UnrealBloomPass sélectif (seules les sources magiques/HDR > 0.85 brillent !)
+      // 3. UnrealBloomPass sélectif (seules les sources magiques/HDR > 0.90 brillent en douceur)
       const bloomPass = new UnrealBloomPass(
         new THREE.Vector2(effW, effH),
-        0.48,
-        0.42,
-        0.85,
+        0.34,
+        0.38,
+        0.90,
       );
       composer.addPass(bloomPass);
       this.bloomPass = bloomPass;
@@ -401,6 +427,11 @@ export class SceneManager {
       updateTiltShiftResolution(tiltShiftPass, effW, effH);
       composer.addPass(tiltShiftPass);
       this.tiltShiftPass = tiltShiftPass;
+
+      // 4b. Distorsion thermique CC0 (`heat_distortion_normal.png`, active uniquement pendant intro/P2/onde Drak-Miaou)
+      const heatDistortionPass = createHeatDistortionPass();
+      composer.addPass(heatDistortionPass);
+      this.heatDistortionPass = heatDistortionPass;
 
       // 5. OutputPass : ACESFilmicToneMapping (exposure 1.05) + transfert sRGB final
       const outputPass = new OutputPass();
@@ -425,6 +456,8 @@ export class SceneManager {
     this.bloomPass = null;
     this.tiltShiftPass?.dispose();
     this.tiltShiftPass = null;
+    this.heatDistortionPass?.dispose();
+    this.heatDistortionPass = null;
     this.outputPass?.dispose();
     this.outputPass = null;
     this.renderPass?.dispose();
@@ -497,15 +530,36 @@ export class SceneManager {
     this.sunDirection.copy(weather.sunDirection);
     this.outdoorLampBrightness = THREE.MathUtils.clamp(
       Math.max(
-        weather.nightFactor * 0.96,
-        weather.sunsetFactor * 0.52,
-        weather.dawnFactor * 0.36,
-        weather.fogIntensity * 0.52,
-        weather.stormIntensity * 0.65,
+        weather.nightFactor * 0.98,
+        weather.sunsetFactor * 0.56,
+        weather.dawnFactor * 0.40,
+        weather.fogIntensity * 0.56,
+        weather.stormIntensity * 0.94,
       ),
       0,
       1,
     );
+
+    // Assombrit fortement l'ambiance en tempête (exposition + IBL) tout en laissant les éclairs et lanternes percer
+    const stormDarkFactor = THREE.MathUtils.clamp(
+      weather.stormIntensity * (1 - weather.lightningFlash * 0.85),
+      0,
+      1,
+    );
+    this.renderer.toneMappingExposure = THREE.MathUtils.lerp(1.05, 0.72, stormDarkFactor);
+
+    // Adapte l'intensité IBL à la luminosité réelle du ciel (reflets très réduits la nuit et sous l'orage)
+    if (this.scene.environment) {
+      this.scene.environmentIntensity = THREE.MathUtils.lerp(
+        0.58,
+        0.06,
+        THREE.MathUtils.clamp(
+          weather.nightFactor * 0.94 + stormDarkFactor * 0.82,
+          0,
+          1,
+        ),
+      );
+    }
 
     // Maintient les ombres alignées sur la nouvelle position solaire/lunaire
     this.updateShadowFollow(this.camLookAt.x, this.camLookAt.z, this.currentShadowExtent);
@@ -555,10 +609,32 @@ export class SceneManager {
     }
   }
 
+  /**
+   * Contrôle la passe de distorsion thermique CC0 (`heat_distortion_normal.png`)
+   * utilisée durant l'intro, la Phase 2 et les ondes de Drak-Miaou.
+   */
+  public setHeatDistortion(intensity: number, normalMap?: THREE.Texture): void {
+    if (normalMap) {
+      this.heatDistortionNormalMap = normalMap;
+    }
+    if (!this.heatDistortionPass) return;
+
+    if (this.heatDistortionNormalMap && this.heatDistortionPass.uniforms.uNormalMap) {
+      this.heatDistortionPass.uniforms.uNormalMap.value = this.heatDistortionNormalMap;
+    }
+    const clamped = THREE.MathUtils.clamp(intensity, 0, 1);
+    if (this.heatDistortionPass.uniforms.uIntensity) {
+      this.heatDistortionPass.uniforms.uIntensity.value = clamped;
+    }
+    this.heatDistortionPass.enabled =
+      clamped > 0.005 && Boolean(this.heatDistortionPass.uniforms.uNormalMap?.value);
+  }
+
   private ensureTorchPool(): void {
     if (this.torchPool.length >= MAX_ACTIVE_TORCH_LIGHTS) return;
     while (this.torchPool.length < MAX_ACTIVE_TORCH_LIGHTS) {
-      const light = new THREE.PointLight(0xff9f40, 0, 17, 1.65);
+      // Atténuation physique quadratique (decay = 2) pour un éclairage réaliste sur sol, murs et personnages
+      const light = new THREE.PointLight(0xff9f40, 0, 18, 2);
       light.castShadow = false;
       light.visible = false;
       this.torchGroup.add(light);
@@ -567,9 +643,9 @@ export class SceneManager {
   }
 
   /**
-   * Enregistre les positions des torches dynamiques du donjon actif.
-   * Les torches les plus proches de la caméra sont éclairées en temps réel par des
-   * PointLights ambrées scintillantes (flicker organique) avec atténuation réaliste.
+   * Enregistre les sources lumineuses dynamiques réelles de la zone active
+   * (lampadaires, foyer de forge, portails, torches de donjon, cristaux, coffres).
+   * Les 8 sources les plus proches pilotent de vraies PointLights physiques + le shader 2.5D.
    */
   public setDynamicTorchLights(positions: readonly TorchLightPosition[]): void {
     this.torchSpecs = positions.map((pos, idx) => ({
@@ -580,6 +656,8 @@ export class SceneManager {
       intensity: pos.intensity ?? this.torchBaseIntensity,
       distance: pos.distance ?? 17,
       outdoor: pos.outdoor ?? false,
+      colorHex: pos.color ?? null,
+      flickerMode: pos.flickerMode ?? (pos.outdoor ? 'lamp' : 'torch'),
     }));
 
     if (this.torchSpecs.length === 0) {
@@ -656,30 +734,56 @@ export class SceneManager {
         continue;
       }
 
-      // Scintillement organique multi-fréquence (flamme vivante de donjon)
+      // Modulation organique adaptée au type physique de source lumineuse
       const s = spec.seed;
       const waveA = Math.sin(time * 9.3 + s);
       const waveB = Math.sin(time * 16.7 + s * 1.73) * 0.55;
       const waveC = Math.sin(time * 27.1 + s * 2.41) * 0.25;
       const flickerNorm = (waveA + waveB + waveC) / 1.8; // [-1, 1]
 
-      const intensityFactor = 0.86 + flickerNorm * 0.22;
+      let intensityFactor = 1;
+      let posJitter = 0;
+      if (spec.flickerMode === 'torch' || spec.flickerMode === 'forge') {
+        intensityFactor = 0.86 + flickerNorm * 0.20;
+        posJitter = 0.055;
+      } else if (spec.flickerMode === 'lamp') {
+        intensityFactor = 0.96 + flickerNorm * 0.05;
+        posJitter = 0.015;
+      } else if (spec.flickerMode === 'magic') {
+        intensityFactor = 0.90 + Math.sin(time * 3.6 + s) * 0.14;
+        posJitter = 0.02;
+      }
+
+      const sourceBrightness = spec.outdoor
+        ? this.outdoorLampBrightness * intensityFactor
+        : intensityFactor;
+      const resolvedIntensity = spec.intensity * sourceBrightness * rangeFade;
+
+      if (resolvedIntensity <= 0.02) {
+        slot.light.visible = false;
+        slot.light.intensity = 0;
+        clearSpriteLight(i);
+        continue;
+      }
+
       slot.light.visible = true;
       slot.light.distance = spec.distance;
-      const sourceBrightness = spec.outdoor
-        ? this.outdoorLampBrightness * (0.98 + flickerNorm * 0.035)
-        : intensityFactor;
-      slot.light.intensity = spec.intensity * sourceBrightness * rangeFade;
+      slot.light.intensity = resolvedIntensity;
 
-      // Micro-danse de la flamme faisant vibrer les reflets sur les dalles PBR
+      // Micro-mouvement de flamme faisant vivre les reflets spéculaires sur les dalles & armures PBR
       slot.light.position.set(
-        spec.x + Math.sin(time * 11.4 + s) * 0.06,
-        spec.y + Math.cos(time * 13.8 + s * 1.3) * 0.04,
-        spec.z + Math.cos(time * 10.2 + s * 0.7) * 0.06,
+        spec.x + Math.sin(time * 11.4 + s) * posJitter,
+        spec.y + Math.cos(time * 13.8 + s * 1.3) * posJitter * 0.7,
+        spec.z + Math.cos(time * 10.2 + s * 0.7) * posJitter,
       );
 
-      // Modulation subtile de température de couleur (braise chaude <-> or ambré)
-      if (flickerNorm >= 0) {
+      // Couleur dédiée de la source (cristal émeraude, portail violet, forge braise) ou spectre de torche
+      if (spec.colorHex !== null) {
+        this.torchColorScratch.setHex(spec.colorHex);
+        if (spec.flickerMode === 'forge') {
+          this.torchColorScratch.lerp(this.torchHotColor, Math.max(0, flickerNorm) * 0.28);
+        }
+      } else if (flickerNorm >= 0) {
         this.torchColorScratch.copy(this.torchWarmColor).lerp(this.torchHotColor, flickerNorm * 0.45);
       } else {
         this.torchColorScratch.copy(this.torchWarmColor).lerp(this.torchEmberColor, -flickerNorm * 0.4);
@@ -724,6 +828,7 @@ export class SceneManager {
   public setZoneLighting(zoneId: ZoneId): void {
     if (this.activeLightingZone === zoneId) return;
     this.activeLightingZone = zoneId;
+    this.renderer.toneMappingExposure = 1.05;
 
     if (zoneId === 'overworld') {
       this.overworldBgColor.setHex(0x1b5e85);
@@ -776,27 +881,30 @@ export class SceneManager {
       this.torchWarmColor.setHex(0xffa64a);
       this.torchHotColor.setHex(0xffd578);
       this.torchEmberColor.setHex(0xff7729);
-      this.torchBaseIntensity = 9.0;
+      this.torchBaseIntensity = 10.0;
     } else {
       this.scene.fog = new THREE.Fog(pal.bgHex, 52, 135);
       this.ambientLight.color.setHex(dungeon.ambientLightColor);
-      this.ambientLight.intensity = 0.38;
+      this.ambientLight.intensity = 0.34;
 
       this.hemiLight.color.setHex(0xff9f70);
       this.hemiLight.groundColor.setHex(0x2e151d);
-      this.hemiLight.intensity = 0.30;
+      this.hemiLight.intensity = 0.26;
 
       this.dirLight.color.setHex(0xffcfa3);
-      this.dirLight.intensity = 1.05;
+      this.dirLight.intensity = 0.92;
       this.dirLightOffset.set(16, 36, 20);
       this.sunDirection.copy(this.dirLightOffset).normalize();
 
       this.torchWarmColor.setHex(0xff8633);
       this.torchHotColor.setHex(0xffbe55);
       this.torchEmberColor.setHex(0xe8481c);
-      this.torchBaseIntensity = 10.5;
+      this.torchBaseIntensity = 11.5;
     }
 
+    if (this.scene.environment) {
+      this.scene.environmentIntensity = 0.26;
+    }
     if (this.ssaoPass) {
       this.ssaoPass.setAoStrength(0.55);
     }
@@ -830,6 +938,18 @@ export class SceneManager {
   }
 
   private getTargetZoom(state: GameState): number {
+    if (state.cinematic) {
+      return state.cinematic.targetZoom;
+    }
+    if (state.portalTransition) {
+      const pt = state.portalTransition;
+      if (pt.phase === 'entering') {
+        const zoomT = THREE.MathUtils.clamp((pt.elapsed - 0.3) / 0.85, 0, 1);
+        return 1.0 - 0.22 * zoomT;
+      }
+      const exitT = THREE.MathUtils.clamp(pt.elapsed / Math.max(0.05, pt.duration), 0, 1);
+      return 0.86 + 0.14 * exitT;
+    }
     if (state.zoneId === 'overworld') {
       const mode = state.ship.mode;
       if (mode === 'sailing') {
@@ -864,6 +984,13 @@ export class SceneManager {
 
     if (this.tiltShiftPass && this.tiltShiftPass.uniforms.uTime) {
       this.tiltShiftPass.uniforms.uTime.value = this.effectTime;
+    }
+    if (
+      this.heatDistortionPass &&
+      this.heatDistortionPass.enabled &&
+      this.heatDistortionPass.uniforms.uTime
+    ) {
+      this.heatDistortionPass.uniforms.uTime.value = this.effectTime;
     }
 
     this.updateDynamicTorches(this.effectTime);
@@ -916,13 +1043,26 @@ export class SceneManager {
     const zoomAlpha = 1 - Math.exp(-zoomRate * safeDt);
     this.currentZoom += (targetZoom - this.currentZoom) * zoomAlpha;
 
-    // Cible horizontale lissée : anticipation douce de vitesse en navigation & cadrage rivage à l'accostage
+    // Cible horizontale lissée : cinématique de boss, anticipation maritime ou joueur
     let focusX = state.player.x;
     let focusZ = state.player.z;
     let desiredLeadX = 0;
     let desiredLeadZ = 0;
 
-    if (state.zoneId === 'overworld') {
+    if (state.cinematic) {
+      focusX = state.cinematic.focusX;
+      focusZ = state.cinematic.focusZ;
+    } else if (state.portalTransition) {
+      const pt = state.portalTransition;
+      if (pt.phase === 'entering') {
+        const focusT = THREE.MathUtils.clamp((pt.elapsed - 0.15) / 0.9, 0, 1);
+        focusX = state.player.x + (pt.portalX - state.player.x) * focusT;
+        focusZ = state.player.z + (pt.portalZ - state.player.z) * focusT;
+      } else {
+        focusX = state.player.x;
+        focusZ = state.player.z;
+      }
+    } else if (state.zoneId === 'overworld') {
       if (state.ship.mode === 'sailing') {
         focusX = state.ship.position.x;
         focusZ = state.ship.position.z;
@@ -1110,6 +1250,12 @@ export class SceneManager {
     this.scene.remove(this.torchGroup);
 
     this.disposePostProcessing();
+    this.heatDistortionNormalMap = null;
+    if (this.envRenderTarget) {
+      this.scene.environment = null;
+      this.envRenderTarget.dispose();
+      this.envRenderTarget = null;
+    }
     this.renderer.dispose();
 
     if (this.domElement.parentNode === this.container) {

@@ -9,6 +9,7 @@ import { SPELL_ORDER } from '../data/spellsData';
 import {
   ALL_EQUIP_SLOTS,
   AUDIO_PREFS_STORAGE_KEY,
+  MAX_FORGE_UPGRADE_LEVEL,
   MAX_PLAYER_LEVEL,
   MAX_SPELL_LEVEL,
   OPTIONAL_EQUIP_SLOTS,
@@ -17,6 +18,8 @@ import {
   type AudioPrefs,
   type EnemyTypeId,
   type EquipSlot,
+  type ForgeUpgradeLevel,
+  type GameOptions,
   type GameState,
   type IslandId,
   type OwnedEquipment,
@@ -31,14 +34,79 @@ import {
   type SpellId,
   type StorageAdapter,
   type Vec2,
+  type WildlifeDensity,
 } from './types';
+
+export const DEFAULT_GAME_OPTIONS: GameOptions = {
+  wildlifeDensity: 'normal',
+};
+
+const VALID_WILDLIFE_DENSITIES: readonly WildlifeDensity[] = ['low', 'normal', 'high'];
+
+const LEGACY_REMOVED_SLOTS = new Set(['boots', 'gloves', 'trinket', 'secondary_weapon']);
+const LEGACY_REMOVED_ITEM_IDS = new Set([
+  'dagger_fang',
+  'trinket_yarn',
+  'boots_leather',
+  'boots_iron',
+  'boots_arcane',
+  'boots_dragon',
+  'gloves_leather',
+  'gloves_iron',
+  'gloves_arcane',
+  'gloves_dragon',
+]);
+
+function isLegacyRemovedEquipment(key: string, item?: Record<string, unknown>): boolean {
+  if (LEGACY_REMOVED_ITEM_IDS.has(key)) return true;
+  if (item && typeof item.id === 'string' && LEGACY_REMOVED_ITEM_IDS.has(item.id)) return true;
+  if (item && typeof item.slot === 'string' && LEGACY_REMOVED_SLOTS.has(item.slot)) return true;
+  return key.startsWith('boots_') || key.startsWith('gloves_') || key.startsWith('trinket_');
+}
 
 export type StorageLike = StorageAdapter;
 
 export const DEFAULT_AUDIO_PREFS: AudioPrefs = {
   muted: false,
-  volume: 0.7,
+  volume: 0.85,
+  master: 0.85,
+  music: 1,
+  sfx: 1,
+  ambience: 1,
 };
+
+function clampAudioUnit(value: unknown, fallback: number): number {
+  if (!isFiniteNumber(value)) return fallback;
+  return Math.max(0, Math.min(1, value));
+}
+
+/**
+ * Normalise et migre de façon rétrocompatible les préférences audio
+ * (ancien format `{ muted, volume }` -> 4 bus `{ muted, volume, master, music, sfx, ambience }`).
+ */
+export function normalizeAudioPrefs(raw: unknown): AudioPrefs {
+  if (!isPlainObject(raw)) return { ...DEFAULT_AUDIO_PREFS };
+  const hasMuted = typeof raw.muted === 'boolean';
+  const hasMaster = isFiniteNumber(raw.master);
+  const hasVolume = isFiniteNumber(raw.volume);
+  if (!hasMuted && !hasMaster && !hasVolume) {
+    return { ...DEFAULT_AUDIO_PREFS };
+  }
+  const master = hasMaster
+    ? clampAudioUnit(raw.master, DEFAULT_AUDIO_PREFS.master)
+    : hasVolume
+      ? clampAudioUnit(raw.volume, DEFAULT_AUDIO_PREFS.master)
+      : DEFAULT_AUDIO_PREFS.master;
+
+  return {
+    muted: hasMuted ? (raw.muted as boolean) : DEFAULT_AUDIO_PREFS.muted,
+    volume: master,
+    master,
+    music: clampAudioUnit(raw.music, DEFAULT_AUDIO_PREFS.music),
+    sfx: clampAudioUnit(raw.sfx, DEFAULT_AUDIO_PREFS.sfx),
+    ambience: clampAudioUnit(raw.ambience, DEFAULT_AUDIO_PREFS.ambience),
+  };
+}
 
 const VALID_QUEST_IDS: readonly QuestId[] = [
   'main_dragon_blood',
@@ -292,13 +360,17 @@ export function validateSaveData(raw: unknown): SaveData | null {
     ship = validatedShip;
   }
 
-  // Equipped (rétrocompatible avec anciennes sauvegardes v1/v2 sans boots/gloves/cape ou slots optionnels)
+  // Equipped (migration silencieuse v1/v2 : les anciens emplacements boots/gloves/trinket/secondary_weapon sont ignorés)
   if (!isPlainObject(rawPlayer.equipped)) return null;
   const equipped: Record<EquipSlot, string> = { ...STARTING_EQUIPMENT };
   for (const slot of ALL_EQUIP_SLOTS) {
     const rawId = rawPlayer.equipped[slot];
     if (rawId === undefined && OPTIONAL_EQUIP_SLOTS.includes(slot)) {
       equipped[slot] = '';
+      continue;
+    }
+    if (typeof rawId === 'string' && rawId !== '' && isLegacyRemovedEquipment(rawId)) {
+      equipped[slot] = STARTING_EQUIPMENT[slot];
       continue;
     }
     if (
@@ -315,9 +387,8 @@ export function validateSaveData(raw: unknown): SaveData | null {
   const inventory: Record<string, OwnedEquipment> = {};
   for (const [key, item] of Object.entries(rawPlayer.inventory)) {
     if (!isPlainObject(item)) return null;
-    // Migration douce : l'ancienne arme secondaire est abandonnée, le reste de
-    // l'inventaire et les autres emplacements sont conservés tels quels.
-    if (key === 'dagger_fang' || item.slot === 'secondary_weapon') continue;
+    // Migration silencieuse v1/v2 : retire proprement boots, gloves, trinket et secondary_weapon
+    if (isLegacyRemovedEquipment(key, item)) continue;
     if (
       typeof item.id !== 'string' ||
       item.id !== key ||
@@ -327,16 +398,29 @@ export function validateSaveData(raw: unknown): SaveData | null {
     ) {
       return null;
     }
+    let upgradeLevel: ForgeUpgradeLevel = 0;
+    if (item.upgradeLevel !== undefined) {
+      if (
+        !isFiniteNumber(item.upgradeLevel) ||
+        !Number.isInteger(item.upgradeLevel) ||
+        item.upgradeLevel < 0 ||
+        item.upgradeLevel > MAX_FORGE_UPGRADE_LEVEL
+      ) {
+        return null;
+      }
+      upgradeLevel = item.upgradeLevel as ForgeUpgradeLevel;
+    }
     inventory[item.id] = {
       id: item.id,
       level: Math.max(1, Math.floor(item.level)),
+      upgradeLevel,
     };
   }
   // Garantit que chaque objet équipé existe dans l'inventaire
   for (const slot of ALL_EQUIP_SLOTS) {
     const id = equipped[slot];
     if (id && !inventory[id]) {
-      inventory[id] = { id, level: 1 };
+      inventory[id] = { id, level: 1, upgradeLevel: 0 };
     }
   }
 
@@ -429,6 +513,23 @@ export function validateSaveData(raw: unknown): SaveData | null {
     return null;
   }
 
+  // Options (optionnel pour rétrocompatibilité v1/v2)
+  let options: Partial<GameOptions> | undefined;
+  if (raw.options !== undefined) {
+    if (!isPlainObject(raw.options)) return null;
+    if (raw.options.wildlifeDensity !== undefined) {
+      if (
+        typeof raw.options.wildlifeDensity !== 'string' ||
+        !VALID_WILDLIFE_DENSITIES.includes(raw.options.wildlifeDensity as WildlifeDensity)
+      ) {
+        return null;
+      }
+      options = { wildlifeDensity: raw.options.wildlifeDensity as WildlifeDensity };
+    } else {
+      options = {};
+    }
+  }
+
   return {
     version,
     timestamp: raw.timestamp,
@@ -446,6 +547,7 @@ export function validateSaveData(raw: unknown): SaveData | null {
     },
     islandId,
     ...(ship ? { ship } : {}),
+    ...(options ? { options } : {}),
     quests,
     trackedQuestId,
     openedChestIds,
@@ -466,7 +568,11 @@ export function validateSaveData(raw: unknown): SaveData | null {
 export function serializeGameState(state: GameState): SaveData {
   const inventoryCopy: Record<string, OwnedEquipment> = {};
   for (const [id, item] of Object.entries(state.player.inventory)) {
-    inventoryCopy[id] = { id: item.id, level: item.level };
+    inventoryCopy[id] = {
+      id: item.id,
+      level: item.level,
+      upgradeLevel: item.upgradeLevel ?? 0,
+    };
   }
 
   const questsCopy = {} as Record<QuestId, QuestProgress>;
@@ -577,6 +683,11 @@ export function serializeGameState(state: GameState): SaveData {
     openedChestIds: [...state.openedChestIds],
     defeatedBossIds: [...state.defeatedBossIds],
     runStats: { ...state.runStats },
+    options: {
+      wildlifeDensity: VALID_WILDLIFE_DENSITIES.includes(state.options?.wildlifeDensity)
+        ? state.options.wildlifeDensity
+        : DEFAULT_GAME_OPTIONS.wildlifeDensity,
+    },
   };
 }
 
@@ -638,21 +749,16 @@ export function deleteSaveData(storage?: StorageLike | null): boolean {
 }
 
 /**
- * Sauvegarde les préférences audio sous `felingard_audio_prefs_v1`.
+ * Sauvegarde les préférences audio 4-bus sous `felingard_audio_prefs_v1`.
  */
 export function saveAudioPrefs(
-  prefs: AudioPrefs,
+  prefs: Partial<AudioPrefs> & { muted: boolean },
   storage?: StorageLike | null,
 ): boolean {
   const store = resolveStorage(storage);
   if (!store) return false;
   try {
-    const sanitized: AudioPrefs = {
-      muted: Boolean(prefs.muted),
-      volume: isFiniteNumber(prefs.volume)
-        ? Math.max(0, Math.min(1, prefs.volume))
-        : DEFAULT_AUDIO_PREFS.volume,
-    };
+    const sanitized = normalizeAudioPrefs(prefs);
     store.setItem(AUDIO_PREFS_STORAGE_KEY, JSON.stringify(sanitized));
     return true;
   } catch {
@@ -661,7 +767,7 @@ export function saveAudioPrefs(
 }
 
 /**
- * Charge les préférences audio avec fallback propre si absent ou corrompu.
+ * Charge les préférences audio avec migration transparente v1 et fallback propre.
  */
 export function loadAudioPrefs(storage?: StorageLike | null): AudioPrefs {
   const store = resolveStorage(storage);
@@ -671,13 +777,10 @@ export function loadAudioPrefs(storage?: StorageLike | null): AudioPrefs {
     if (!rawStr) return { ...DEFAULT_AUDIO_PREFS };
     const parsed: unknown = JSON.parse(rawStr);
     if (!isPlainObject(parsed)) return { ...DEFAULT_AUDIO_PREFS };
-    if (typeof parsed.muted !== 'boolean' || !isFiniteNumber(parsed.volume)) {
+    if (typeof parsed.muted !== 'boolean') {
       return { ...DEFAULT_AUDIO_PREFS };
     }
-    return {
-      muted: parsed.muted,
-      volume: Math.max(0, Math.min(1, parsed.volume)),
-    };
+    return normalizeAudioPrefs(parsed);
   } catch {
     return { ...DEFAULT_AUDIO_PREFS };
   }

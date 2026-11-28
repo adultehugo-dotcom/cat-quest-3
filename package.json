@@ -5,10 +5,11 @@
   "description": "Prototype Action-RPG 2.5D inspiré de Cat Quest — Les Chroniques de Félingard",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port=3000 --host=0.0.0.0",
     "start": "vite --host 127.0.0.1 --open",
     "build": "vite build",
     "preview": "vite preview",
+    "lint": "tsc --noEmit",
     "test": "vitest"
   },
   "dependencies": {

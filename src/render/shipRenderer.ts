@@ -1826,6 +1826,30 @@ function buildWindStreaksGeometry(): THREE.BufferGeometry {
 // Classe principale ShipRenderer
 // ============================================================================
 
+export function computeShipBowLanternLevel(
+  weather?: {
+    dayPhase?: string;
+    lanternBoost?: number;
+    stormIntensity?: number;
+    nightFactor?: number;
+  } | null,
+): number {
+  if (!weather) return 0;
+  const phaseBoost =
+    weather.dayPhase === 'night'
+      ? 0.95
+      : weather.dayPhase === 'dusk'
+        ? 0.62
+        : 0;
+  const raw = Math.max(
+    weather.lanternBoost ?? 0,
+    phaseBoost,
+    (weather.stormIntensity ?? 0) * 0.92,
+    (weather.nightFactor ?? 0) * 0.95,
+  );
+  return Math.max(0, Math.min(1, raw));
+}
+
 export class ShipRenderer {
   private readonly scene: THREE.Scene;
   private readonly rootGroup = new THREE.Group();
@@ -1834,6 +1858,7 @@ export class ShipRenderer {
   private readonly sailRigGroup = new THREE.Group();
   private readonly rudderPivot = new THREE.Group();
   private readonly lanternPivot = new THREE.Group();
+  private readonly bowLanternPivot = new THREE.Group();
 
   // Ancres de pont exactes (lues par EntityRenderer via getDeckAnchors())
   private readonly heroSeatAnchor = new THREE.Object3D();
@@ -1853,6 +1878,8 @@ export class ShipRenderer {
   private readonly windStreakMat: THREE.ShaderMaterial;
   private readonly lanternGlowMat: THREE.MeshStandardMaterial;
   private readonly lanternLight: THREE.PointLight;
+  private readonly bowLanternGlowMat: THREE.MeshStandardMaterial;
+  private readonly bowLanternLight: THREE.PointLight;
   private readonly sprayMat: THREE.MeshBasicMaterial;
   private readonly tmpColor = new THREE.Color();
 
@@ -2136,6 +2163,46 @@ export class ShipRenderer {
     this.lanternPivot.add(this.lanternLight);
 
     this.shipMotionGroup.add(this.lanternPivot);
+
+    // 7b. Lanterne de proue suspendue au beaupré (s'allume au crépuscule, la nuit et par temps d'orage)
+    const bowBracketGeo = this.track(new THREE.CylinderGeometry(0.022, 0.026, 0.24, 6));
+    bowBracketGeo.rotateX(Math.PI * 0.34);
+    const bowBracketMesh = new THREE.Mesh(bowBracketGeo, brassMat);
+    bowBracketMesh.name = 'ShipBowLanternBracket';
+    bowBracketMesh.position.set(0, DECK_Y + 0.84, -2.86);
+    this.shipMotionGroup.add(bowBracketMesh);
+
+    this.bowLanternPivot.name = 'ShipBowLanternPivot';
+    this.bowLanternPivot.position.set(0, DECK_Y + 0.78, -2.95);
+
+    const bowLanternFrameMesh = new THREE.Mesh(lanternFrameGeo, brassMat);
+    bowLanternFrameMesh.name = 'ShipBowLanternFrame';
+    bowLanternFrameMesh.castShadow = false;
+    bowLanternFrameMesh.scale.setScalar(0.9);
+    this.bowLanternPivot.add(bowLanternFrameMesh);
+
+    this.bowLanternGlowMat = this.track(
+      new THREE.MeshStandardMaterial({
+        color: 0xffe49c,
+        emissive: new THREE.Color(0xffaa38),
+        emissiveIntensity: 0.15,
+        roughness: 0.25,
+        metalness: 0.1,
+      }),
+    );
+    const bowLanternGlassMesh = new THREE.Mesh(lanternGlassGeo, this.bowLanternGlowMat);
+    bowLanternGlassMesh.name = 'ShipBowLanternGlow';
+    bowLanternGlassMesh.scale.setScalar(0.9);
+    bowLanternGlassMesh.userData.skipSSAO = true;
+    this.bowLanternPivot.add(bowLanternGlassMesh);
+
+    this.bowLanternLight = new THREE.PointLight(0xffb454, 0, 14, 1.55);
+    this.bowLanternLight.name = 'ShipBowLanternLight';
+    this.bowLanternLight.position.set(0, -0.2, 0);
+    this.bowLanternLight.castShadow = false;
+    this.bowLanternPivot.add(this.bowLanternLight);
+
+    this.shipMotionGroup.add(this.bowLanternPivot);
 
     // 8. Ancres locales exactes du Héros & de Miaou-sprit sur le pont
     this.heroSeatAnchor.name = 'ShipHeroSeatAnchor';
@@ -2811,12 +2878,20 @@ export class ShipRenderer {
     this.lanternSwingZ += (lanternTargetZ - this.lanternSwingZ) * lanAlpha;
     this.lanternSwingX += (lanternTargetX - this.lanternSwingX) * lanAlpha;
     this.lanternPivot.rotation.set(this.lanternSwingX, 0, this.lanternSwingZ);
+    this.bowLanternPivot.rotation.set(this.lanternSwingX * 1.15, 0, this.lanternSwingZ * 1.15);
 
     const lanternBoost = weather ? weather.lanternBoost : 0;
+    const bowBoost = computeShipBowLanternLevel(weather);
     const flicker =
       Math.sin(this.animTime * 6.8) * 0.1 + Math.sin(this.animTime * 13.4) * 0.04;
     this.lanternGlowMat.emissiveIntensity = 1.48 + lanternBoost * 0.72 + flicker;
     this.lanternLight.intensity = lanternBoost > 0.04 ? lanternBoost * (4.6 + flicker * 1.6) : 0;
+
+    this.bowLanternGlowMat.emissiveIntensity =
+      bowBoost > 0.04 ? 1.45 + bowBoost * 0.85 + flicker : 0.12;
+    this.bowLanternLight.intensity =
+      bowBoost > 0.04 ? bowBoost * (4.8 + flicker * 1.6) : 0;
+    this.bowLanternLight.visible = bowBoost > 0.04;
 
     // 6. Mise à jour des matrices monde et export des ancres de pont pour EntityRenderer
     this.shipYawGroup.updateMatrixWorld(true);

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 import {
+  CANONICAL_16_SPRITESHEETS,
   ENEMY_ANIM_CLIPS,
   HD_CAPE_FABRIC_FILES,
   HD_CHARACTER_FILES,
@@ -26,6 +27,7 @@ import {
   createSpriteUvRect,
   resolveActiveSpriteGrid,
   resolveEnemyAtlasStateGrid,
+  resolveEnemySixStateGrid,
   sampleOneShotProgressFrame,
 } from '../src/art/hdAssets';
 import {
@@ -307,25 +309,19 @@ describe('Parcours de Grille Multi-Lignes (col, row) & Paramètres UV Three.js Z
 });
 
 describe('Couches Modulaires Indépendantes du Héros & Intégrité de la Cape Verlet', () => {
-  it('maintient exactement 8 emplacements indépendants sans arme secondaire et isole la cape du cache corps 3D', () => {
+  it('maintient exactement 5 emplacements indépendants sans arme secondaire et isole la cape du cache corps 3D', () => {
     expect(ALL_EQUIP_SLOTS).toEqual([
       'weapon',
       'shield',
       'helmet',
       'armor',
-      'boots',
-      'gloves',
       'cape',
-      'trinket',
     ]);
     expect(HERO_BODY_EQUIP_SLOTS).toEqual([
       'weapon',
       'shield',
       'helmet',
       'armor',
-      'boots',
-      'gloves',
-      'trinket',
     ]);
     expect((ALL_EQUIP_SLOTS as readonly string[]).includes('secondary_weapon')).toBe(false);
     expect(EQUIPMENT['dagger_fang']).toBeUndefined();
@@ -340,9 +336,8 @@ describe('Couches Modulaires Indépendantes du Héros & Intégrité de la Cape V
       'cape_starlight',
       'cape_dragon',
       'shield_knight',
-      'boots_iron',
-      'gloves_arcane',
-      'trinket_yarn',
+      'hammer_frost',
+      'bow_hunter',
       'blade_dragon',
     ]) {
       addEquipment(p, id);
@@ -611,6 +606,8 @@ describe('Rétrocompatibilité 100 % Transparente avec public/assets/ (Zéro 404
       expect(resolved).toMatchObject({ cols: 1, rows: 1, frameCount: 1 });
     }
 
+    expect(HERO_ANIM_CLIPS.walk.frameSequenceKeys).toBeUndefined();
+
     const allEnemies: readonly HdEnemySheetKey[] = [
       'slime_yarn',
       'mouse_goblin',
@@ -621,35 +618,51 @@ describe('Rétrocompatibilité 100 % Transparente avec public/assets/ (Zéro 404
       'boss_dragon_claw',
     ];
     for (const enemyId of allEnemies) {
+      const spec = CANONICAL_16_SPRITESHEETS[enemyId];
       const size = readPngHeaderSize(HD_ENEMY_SHEET_FILES[enemyId]);
-      expect(size).toEqual({ width: 1024, height: 256 });
+      expect(size).toEqual({
+        width: spec.cols * spec.cellWidth,
+        height: spec.rows * spec.cellHeight,
+      });
       expect(ENEMY_ANIM_CLIPS[enemyId].idle.fps).toBe(30);
       expect(ENEMY_ANIM_CLIPS[enemyId].windup.loop).toBe(false);
       expect(ENEMY_ANIM_CLIPS[enemyId].attack.loop).toBe(false);
 
-      expect(resolveEnemyAtlasStateGrid(enemyId, 'idle', size.width, size.height)).toMatchObject({
-        cols: 4,
-        rows: 1,
-        frameCount: 1,
+      expect(resolveEnemySixStateGrid(enemyId, 'idle', size.width, size.height)).toMatchObject({
+        cols: 10,
+        rows: 9,
+        frameCount: 15,
         startFrame: 0,
       });
-      expect(resolveEnemyAtlasStateGrid(enemyId, 'move', size.width, size.height)).toMatchObject({
-        cols: 4,
-        rows: 1,
-        frameCount: 1,
-        startFrame: 1,
+      expect(resolveEnemySixStateGrid(enemyId, 'move', size.width, size.height)).toMatchObject({
+        cols: 10,
+        rows: 9,
+        frameCount: 15,
+        startFrame: 15,
       });
-      expect(resolveEnemyAtlasStateGrid(enemyId, 'windup', size.width, size.height)).toMatchObject({
-        cols: 4,
-        rows: 1,
-        frameCount: 1,
-        startFrame: 2,
+      expect(resolveEnemySixStateGrid(enemyId, 'windup', size.width, size.height)).toMatchObject({
+        cols: 10,
+        rows: 9,
+        frameCount: 15,
+        startFrame: 30,
       });
-      expect(resolveEnemyAtlasStateGrid(enemyId, 'attack', size.width, size.height)).toMatchObject({
-        cols: 4,
-        rows: 1,
-        frameCount: 1,
-        startFrame: 3,
+      expect(resolveEnemySixStateGrid(enemyId, 'attack', size.width, size.height)).toMatchObject({
+        cols: 10,
+        rows: 9,
+        frameCount: 15,
+        startFrame: 45,
+      });
+      expect(resolveEnemySixStateGrid(enemyId, 'hurt', size.width, size.height)).toMatchObject({
+        cols: 10,
+        rows: 9,
+        frameCount: 15,
+        startFrame: 60,
+      });
+      expect(resolveEnemySixStateGrid(enemyId, 'death', size.width, size.height)).toMatchObject({
+        cols: 10,
+        rows: 9,
+        frameCount: 15,
+        startFrame: 75,
       });
     }
   });

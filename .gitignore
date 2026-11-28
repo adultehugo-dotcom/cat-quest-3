@@ -1,5 +1,7 @@
-﻿node_modules/
+node_modules/
 dist/
+graphify-out/
+.aistudio/artifacts/
 .vite/
 asset-library/_zips/
 *.log

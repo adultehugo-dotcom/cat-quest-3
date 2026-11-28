@@ -12,6 +12,8 @@ import { getSpellDefinition, getSpellUpgradeCost } from '../data/spellsData';
 import { OVERWORLD_DATA } from '../data/worldData';
 import {
   ALL_EQUIP_SLOTS,
+  FORGE_UPGRADE_MULTIPLIERS,
+  MAX_FORGE_UPGRADE_LEVEL,
   MAX_PLAYER_LEVEL,
   MAX_SPELL_LEVEL,
   MYSTERY_CHEST_COST,
@@ -20,8 +22,10 @@ import {
   type EquipSlot,
   type EquipmentDefinition,
   type EquipmentStatBonuses,
+  type ForgeUpgradeLevel,
   type GameEvent,
   type MysteryChestResult,
+  type OwnedEquipment,
   type PlayerState,
   type PlayerStats,
   type Rarity,
@@ -44,6 +48,25 @@ export interface AddEquipmentResult {
   rarity: Rarity;
   isUpgrade: boolean;
   newLevel: number;
+}
+
+export interface EquipmentUpgradeResult {
+  success: boolean;
+  itemId: string;
+  previousUpgradeLevel: ForgeUpgradeLevel;
+  newUpgradeLevel: ForgeUpgradeLevel;
+  isMaxUpgrade: boolean;
+  cost: number;
+  reason?: 'not_owned' | 'unknown_item' | 'max_upgrade' | 'insufficient_gold';
+}
+
+export interface EquipmentPurchaseResult {
+  success: boolean;
+  itemId: string;
+  cost: number;
+  isUpgrade: boolean;
+  newLevel: number;
+  reason?: 'unknown_item' | 'not_for_sale' | 'insufficient_gold';
 }
 
 export interface SpellUpgradeResult {
@@ -84,29 +107,52 @@ export function getBasePlayerStats(level: number): BaseHeroStats {
   };
 }
 
-/**
- * Scaling d'une stat entière d'équipement au niveau L :
- * Math.round(base * (1 + 0.25 * (L - 1)))
- */
-export function scaleEquipmentStat(base: number, level: number): number {
-  const l = Math.max(1, Math.floor(level));
-  return Math.round(base * (1 + 0.25 * (l - 1)));
+export function clampForgeUpgradeLevel(level: number | undefined): ForgeUpgradeLevel {
+  const n = Math.max(0, Math.min(MAX_FORGE_UPGRADE_LEVEL, Math.floor(level ?? 0)));
+  return n as ForgeUpgradeLevel;
+}
+
+export function isMaxUpgrade(
+  target: Pick<OwnedEquipment, 'upgradeLevel'> | ForgeUpgradeLevel | number,
+): boolean {
+  const raw = typeof target === 'number' ? target : (target.upgradeLevel ?? 0);
+  return clampForgeUpgradeLevel(raw) >= MAX_FORGE_UPGRADE_LEVEL;
 }
 
 /**
- * Scaling d'une stat fractionnaire (ex: critChance = 0.03) au niveau L.
+ * Scaling d'une stat entière d'équipement au niveau L et palier de Forge U (+0..+3) :
+ * Math.round(base * (1 + 0.25 * (L - 1)) * FORGE_UPGRADE_MULTIPLIERS[U])
  */
-export function scaleEquipmentFraction(base: number, level: number): number {
+export function scaleEquipmentStat(
+  base: number,
+  level: number,
+  upgradeLevel: ForgeUpgradeLevel | number = 0,
+): number {
   const l = Math.max(1, Math.floor(level));
-  return Math.round(base * (1 + 0.25 * (l - 1)) * 10000) / 10000;
+  const u = clampForgeUpgradeLevel(upgradeLevel);
+  return Math.round(base * (1 + 0.25 * (l - 1)) * FORGE_UPGRADE_MULTIPLIERS[u]);
 }
 
 /**
- * Calcule les bonus agrégés d'un équipement donné à un niveau L.
+ * Scaling d'une stat fractionnaire (ex: critChance = 0.03) au niveau L et palier de Forge U.
+ */
+export function scaleEquipmentFraction(
+  base: number,
+  level: number,
+  upgradeLevel: ForgeUpgradeLevel | number = 0,
+): number {
+  const l = Math.max(1, Math.floor(level));
+  const u = clampForgeUpgradeLevel(upgradeLevel);
+  return Math.round(base * (1 + 0.25 * (l - 1)) * FORGE_UPGRADE_MULTIPLIERS[u] * 10000) / 10000;
+}
+
+/**
+ * Calcule les bonus agrégés d'un équipement donné à un niveau L et palier de Forge U.
  */
 export function getScaledEquipmentStats(
   itemId: string,
   level: number,
+  upgradeLevel: ForgeUpgradeLevel | number = 0,
 ): Required<EquipmentStatBonuses> {
   const def = getEquipmentDefinition(itemId);
   if (!def) {
@@ -114,17 +160,17 @@ export function getScaledEquipmentStats(
   }
   const b = def.baseStats;
   return {
-    atk: b.atk ? scaleEquipmentStat(b.atk, level) : 0,
-    mag: b.mag ? scaleEquipmentStat(b.mag, level) : 0,
-    def: b.def ? scaleEquipmentStat(b.def, level) : 0,
-    hp: b.hp ? scaleEquipmentStat(b.hp, level) : 0,
-    mp: b.mp ? scaleEquipmentStat(b.mp, level) : 0,
-    critChance: b.critChance ? scaleEquipmentFraction(b.critChance, level) : 0,
+    atk: b.atk ? scaleEquipmentStat(b.atk, level, upgradeLevel) : 0,
+    mag: b.mag ? scaleEquipmentStat(b.mag, level, upgradeLevel) : 0,
+    def: b.def ? scaleEquipmentStat(b.def, level, upgradeLevel) : 0,
+    hp: b.hp ? scaleEquipmentStat(b.hp, level, upgradeLevel) : 0,
+    mp: b.mp ? scaleEquipmentStat(b.mp, level, upgradeLevel) : 0,
+    critChance: b.critChance ? scaleEquipmentFraction(b.critChance, level, upgradeLevel) : 0,
   };
 }
 
 /**
- * Calcule les statistiques totales du joueur (base niveau + 3 slots équipés).
+ * Calcule les statistiques totales du joueur (base niveau + 5 emplacements équipés).
  */
 export function computeAggregatedStats(player: PlayerState): {
   maxHp: number;
@@ -144,7 +190,8 @@ export function computeAggregatedStats(player: PlayerState): {
     if (!itemId) continue;
     const owned = player.inventory[itemId];
     const itemLevel = owned ? owned.level : 1;
-    const bonus = getScaledEquipmentStats(itemId, itemLevel);
+    const upgradeLevel = owned ? clampForgeUpgradeLevel(owned.upgradeLevel) : 0;
+    const bonus = getScaledEquipmentStats(itemId, itemLevel, upgradeLevel);
     maxHp += bonus.hp;
     maxMp += bonus.mp;
     atk += bonus.atk;
@@ -198,14 +245,11 @@ export function createInitialPlayerState(
     gold: 0,
     equipped: { ...STARTING_EQUIPMENT },
     inventory: {
-      [STARTING_EQUIPMENT.weapon]: { id: STARTING_EQUIPMENT.weapon, level: 1 },
-      [STARTING_EQUIPMENT.helmet]: { id: STARTING_EQUIPMENT.helmet, level: 1 },
-      [STARTING_EQUIPMENT.armor]: { id: STARTING_EQUIPMENT.armor, level: 1 },
-      boots_leather: { id: 'boots_leather', level: 1 },
-      gloves_leather: { id: 'gloves_leather', level: 1 },
-      cape_traveler: { id: 'cape_traveler', level: 1 },
-      shield_wood: { id: 'shield_wood', level: 1 },
-      trinket_yarn: { id: 'trinket_yarn', level: 1 },
+      [STARTING_EQUIPMENT.weapon]: { id: STARTING_EQUIPMENT.weapon, level: 1, upgradeLevel: 0 },
+      [STARTING_EQUIPMENT.helmet]: { id: STARTING_EQUIPMENT.helmet, level: 1, upgradeLevel: 0 },
+      [STARTING_EQUIPMENT.armor]: { id: STARTING_EQUIPMENT.armor, level: 1, upgradeLevel: 0 },
+      cape_traveler: { id: 'cape_traveler', level: 1, upgradeLevel: 0 },
+      shield_wood: { id: 'shield_wood', level: 1, upgradeLevel: 0 },
     },
     spellLevels: {
       flamepurr: 1,
@@ -245,6 +289,8 @@ export function createInitialPlayerState(
     knockbackVx: 0,
     knockbackVz: 0,
     lastMeleeAngle: 0,
+    activeStatuses: [],
+    perfectDodgeBuffTimer: 0,
   };
 
   recalculatePlayerStats(player);
@@ -271,7 +317,14 @@ export function grantXp(
     return { leveledUp: false, levelsGained: 0, newLevel: player.level };
   }
 
-  player.xp += Math.round(amount);
+  const roundedXp = Math.round(amount);
+  player.xp += roundedXp;
+  events?.push({
+    type: 'xp_pickup',
+    x: player.x,
+    z: player.z,
+    value: roundedXp,
+  });
   let levelsGained = 0;
 
   while (player.level < MAX_PLAYER_LEVEL && player.xp >= player.xpToNext) {
@@ -340,7 +393,7 @@ export function addEquipment(
     };
   }
 
-  player.inventory[itemId] = { id: def.id, level: 1 };
+  player.inventory[itemId] = { id: def.id, level: 1, upgradeLevel: 0 };
   events?.push({
     type: 'toast',
     x: player.x,
@@ -372,7 +425,7 @@ export function equipItem(player: PlayerState, itemId: string): boolean {
 }
 
 /**
- * Retire l'équipement d'un emplacement optionnel (bottes, gants, cape, bouclier, arme secondaire, accessoire).
+ * Retire l'équipement d'un emplacement optionnel (bouclier ou cape).
  */
 export function unequipSlot(player: PlayerState, slot: EquipSlot): boolean {
   if (!OPTIONAL_EQUIP_SLOTS.includes(slot)) return false;
@@ -493,5 +546,191 @@ export function upgradeSpell(
     spellId,
     newLevel,
     cost,
+  };
+}
+
+const FORGE_BASE_COST_BY_RARITY: Readonly<Record<Rarity, number>> = {
+  common: 90,
+  rare: 150,
+  epic: 240,
+};
+
+const FORGE_STEP_MULTIPLIERS: readonly [number, number, number] = [1, 2, 3.5];
+
+/**
+ * Coût progressif en or pour forger un équipement du palier U vers U+1 (0->1, 1->2, 2->3).
+ */
+export function getEquipmentUpgradeCost(
+  itemId: string,
+  currentUpgradeLevel: ForgeUpgradeLevel | number,
+): number {
+  const clamped = clampForgeUpgradeLevel(currentUpgradeLevel);
+  if (clamped >= MAX_FORGE_UPGRADE_LEVEL) {
+    return 0;
+  }
+  const def = getEquipmentDefinition(itemId);
+  const rarity: Rarity = def?.rarity ?? 'common';
+  const base = FORGE_BASE_COST_BY_RARITY[rarity];
+  const stepMult = FORGE_STEP_MULTIPLIERS[clamped as 0 | 1 | 2];
+  return Math.round(base * stepMult);
+}
+
+/**
+ * Améliore un équipement possédé à la Forge de Kit-Chat (+1 -> +2 -> +3).
+ */
+export function upgradeEquipment(
+  player: PlayerState,
+  itemId: string,
+  events?: GameEvent[],
+): EquipmentUpgradeResult {
+  const def = getEquipmentDefinition(itemId);
+  if (!def) {
+    return {
+      success: false,
+      itemId,
+      previousUpgradeLevel: 0,
+      newUpgradeLevel: 0,
+      isMaxUpgrade: false,
+      cost: 0,
+      reason: 'unknown_item',
+    };
+  }
+
+  const owned = player.inventory[itemId];
+  if (!owned) {
+    return {
+      success: false,
+      itemId,
+      previousUpgradeLevel: 0,
+      newUpgradeLevel: 0,
+      isMaxUpgrade: false,
+      cost: 0,
+      reason: 'not_owned',
+    };
+  }
+
+  const currentUpgrade = clampForgeUpgradeLevel(owned.upgradeLevel);
+  if (isMaxUpgrade(currentUpgrade)) {
+    return {
+      success: false,
+      itemId,
+      previousUpgradeLevel: currentUpgrade,
+      newUpgradeLevel: currentUpgrade,
+      isMaxUpgrade: true,
+      cost: 0,
+      reason: 'max_upgrade',
+    };
+  }
+
+  const cost = getEquipmentUpgradeCost(itemId, currentUpgrade);
+  if (player.gold < cost) {
+    return {
+      success: false,
+      itemId,
+      previousUpgradeLevel: currentUpgrade,
+      newUpgradeLevel: currentUpgrade,
+      isMaxUpgrade: false,
+      cost,
+      reason: 'insufficient_gold',
+    };
+  }
+
+  player.gold -= cost;
+  const nextUpgrade = (currentUpgrade + 1) as ForgeUpgradeLevel;
+  owned.upgradeLevel = nextUpgrade;
+  recalculatePlayerStats(player);
+
+  events?.push({
+    type: 'forge_upgraded',
+    x: player.x,
+    z: player.z,
+    itemId: def.id,
+    itemLevel: owned.level,
+    upgradeLevel: nextUpgrade,
+    value: cost,
+    text: `${def.name} forgé +${nextUpgrade} !`,
+  });
+
+  return {
+    success: true,
+    itemId: def.id,
+    previousUpgradeLevel: currentUpgrade,
+    newUpgradeLevel: nextUpgrade,
+    isMaxUpgrade: nextUpgrade >= MAX_FORGE_UPGRADE_LEVEL,
+    cost,
+  };
+}
+
+/**
+ * Achète une arme à l'armurerie de Kit-Chat contre de l'or.
+ */
+export function buyEquipment(
+  player: PlayerState,
+  itemId: string,
+  events?: GameEvent[],
+): EquipmentPurchaseResult {
+  const def = getEquipmentDefinition(itemId);
+  if (!def) {
+    return {
+      success: false,
+      itemId,
+      cost: 0,
+      isUpgrade: false,
+      newLevel: 0,
+      reason: 'unknown_item',
+    };
+  }
+  const price = def.shopPrice ?? 0;
+  if (price <= 0) {
+    return {
+      success: false,
+      itemId,
+      cost: 0,
+      isUpgrade: false,
+      newLevel: 0,
+      reason: 'not_for_sale',
+    };
+  }
+  if (player.gold < price) {
+    return {
+      success: false,
+      itemId,
+      cost: price,
+      isUpgrade: false,
+      newLevel: player.inventory[itemId]?.level ?? 0,
+      reason: 'insufficient_gold',
+    };
+  }
+
+  player.gold -= price;
+  const added = addEquipment(player, def.id, events);
+  if (!added) {
+    player.gold += price;
+    return {
+      success: false,
+      itemId,
+      cost: price,
+      isUpgrade: false,
+      newLevel: 0,
+      reason: 'unknown_item',
+    };
+  }
+
+  events?.push({
+    type: 'equipment_purchased',
+    x: player.x,
+    z: player.z,
+    itemId: def.id,
+    itemLevel: added.newLevel,
+    value: price,
+    text: `${def.name} acquis à l'Armurerie !`,
+  });
+
+  return {
+    success: true,
+    itemId: def.id,
+    cost: price,
+    isUpgrade: added.isUpgrade,
+    newLevel: added.newLevel,
   };
 }

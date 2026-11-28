@@ -10,24 +10,28 @@ export const AUDIO_PREFS_STORAGE_KEY = 'felingard_audio_prefs_v1';
 export const MYSTERY_CHEST_COST = 120;
 export const MAX_PLAYER_LEVEL = 10;
 export const MAX_SPELL_LEVEL = 5;
+export const MAX_FORGE_UPGRADE_LEVEL = 3 as const;
+
+export type ForgeUpgradeLevel = 0 | 1 | 2 | 3;
+
+export const FORGE_UPGRADE_MULTIPLIERS: Readonly<Record<ForgeUpgradeLevel, number>> = {
+  0: 1.0,
+  1: 1.15,
+  2: 1.32,
+  3: 1.55,
+};
 
 export const ALL_EQUIP_SLOTS: readonly EquipSlot[] = [
   'weapon',
   'shield',
   'helmet',
   'armor',
-  'boots',
-  'gloves',
   'cape',
-  'trinket',
 ];
 
 export const OPTIONAL_EQUIP_SLOTS: readonly EquipSlot[] = [
   'shield',
-  'boots',
-  'gloves',
   'cape',
-  'trinket',
 ];
 
 export const STARTING_EQUIPMENT: Record<EquipSlot, string> = {
@@ -35,10 +39,7 @@ export const STARTING_EQUIPMENT: Record<EquipSlot, string> = {
   shield: '',
   helmet: 'helm_bandana',
   armor: 'armor_tunic',
-  boots: '',
-  gloves: '',
   cape: '',
-  trinket: '',
 };
 
 // --- Types de base (Section 3 du cahier des charges) ---
@@ -72,13 +73,27 @@ export type EquipSlot =
   | 'shield'
   | 'helmet'
   | 'armor'
-  | 'boots'
-  | 'gloves'
-  | 'cape'
-  | 'trinket';
+  | 'cape';
 export type Rarity = 'common' | 'rare' | 'epic';
 
 export type TelegraphShape = 'circle' | 'cone' | 'line' | 'ring';
+export type TelegraphElement = 'physical' | 'frost' | 'fire' | 'poison' | 'spectral';
+export type EnemySkillBehavior =
+  | 'standard'
+  | 'slime_splatter'
+  | 'goblin_dagger_throw'
+  | 'thorn_burst'
+  | 'boomerang_bone'
+  | 'ice_spikes_wave'
+  | 'cheese_wheel'
+  | 'toxic_miasma'
+  | 'homing_orb'
+  | 'spectral_scythe'
+  | 'abyssal_fissure'
+  | 'flame_jet_sweep'
+  | 'meteor_rain'
+  | 'thermal_shockwave'
+  | 'inferno_cross';
 
 export type ShipSlot =
   | 'coque'
@@ -228,11 +243,22 @@ export interface TelegraphZone {
   damage: number;
   color?: string;
   resolved: boolean;
+  patternId?: string;
+  ownerTypeId?: EnemyTypeId;
+  statusProc?: WeaponStatusProc;
+  perfectDodged?: boolean;
+  delaySec?: number;
+  element?: TelegraphElement;
+  skillBehavior?: EnemySkillBehavior;
+  sweepProgress?: number;
+  sweepStartAngle?: number;
+  sweepEndAngle?: number;
 }
 
 export interface OwnedEquipment {
   id: string;
   level: number; // commence à 1, +1 à chaque doublon obtenu
+  upgradeLevel: ForgeUpgradeLevel; // amélioration Forge de Kit-Chat (0 à +3)
 }
 
 export interface PlayerStats {
@@ -282,10 +308,15 @@ export interface PlayerState {
   knockbackVx?: number;
   knockbackVz?: number;
   lastMeleeAngle?: number;
+  lastMeleeWeaponId?: string;
   /** Élévation monde Y (pont du bateau ou saut parabolique embarquement/débarquement) */
   elevationY?: number;
   /** Vrai lorsque le personnage se tient sur le pont du voilier */
   onShipDeck?: boolean;
+  /** Effets de statut actifs (Phase 3) */
+  activeStatuses?: ActiveStatusEffect[];
+  /** Durée restante du bonus d'attaque +35 % après une esquive parfaite */
+  perfectDodgeBuffTimer?: number;
 }
 
 export type EnemyTypeId =
@@ -297,7 +328,7 @@ export type EnemyTypeId =
   | 'boss_rat_king'
   | 'boss_dragon_claw';
 
-export type EnemyAIState = 'idle' | 'chase' | 'windup' | 'recover' | 'dead';
+export type EnemyAIState = 'idle' | 'chase' | 'windup' | 'recover' | 'staggered' | 'dead';
 
 export interface EnemyInstance {
   id: string;
@@ -330,6 +361,22 @@ export interface EnemyInstance {
   activeLungeAngle?: number;
   activeLungeDist?: number;
   aggroed?: boolean;
+  // Phase 3 : Statuts & Posture/Stagger
+  activeStatuses?: ActiveStatusEffect[];
+  stagger?: number;
+  maxStagger?: number;
+  staggeredTimer?: number;
+  staggerDecayDelay?: number;
+  // Phase 4 : Projection de mort, intro boss & souffles continus
+  deathTimer?: number;
+  deathDuration?: number;
+  introPlayed?: boolean;
+  activeSweepStartAngle?: number;
+  activeSweepEndAngle?: number;
+  activeSweepElapsed?: number;
+  activeSweepDuration?: number;
+  activeSweepTickAccum?: number;
+  activeSweepPatternId?: string;
 }
 
 export type QuestId = 'main_dragon_blood' | 'side_yarn_hunt' | 'side_lost_blade';
@@ -347,11 +394,18 @@ export type GameEventType =
   | 'hit_enemy'
   | 'hit_player'
   | 'enemy_died'
+  | 'enemy_telegraph'
+  | 'footstep'
+  | 'low_hp_alert'
   | 'spell_cast'
   | 'dodge_roll'
   | 'level_up'
   | 'chest_opened'
+  | 'gold_pickup'
+  | 'xp_pickup'
   | 'item_upgraded'
+  | 'forge_upgraded'
+  | 'equipment_purchased'
   | 'quest_updated'
   | 'quest_completed'
   | 'zone_transition'
@@ -368,7 +422,29 @@ export type GameEventType =
   | 'ship_boarded'
   | 'ship_docking'
   | 'ship_disembarked'
-  | 'ship_refused';
+  | 'ship_refused'
+  | 'chest_opening_start'
+  | 'starfall_impact'
+  | 'portal_enter'
+  | 'portal_exit'
+  | 'hero_death_start'
+  | 'boss_attack_sfx'
+  | 'perfect_dodge'
+  | 'status_applied'
+  | 'status_tick'
+  | 'status_purged'
+  | 'stagger_break'
+  | 'loot_bounce'
+  | 'loot_spawned'
+  | 'enemy_projectile_spawned'
+  | 'hazard_zone_spawned'
+  | 'boss_cinematic_start'
+  | 'boss_cinematic_stage'
+  | 'boss_cinematic_end'
+  | 'portal_vortex'
+  | 'companion_chime'
+  | 'decor_hit'
+  | 'shore_splash';
 
 export interface GameEvent {
   type: GameEventType;
@@ -379,42 +455,288 @@ export interface GameEvent {
   value?: number;
   text?: string;
   isCrit?: boolean;
+  blocked?: boolean;
+  absorbedByShield?: boolean;
   spellId?: SpellId;
   zoneId?: ZoneId;
   islandId?: IslandId;
   enemyId?: string;
   enemyTypeId?: EnemyTypeId;
+  enemyMaterial?: EnemyMaterialSound;
   itemId?: string;
   itemLevel?: number;
+  upgradeLevel?: ForgeUpgradeLevel;
   questId?: QuestId;
   comboStep?: 0 | 1 | 2;
   shape?: TelegraphShape;
   color?: string;
+  accentColor?: string;
   toastVariant?: 'info' | 'warning';
+  weaponId?: string;
+  weaponFamily?: WeaponFamily;
+  materialSound?: MaterialSound;
+  terrain?: TerrainSurfaceId;
+  patternId?: string;
+  sfxId?: SfxId;
+  targetX?: number;
+  targetZ?: number;
+  hitArc?: number;
+  statusId?: StatusEffectId;
+  attackShape?: WeaponAttackShape;
+  startAngle?: number;
+  endAngle?: number;
+  activeSec?: number;
+  windupSec?: number;
+  element?: string;
+  lootKind?: LootDropKind;
+  hazardKind?: HazardZoneKind;
+  projectileKind?: EnemyProjectileKind;
+  cinematicKind?: CinematicKind;
+  cinematicStage?: string;
+  knockbackVx?: number;
+  knockbackVz?: number;
+  companionTargetKind?: 'chest' | 'quest';
+  companionReactionKind?: CompanionReactionKind;
+  propId?: string;
+  propKind?: PropKind;
+  decorMaterial?: DecorMaterialKind;
 }
 
 // --- Équipement & Styles Visuels ---
+
+export type WeaponFamily =
+  | 'sword'
+  | 'axe_hammer'
+  | 'dagger_claws'
+  | 'spear'
+  | 'staff'
+  | 'bow_crossbow';
+
+export type MaterialSound =
+  | 'wood'
+  | 'steel'
+  | 'iron_heavy'
+  | 'bone'
+  | 'arcane'
+  | 'draconic'
+  | 'flame'
+  | 'frost';
+
+export type EnemyMaterialSound =
+  | 'gelatinous'
+  | 'flesh_fur'
+  | 'bone'
+  | 'stone_ice'
+  | 'spectral'
+  | 'dragon_scales';
+
+export type TerrainSurfaceId =
+  | 'grass'
+  | 'sand'
+  | 'rock'
+  | 'snow_ice'
+  | 'wood_deck'
+  | 'dungeon_tiles';
+
+export type WeaponAttackShape = 'arc' | 'thrust_line' | 'cleave' | 'projectile';
+
+export type StatusEffectId =
+  | 'burn'
+  | 'chill'
+  | 'poison'
+  | 'bleed'
+  | 'stun'
+  | 'shock'
+  | 'curse';
+
+export interface WeaponStatusProc {
+  statusId: StatusEffectId;
+  chance: number;
+  durationSec: number;
+  potency?: number;
+}
+
+export interface ActiveStatusEffect {
+  id: StatusEffectId;
+  remainingSec: number;
+  durationSec: number;
+  potency: number;
+  tickAccum: number;
+  sourceId?: string;
+}
+
+export interface AttackMetadata {
+  weaponId: string;
+  weaponFamily: WeaponFamily;
+  materialSound: MaterialSound;
+  attackShape: WeaponAttackShape;
+  comboStep: 0 | 1 | 2;
+  startAngle: number;
+  endAngle: number;
+  range: number;
+  windupSec: number;
+  activeSec: number;
+  element?: string;
+  color: string;
+  accentColor: string;
+}
+
+export interface PlayerProjectile {
+  id: string;
+  projectileId: string;
+  weaponId: string;
+  weaponFamily: WeaponFamily;
+  materialSound: MaterialSound;
+  x: number;
+  z: number;
+  vx: number;
+  vz: number;
+  speed: number;
+  radius: number;
+  distanceTraveled: number;
+  maxRange: number;
+  damage: number;
+  isCrit: boolean;
+  knockback: number;
+  staggerPower: number;
+  hitstopSec: number;
+  mpGain: number;
+  comboStep: 0 | 1 | 2;
+  statusProc?: WeaponStatusProc;
+  canConsumePerfectDodgeBuff?: boolean;
+  color: string;
+  accentColor: string;
+}
+
+export type LootDropKind = 'gold' | 'xp';
+
+export interface LootDrop {
+  id: string;
+  kind: LootDropKind;
+  amount: number;
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  age: number;
+  collectDelay: number;
+  bounces: number;
+  magnetRange: number;
+  magnetized: boolean;
+}
+
+export type EnemyProjectileKind =
+  | 'dagger'
+  | 'fishbone'
+  | 'cheese_wheel'
+  | 'spectral_orb'
+  | 'spectral_scythe'
+  | 'ember_bolt';
+
+export interface EnemyProjectile {
+  id: string;
+  ownerId: string;
+  ownerTypeId: EnemyTypeId;
+  patternId?: string;
+  kind: EnemyProjectileKind;
+  x: number;
+  z: number;
+  startX: number;
+  startZ: number;
+  vx: number;
+  vz: number;
+  speed: number;
+  radius: number;
+  distanceTraveled: number;
+  maxRange: number;
+  age: number;
+  maxAge: number;
+  damage: number;
+  element: TelegraphElement;
+  color: string;
+  accentColor: string;
+  statusProc?: WeaponStatusProc;
+  homingTurnRate?: number;
+  isBoomerang?: boolean;
+  returning?: boolean;
+  hitPlayerOnOutbound?: boolean;
+  hitPlayerOnInbound?: boolean;
+  returnSpeed?: number;
+  piercing?: boolean;
+  spinAngle?: number;
+}
+
+export type HazardZoneKind =
+  | 'slime_puddle'
+  | 'thorn_patch'
+  | 'toxic_miasma'
+  | 'abyssal_fissure'
+  | 'scorch_crater'
+  | 'frost_patch';
+
+export interface HazardZone {
+  id: string;
+  ownerId: string;
+  ownerTypeId: EnemyTypeId;
+  patternId?: string;
+  kind: HazardZoneKind;
+  x: number;
+  z: number;
+  radius: number;
+  length?: number;
+  width?: number;
+  angle?: number;
+  elapsed: number;
+  duration: number;
+  tickInterval: number;
+  tickAccum: number;
+  damagePerTick: number;
+  slowFactor?: number;
+  statusProc?: WeaponStatusProc;
+  element: TelegraphElement;
+  color: string;
+}
+
+export type CinematicKind = 'boss_intro' | 'boss_death';
+
+export interface CinematicState {
+  id: string;
+  kind: CinematicKind;
+  bossId: string;
+  bossTypeId: EnemyTypeId;
+  stage: string;
+  stageIndex: number;
+  elapsed: number;
+  duration: number;
+  maxDuration: number;
+  focusX: number;
+  focusZ: number;
+  targetZoom: number;
+  heatDistortion: number;
+  lairBrighten: number;
+  completed: boolean;
+}
 
 export type WeaponShape =
   | 'wood_sword'
   | 'steel_saber'
   | 'arcane_staff'
   | 'dragon_blade'
+  | 'iron_axe'
+  | 'frost_hammer'
+  | 'lynx_claws'
+  | 'viper_dagger'
+  | 'bone_spear'
+  | 'royal_halberd'
+  | 'ember_staff'
+  | 'hunter_bow'
+  | 'storm_crossbow'
   | 'wood_shield'
-  | 'knight_shield'
-  | 'yarn_trinket';
+  | 'knight_shield';
 export type HelmetShape = 'bandana' | 'knight_helm' | 'mage_hat' | 'dragon_crown';
 export type ArmorShape = 'tunic' | 'mail' | 'star_robe' | 'dragon_plate';
-export type BootsShape =
-  | 'leather_boots'
-  | 'iron_greaves'
-  | 'arcane_slippers'
-  | 'dragon_boots';
-export type GlovesShape =
-  | 'leather_gloves'
-  | 'steel_gauntlets'
-  | 'arcane_gloves'
-  | 'dragon_gauntlets';
 export type CapeShape =
   | 'traveler_cloak'
   | 'knight_mantle'
@@ -426,8 +748,6 @@ export interface EquipmentVisualStyle {
     | WeaponShape
     | HelmetShape
     | ArmorShape
-    | BootsShape
-    | GlovesShape
     | CapeShape;
   primaryColor: string;
   secondaryColor: string;
@@ -446,6 +766,47 @@ export interface EquipmentStatBonuses {
   critChance?: number; // fraction décimale, ex: 0.03 pour +3%
 }
 
+export type WeaponAnimStyle =
+  | 'wood_slash'
+  | 'steel_thrust'
+  | 'arcane_sweep'
+  | 'dragon_cleave';
+
+export interface WeaponCombatProfile {
+  weaponId: string;
+  weaponFamily: WeaponFamily;
+  materialSound: MaterialSound;
+  range: number;
+  attackCooldown: number;
+  windupSec: number;
+  activeSec: number;
+  arcAngleDeg: number;
+  attackShape: WeaponAttackShape;
+  comboSteps: number;
+  comboMultipliers: readonly number[];
+  critBonus: number;
+  knockback: number;
+  hitstopSec: number;
+  staggerPower: number;
+  projectileSpeed?: number;
+  projectileId?: string;
+  statusProc?: WeaponStatusProc;
+  animStyle: WeaponAnimStyle;
+  reach: number;
+  reachFinisher: number;
+  arcAngle: number;
+  arcAngleFinisher: number;
+  cooldownMult: number;
+  damageMult: number;
+  knockbackMult: number;
+  dashMult: number;
+  animDuration: number;
+  swingSfx: SfxId;
+  slashColor: string;
+  slashAccent: string;
+  sparkColor: string;
+}
+
 export interface EquipmentDefinition {
   id: string;
   name: string;
@@ -454,6 +815,11 @@ export interface EquipmentDefinition {
   description: string;
   baseStats: EquipmentStatBonuses;
   visualStyle: EquipmentVisualStyle;
+  weaponFamily?: WeaponFamily;
+  materialSound?: MaterialSound;
+  combatProfile?: WeaponCombatProfile;
+  statusProc?: WeaponStatusProc;
+  shopPrice?: number;
 }
 
 export interface MysteryChestResult {
@@ -527,6 +893,24 @@ export interface EnemyAttackPattern {
   lungeOnImpact?: boolean;  // si vrai, l'ennemi fonce vers l'avant à la résolution
   phaseMin?: 1 | 2;         // 2 si réservé à la phase 2
   color?: string;
+  statusProc?: WeaponStatusProc;
+  element?: TelegraphElement;
+  skillBehavior?: EnemySkillBehavior;
+  projectileSpeed?: number;
+  projectileRadius?: number;
+  projectileRange?: number;
+  projectileCount?: number;
+  projectileSpreadDeg?: number;
+  homingTurnRate?: number;
+  boomerangReturnSpeed?: number;
+  hazardDurationSec?: number;
+  hazardRadius?: number;
+  hazardDamagePerSec?: number;
+  hazardSlowFactor?: number;
+  sequentialCount?: number;
+  sequentialStepDelay?: number;
+  sequentialStepDist?: number;
+  sweepDurationSec?: number;
 }
 
 export interface EnemyDefinition {
@@ -543,10 +927,12 @@ export interface EnemyDefinition {
   leashRange: number;
   isBoss: boolean;
   isMiniBoss?: boolean;
+  maxStagger?: number;
   hasPhaseTwo?: boolean;
   phaseTwoThreshold?: number;
   phaseTwoSpeedMult?: number;
   phaseTwoDialogue?: string;
+  materialSound: EnemyMaterialSound;
   spriteScale: number;
   primaryColor: string;
   accentColor: string;
@@ -593,6 +979,8 @@ export interface ChestInstance {
   tier: ChestTier;
   label: string;
   opened: boolean;
+  opening?: boolean;
+  openingProgress?: number;
   locked: boolean;
   lockedUntilBossDefeated?: EnemyTypeId;
   loot: ChestLootConfig;
@@ -686,23 +1074,55 @@ export interface DungeonRoomDef {
   isBossArena?: boolean;
 }
 
-export type MusicTrackId = 'overworld' | 'dungeon' | 'boss';
+export type MusicTrackId =
+  | 'menu'
+  | 'overworld'
+  | 'maritime'
+  | 'dungeon'
+  | 'combat'
+  | 'boss'
+  | 'boss_phase2'
+  | 'victory';
 
 export type SfxId =
   | 'sword_swing'
+  | 'swing_wood'
+  | 'swing_steel'
+  | 'swing_staff'
+  | 'swing_dragon'
   | 'sword_hit'
   | 'crit_hit'
+  | 'enemy_hurt'
   | 'dodge_whoosh'
   | 'spell_fire'
   | 'spell_lightning'
   | 'spell_ice'
   | 'spell_heal'
+  | 'spell_flamepurr'
+  | 'spell_lightnyan'
+  | 'spell_freezepaw'
+  | 'spell_healing_paw'
+  | 'spell_aegis_purr'
+  | 'spell_pounce_dash'
+  | 'spell_meteor_paw'
+  | 'spell_meteor_fall'
   | 'player_hurt'
+  | 'chest_creak'
   | 'chest_open'
   | 'level_up'
   | 'coin_pickup'
+  | 'menu_open'
+  | 'menu_close'
+  | 'map_open'
+  | 'npc_talk'
+  | 'interact'
+  | 'special_interact'
   | 'meow_ui'
-  | 'boss_roar';
+  | 'boss_roar'
+  | 'boss_dragon_flame'
+  | 'boss_dragon_slam'
+  | 'boss_rat_attack'
+  | 'hero_death';
 
 export interface DungeonDefinition {
   id: Exclude<ZoneId, 'overworld'>;
@@ -727,6 +1147,7 @@ export interface DungeonDefinition {
   chests: ChestDef[];
   traps: TrapDef[];
   healingCrystals: HealingCrystalDef[];
+  props?: WorldProp[];
   bossTypeId: EnemyTypeId;
   bossArenaCenter: Vec2;
   musicTrack: MusicTrackId;
@@ -744,7 +1165,11 @@ export type PropKind =
   | 'mushroom'
   | 'house_cat'
   | 'signpost'
-  | 'fence';
+  | 'fence'
+  | 'bush'
+  | 'barrel';
+
+export type DecorMaterialKind = 'wood' | 'stone' | 'foliage' | 'crystal';
 
 export interface WorldProp {
   id: string;
@@ -931,6 +1356,12 @@ export interface SavedPlayerData {
   position?: Vec2;
 }
 
+export type WildlifeDensity = 'low' | 'normal' | 'high';
+
+export interface GameOptions {
+  wildlifeDensity: WildlifeDensity;
+}
+
 export interface SaveData {
   version: 1 | 2;
   timestamp: number;
@@ -942,11 +1373,19 @@ export interface SaveData {
   openedChestIds: string[];
   defeatedBossIds: EnemyTypeId[];
   runStats: RunStats;
+  options?: Partial<GameOptions>;
 }
 
-export interface AudioPrefs {
+export interface AudioBusVolumes {
+  master: number; // 0 à 1 (synchronisé avec volume)
+  music: number; // 0 à 1
+  sfx: number; // 0 à 1
+  ambience: number; // 0 à 1
+}
+
+export interface AudioPrefs extends AudioBusVolumes {
   muted: boolean;
-  volume: number; // 0 à 1
+  volume: number; // 0 à 1 (alias rétrocompatible de master)
 }
 
 export interface StorageAdapter {
@@ -967,7 +1406,13 @@ export type FloatingTextStyle =
   | 'gold'
   | 'player_damage'
   | 'level_up'
-  | 'info';
+  | 'info'
+  | 'status_burn'
+  | 'status_poison'
+  | 'status_bleed'
+  | 'perfect_dodge'
+  | 'stagger_break'
+  | 'status_purge';
 
 export interface FloatingTextEvent {
   id: string;
@@ -995,6 +1440,54 @@ export interface ActiveSpellEffect {
   width?: number;
   elapsed: number;
   duration: number;
+  targetX?: number;
+  targetZ?: number;
+  waveCount?: number;
+  wavesTriggered?: number;
+  waveInterval?: number;
+  starSeeds?: number[];
+  spellDamage?: number;
+  spellCritChance?: number;
+}
+
+export interface PendingInteractionState {
+  interactableId: string;
+  targetX: number;
+  targetZ: number;
+  standX: number;
+  standZ: number;
+  elapsed: number;
+  maxDuration: number;
+}
+
+export interface OpeningChestState {
+  chestId: string;
+  elapsed: number;
+  duration: number;
+  x: number;
+  z: number;
+}
+
+export interface PortalTransitionState {
+  phase: 'entering' | 'exiting';
+  elapsed: number;
+  duration: number;
+  maxDuration?: number;
+  vortexEmitted?: boolean;
+  portalX: number;
+  portalZ: number;
+  exitTargetX: number;
+  exitTargetZ: number;
+  targetZoneId: ZoneId;
+  targetSpawn: Vec2;
+}
+
+export interface DeathSequenceState {
+  elapsed: number;
+  duration: number;
+  x: number;
+  z: number;
+  completed: boolean;
 }
 
 export interface DodgeGhost {
@@ -1005,6 +1498,16 @@ export interface DodgeGhost {
   duration: number;
 }
 
+export type CompanionMode =
+  | 'follow'
+  | 'guide_chest'
+  | 'guide_quest'
+  | 'react_crit'
+  | 'react_dodge'
+  | 'react_victory';
+
+export type CompanionReactionKind = 'crit' | 'perfect_dodge' | 'boss_victory';
+
 export interface CompanionState {
   x: number;
   z: number;
@@ -1013,6 +1516,14 @@ export interface CompanionState {
   y?: number;
   /** Vrai lorsque le compagnon est embarqué sur le pont */
   onShipDeck?: boolean;
+  mode?: CompanionMode;
+  guideTargetX?: number;
+  guideTargetZ?: number;
+  guideKind?: 'chest' | 'quest' | null;
+  guidePulse?: number;
+  reactionKind?: CompanionReactionKind | null;
+  reactionTimer?: number;
+  reactionDuration?: number;
 }
 
 export interface GameState {
@@ -1048,4 +1559,25 @@ export interface GameState {
   activeBossId: string | null;
   victoryShown: boolean;
   inVillage: boolean;
+  pendingInteraction?: PendingInteractionState | null;
+  openingChest?: OpeningChestState | null;
+  portalTransition?: PortalTransitionState | null;
+  deathSequence?: DeathSequenceState | null;
+  inCombat?: boolean;
+  combatMusicTimer?: number;
+  // Phase 3 : TimeScale, Esquive Parfaite, PV Bas, Métadonnées d'attaque, Projectiles & Butin physique
+  timeScale: number;
+  perfectDodgeTimer: number;
+  lowHpActive: boolean;
+  lowHpIntensity: number;
+  lastAttackMeta: AttackMetadata | null;
+  playerProjectiles: PlayerProjectile[];
+  lootDrops: LootDrop[];
+  // Phase 4 : Projectiles ennemis, zones persistantes & cinématiques de boss
+  enemyProjectiles: EnemyProjectile[];
+  hazardZones: HazardZone[];
+  cinematic: CinematicState | null;
+  playedBossIntros: EnemyTypeId[];
+  // Phase 5 : Options (densité de faune)
+  options: GameOptions;
 }

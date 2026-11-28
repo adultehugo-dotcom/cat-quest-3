@@ -580,21 +580,24 @@ export function playProceduralSfx(
       break;
     }
 
-    case 'boss_roar': {
-      // Oscillateur grave modulé + bruit filtré puissant pour transition phase 2
+    case 'boss_roar':
+    case 'boss_dragon_slam':
+    case 'boss_rat_attack': {
+      // Oscillateur grave modulé + bruit filtré puissant pour attaques de boss
+      const baseFreq = name === 'boss_rat_attack' ? 168 : name === 'boss_dragon_slam' ? 92 : 106;
       const saw = ctx.createOscillator();
       saw.type = 'sawtooth';
-      saw.frequency.setValueAtTime(106, now);
-      saw.frequency.exponentialRampToValueAtTime(54, now + 0.82);
+      saw.frequency.setValueAtTime(baseFreq, now);
+      saw.frequency.exponentialRampToValueAtTime(baseFreq * 0.5, now + 0.72);
 
       const sub = ctx.createOscillator();
       sub.type = 'sine';
-      sub.frequency.setValueAtTime(64, now);
-      sub.frequency.exponentialRampToValueAtTime(34, now + 0.85);
+      sub.frequency.setValueAtTime(baseFreq * 0.6, now);
+      sub.frequency.exponentialRampToValueAtTime(34, now + 0.75);
 
       const lfo = ctx.createOscillator();
       lfo.type = 'sine';
-      lfo.frequency.setValueAtTime(24, now);
+      lfo.frequency.setValueAtTime(name === 'boss_rat_attack' ? 34 : 24, now);
       const lfoGain = ctx.createGain();
       lfoGain.gain.setValueAtTime(18, now);
       lfo.connect(lfoGain);
@@ -603,11 +606,11 @@ export function playProceduralSfx(
       const lp = ctx.createBiquadFilter();
       lp.type = 'lowpass';
       lp.frequency.setValueAtTime(680, now);
-      lp.frequency.exponentialRampToValueAtTime(210, now + 0.82);
+      lp.frequency.exponentialRampToValueAtTime(210, now + 0.72);
       lp.Q.setValueAtTime(3.2, now);
 
       const voiceGain = ctx.createGain();
-      const endTime = applyAdsr(voiceGain.gain, now, 0.36, 0.05, 0.34, 0.46);
+      const endTime = applyAdsr(voiceGain.gain, now, 0.34, 0.04, 0.28, 0.4);
 
       saw.connect(lp);
       sub.connect(lp);
@@ -626,10 +629,198 @@ export function playProceduralSfx(
         startFreq: 480,
         endFreq: 170,
         q: 1.6,
+        peak: 0.28,
+        attack: 0.05,
+        hold: 0.22,
+        release: 0.42,
+      });
+      break;
+    }
+
+    case 'swing_wood':
+    case 'swing_steel':
+    case 'swing_staff':
+    case 'swing_dragon': {
+      const startF =
+        name === 'swing_steel'
+          ? 2600
+          : name === 'swing_staff'
+            ? 1500
+            : name === 'swing_dragon'
+              ? 1250
+              : 2050;
+      const endF = name === 'swing_dragon' ? 240 : name === 'swing_staff' ? 680 : 460;
+      playNoiseBurst(ctx, destination, now, {
+        filterType: 'bandpass',
+        startFreq: startF,
+        endFreq: endF,
+        q: name === 'swing_steel' ? 2.6 : 1.8,
+        peak: name === 'swing_dragon' ? 0.38 : 0.3,
+        attack: 0.01,
+        hold: 0.018,
+        release: name === 'swing_dragon' ? 0.17 : 0.11,
+      });
+      playTone(ctx, destination, now, {
+        type: name === 'swing_staff' ? 'sine' : 'triangle',
+        startFreq: name === 'swing_dragon' ? 260 : name === 'swing_staff' ? 620 : 410,
+        endFreq: name === 'swing_dragon' ? 95 : 155,
+        peak: 0.14,
+        attack: 0.008,
+        release: 0.1,
+      });
+      break;
+    }
+
+    case 'enemy_hurt': {
+      playTone(ctx, destination, now, {
+        type: 'sawtooth',
+        startFreq: 240,
+        endFreq: 115,
+        peak: 0.18,
+        attack: 0.005,
+        release: 0.09,
+        filterFreq: 750,
+      });
+      break;
+    }
+
+    case 'spell_flamepurr':
+    case 'boss_dragon_flame': {
+      playProceduralSfx(ctx, destination, 'spell_fire');
+      break;
+    }
+    case 'spell_lightnyan': {
+      playProceduralSfx(ctx, destination, 'spell_lightning');
+      break;
+    }
+    case 'spell_freezepaw': {
+      playProceduralSfx(ctx, destination, 'spell_ice');
+      break;
+    }
+    case 'spell_healing_paw': {
+      playProceduralSfx(ctx, destination, 'spell_heal');
+      break;
+    }
+    case 'spell_aegis_purr': {
+      for (const [idx, freq] of [440, 659.25, 880].entries()) {
+        playTone(ctx, destination, now + idx * 0.04, {
+          type: 'triangle',
+          startFreq: freq,
+          peak: 0.16,
+          attack: 0.015,
+          hold: 0.08,
+          release: 0.32,
+        });
+      }
+      break;
+    }
+    case 'spell_pounce_dash': {
+      playProceduralSfx(ctx, destination, 'dodge_whoosh');
+      break;
+    }
+    case 'spell_meteor_paw':
+    case 'spell_meteor_fall': {
+      playTone(ctx, destination, now, {
+        type: 'sawtooth',
+        startFreq: name === 'spell_meteor_paw' ? 190 : 320,
+        endFreq: 48,
+        peak: 0.32,
+        attack: 0.01,
+        hold: 0.05,
+        release: 0.36,
+        filterFreq: 640,
+      });
+      playNoiseBurst(ctx, destination, now, {
+        filterType: 'lowpass',
+        startFreq: 1900,
+        endFreq: 260,
+        q: 1.2,
         peak: 0.3,
+        attack: 0.008,
+        release: 0.32,
+      });
+      break;
+    }
+
+    case 'chest_creak': {
+      playTone(ctx, destination, now, {
+        type: 'sawtooth',
+        startFreq: 195,
+        endFreq: 290,
+        peak: 0.16,
         attack: 0.06,
-        hold: 0.28,
-        release: 0.48,
+        hold: 0.25,
+        release: 0.3,
+        filterFreq: 650,
+      });
+      break;
+    }
+
+    case 'menu_open':
+    case 'menu_close':
+    case 'interact': {
+      const up = name === 'menu_open';
+      playTone(ctx, destination, now, {
+        type: 'triangle',
+        startFreq: up ? 480 : name === 'menu_close' ? 620 : 540,
+        endFreq: up ? 720 : name === 'menu_close' ? 380 : 640,
+        peak: 0.16,
+        attack: 0.006,
+        release: 0.09,
+      });
+      break;
+    }
+
+    case 'map_open': {
+      playNoiseBurst(ctx, destination, now, {
+        filterType: 'bandpass',
+        startFreq: 2400,
+        endFreq: 950,
+        q: 1.4,
+        peak: 0.22,
+        attack: 0.015,
+        hold: 0.04,
+        release: 0.18,
+      });
+      break;
+    }
+
+    case 'npc_talk': {
+      playProceduralSfx(ctx, destination, 'meow_ui');
+      break;
+    }
+
+    case 'special_interact': {
+      playTone(ctx, destination, now, {
+        type: 'sine',
+        startFreq: 587.33,
+        peak: 0.18,
+        attack: 0.01,
+        hold: 0.04,
+        release: 0.2,
+      });
+      playTone(ctx, destination, now + 0.08, {
+        type: 'sine',
+        startFreq: 880,
+        peak: 0.2,
+        attack: 0.01,
+        hold: 0.06,
+        release: 0.28,
+      });
+      break;
+    }
+
+    case 'hero_death': {
+      const notes = [440, 392, 349.23, 293.66];
+      notes.forEach((freq, idx) => {
+        playTone(ctx, destination, now + idx * 0.22, {
+          type: 'triangle',
+          startFreq: freq,
+          peak: 0.2,
+          attack: 0.02,
+          hold: 0.1,
+          release: 0.35,
+        });
       });
       break;
     }
